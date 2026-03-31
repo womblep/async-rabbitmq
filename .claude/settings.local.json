@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git clone:*)",
+      "Bash(./setup)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.rubydoc.info)",
+      "WebFetch(domain:rubydoc.info)",
+      "Skill(ship)",
+      "Skill(ship:*)"
+    ]
+  }
+}
