@@ -352,6 +352,12 @@ module AsyncRabbitMQ
       if @confirms_enabled
         @frame_io.write_frame(AMQ::Protocol::Confirm::Select.encode(@channel_id, false).encode)
         wait_for(:confirm_select_ok, AMQ::Protocol::Confirm::SelectOk)
+        # Reset confirms state for the new connection — old pending tags are gone
+        # and the old condition object is stale (any prior waiter already unblocked
+        # via interrupt_wait! with a ConnectionError).
+        @confirm_condition = Async::Condition.new
+        @pending_confirms  = {}
+        @delivery_tag      = 0
       end
 
       re_register_consumers
@@ -434,6 +440,11 @@ module AsyncRabbitMQ
           @on_cancel&.call(method.consumer_tag)
         end
         # No CancelOk to send for server-initiated cancel (no-wait is implicit).
+
+      when AMQ::Protocol::Channel::Flow
+        # Server-initiated flow control — broker throttling this channel.
+        @flow_active = method.active
+        @frame_io.write_frame(AMQ::Protocol::Channel::FlowOk.encode(@channel_id, method.active).encode)
 
       when AMQ::Protocol::Connection::Blocked,
            AMQ::Protocol::Connection::Unblocked
