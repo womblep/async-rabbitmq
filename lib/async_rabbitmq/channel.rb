@@ -20,13 +20,14 @@ module AsyncRabbitMQ
 
       @state             = :closed
       @queue             = nil
-      @consumers         = {}        # consumer_tag => block
+      @consumers         = {}        # consumer_tag => {queue_name:, block:, manual_ack:}
       @return_handler    = nil
       @delivery_tag      = 0
       @pending_confirms  = {}        # delivery_tag => Async::Condition
       @confirms_enabled  = false
       @confirm_condition = nil
       @flow_active       = true
+      @on_cancel         = nil
       @mutex             = Async::Semaphore.new(1)
       @reply_condition   = nil
       @content_condition = nil
@@ -175,7 +176,7 @@ module AsyncRabbitMQ
         @mutex.acquire do
           @delivery_tag += 1
           tag = @delivery_tag
-          @pending_confirms[tag] = Async::Condition.new
+          @pending_confirms[tag] = tag
           tag
         end
       end
@@ -238,7 +239,7 @@ module AsyncRabbitMQ
         ).encode
       )
       resp = wait_for(:basic_consume_ok, AMQ::Protocol::Basic::ConsumeOk)
-      @consumers[resp.consumer_tag] = block
+      @consumers[resp.consumer_tag] = { queue_name: queue_name, block: block, manual_ack: manual_ack }
       resp.consumer_tag
     end
 
@@ -287,6 +288,13 @@ module AsyncRabbitMQ
 
     attr_reader :return_handler
 
+    # Register a callback invoked when the broker cancels a consumer server-side
+    # (e.g. the queue is deleted or an HA failover occurs).
+    # The block receives the consumer_tag that was cancelled.
+    def on_cancel(&block)
+      @on_cancel = block
+    end
+
     # -------------------------------------------------------------------------
     # Flow control
     # -------------------------------------------------------------------------
@@ -302,9 +310,9 @@ module AsyncRabbitMQ
     # Duck-typed stream: #each yields deliveries
     # -------------------------------------------------------------------------
 
-    def each(&block)
+    def each(queue_name, manual_ack: false, &block)
       assert_open!
-      tag = basic_consume("", manual_ack: false, &block)
+      tag = basic_consume(queue_name, manual_ack: manual_ack, &block)
       # Block until the channel or consumer is closed
       Async::Condition.new.wait
     ensure
@@ -322,6 +330,8 @@ module AsyncRabbitMQ
       @reply_condition   = nil
       @content_condition&.signal(error)
       @content_condition = nil
+      @confirm_condition&.signal(error)
+      @confirm_condition = nil
       @queue&.push(nil) rescue nil
     rescue => e
       # ignore — best-effort unblock
@@ -389,9 +399,9 @@ module AsyncRabbitMQ
         # After Deliver, the broker sends header+body frames immediately on this channel.
         content_msg = @queue.pop
         _, header, body = content_msg
-        consumer = @consumers[method.consumer_tag]
-        if consumer
-          Async { consumer.call(method, header, body) }
+        entry = @consumers[method.consumer_tag]
+        if entry
+          Async { entry[:block].call(method, header, body) }
         else
           @logger.warn("Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
         end
@@ -415,11 +425,21 @@ module AsyncRabbitMQ
       when AMQ::Protocol::Channel::Close
         handle_channel_close(method)
 
-      when AMQ::Protocol::Connection::Blocked
-        @logger.warn("Connection blocked: #{method.reason}")
+      when AMQ::Protocol::Basic::Cancel
+        # Server-initiated consumer cancel (e.g. queue deleted, HA failover).
+        # Remove from @consumers so deliveries are no longer dispatched to a dead block.
+        entry = @consumers.delete(method.consumer_tag)
+        if entry
+          @logger.warn("Channel #{@channel_id}: broker cancelled consumer #{method.consumer_tag}")
+          @on_cancel&.call(method.consumer_tag)
+        end
+        # No CancelOk to send for server-initiated cancel (no-wait is implicit).
 
-      when AMQ::Protocol::Connection::Unblocked
-        @logger.info("Connection unblocked")
+      when AMQ::Protocol::Connection::Blocked,
+           AMQ::Protocol::Connection::Unblocked
+        # These arrive on channel 0 and are handled by the Session channel-0 monitor.
+        # They should never reach a Channel object — log and ignore defensively.
+        @logger.debug("Channel #{@channel_id}: ignoring connection-level #{method.class} frame")
 
       else
         # Wake any fiber waiting on this method type
@@ -520,8 +540,13 @@ module AsyncRabbitMQ
     end
 
     def re_register_consumers
-      @consumers.each do |tag, block|
-        basic_consume("", consumer_tag: tag, manual_ack: true, &block) rescue nil
+      @consumers.each do |tag, entry|
+        basic_consume(
+          entry[:queue_name],
+          consumer_tag: tag,
+          manual_ack:   entry[:manual_ack],
+          &entry[:block]
+        ) rescue nil
       end
     end
 

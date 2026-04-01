@@ -59,6 +59,7 @@ module AsyncRabbitMQ
       @open_condition    = nil
       @last_frame_at     = nil
       @heartbeat_task    = nil
+      @channel0_task     = nil    # drains channel-0 queue; handles connection.blocked/unblocked
       @recovery_task     = nil
       @recovery_wakeup   = nil    # Async::Condition to interrupt the retry sleep
       @session_root_task = nil    # top-level task; recovery is spawned here so it
@@ -77,6 +78,7 @@ module AsyncRabbitMQ
         @frame_io.start
         handshake
         start_heartbeat_task
+        start_channel0_monitor_task
         @state = :open
       end
     rescue Async::TimeoutError
@@ -107,9 +109,11 @@ module AsyncRabbitMQ
       @channels.each_value { |ch| ch.interrupt_wait!(conn_error) rescue nil }
       if open?
         @state = :closing
+        @channel0_task&.cancel rescue nil
         send_connection_close rescue nil
       end
       @heartbeat_task&.cancel rescue nil
+      @channel0_task&.cancel rescue nil
       @recovery_task&.cancel rescue nil
       @frame_io&.stop rescue nil
       @state = :closed
@@ -169,6 +173,12 @@ module AsyncRabbitMQ
 
       @recovery_in_progress = true
       @state = :recovering
+
+      # Stop the channel-0 monitor so it doesn't race on the stale queue.
+      # Also unblock any fibers stuck in write_frame waiting on connection.blocked.
+      @channel0_task&.cancel rescue nil
+      @channel0_task = nil
+      @frame_io&.set_unblocked rescue nil
 
       # Interrupt all channel fibers so they raise ConnectionError instead of
       # hanging forever waiting for a reply that will never come.
@@ -391,6 +401,7 @@ module AsyncRabbitMQ
           end
           @heartbeat_task&.cancel rescue nil
           start_heartbeat_task
+          start_channel0_monitor_task
           @state = :open
           @recovery_in_progress = false
           # NOTE: keep @recovery_task non-nil until reopen_channels completes so
@@ -419,6 +430,35 @@ module AsyncRabbitMQ
       @channels.each_value do |channel|
         channel.reopen_after_recovery(@frame_io) rescue nil
       end
+    end
+
+    # Dedicated long-lived task that drains the channel-0 queue after the
+    # AMQP handshake completes.  Handles connection.blocked / connection.unblocked
+    # by delegating to FrameIO's blocked-state gate so write_frame yields
+    # automatically when the broker is resource-constrained.
+    def start_channel0_monitor_task
+      @channel0_task = Async::Task.current.async { channel0_monitor_loop }
+    end
+
+    def channel0_monitor_loop
+      queue = @frame_io.channel_queue(0)
+      loop do
+        msg = queue.pop
+        break if msg.nil?
+        next unless msg[0] == :method
+        method = msg[1]
+        case method
+        when AMQ::Protocol::Connection::Blocked
+          @frame_io&.set_blocked(method.reason)
+        when AMQ::Protocol::Connection::Unblocked
+          @frame_io&.set_unblocked
+        end
+        # All other channel-0 methods during normal operation (e.g. stray HeartbeatFrames
+        # routed here) are intentionally ignored; the handshake path uses wait_channel0_method
+        # directly and does not go through this loop.
+      end
+    rescue => e
+      @logger.debug("Channel-0 monitor exited: #{e.class}: #{e.message}")
     end
   end
 end

@@ -23,7 +23,9 @@ module AsyncRabbitMQ
     WRITE_QUEUE_LIMIT = 1024
 
     # AMQP soft-error codes: broker closes the channel, connection stays alive.
-    SOFT_ERROR_CODES = [403, 404, 405, 406].freeze
+    # 311 content-too-large, 312 no-route, 313 no-consumers are channel-level errors.
+    # 403 access-refused, 404 not-found, 405 resource-locked, 406 precondition-failed.
+    SOFT_ERROR_CODES = [311, 312, 313, 403, 404, 405, 406].freeze
 
     def initialize(socket, logger: Logger.new($stdout, level: Logger::WARN))
       @socket        = socket
@@ -32,11 +34,13 @@ module AsyncRabbitMQ
       @channel_sem   = Async::Semaphore.new(1)
       @write_queue   = Async::LimitedQueue.new(WRITE_QUEUE_LIMIT)
       @socket_sem    = Async::Semaphore.new(1)
-      @running       = false
-      @reader_task   = nil
-      @writer_task   = nil
-      @content_state = {}
-      @on_frame      = nil   # optional proc called each time a frame is read
+      @running            = false
+      @reader_task        = nil
+      @writer_task        = nil
+      @content_state      = {}
+      @on_frame           = nil   # optional proc called each time a frame is read
+      @blocked            = false
+      @unblocked_condition = nil
     end
 
     # Set a callback invoked immediately after each frame is successfully read.
@@ -82,9 +86,29 @@ module AsyncRabbitMQ
       @reader_task&.cancel rescue nil
     end
 
-    # Enqueue raw frame bytes for writing. Yields the fiber when queue is full.
+    # Enqueue raw frame bytes for writing. Yields the fiber when queue is full,
+    # or while the connection is broker-blocked (connection.blocked received).
     def write_frame(data)
+      while @blocked
+        @unblocked_condition ||= Async::Condition.new
+        @unblocked_condition.wait
+      end
       @write_queue.push(data)
+    end
+
+    # Called by the Session channel-0 monitor when connection.blocked is received.
+    def set_blocked(reason)
+      @blocked = true
+      @logger.warn("Connection blocked: #{reason}")
+    end
+
+    # Called by the Session channel-0 monitor when connection.unblocked is received.
+    def set_unblocked
+      @blocked = false
+      cond = @unblocked_condition
+      @unblocked_condition = nil
+      cond&.signal
+      @logger.info("Connection unblocked")
     end
 
     # Write heartbeat directly to socket, bypassing the write queue so
