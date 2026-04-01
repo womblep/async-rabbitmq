@@ -1,0 +1,532 @@
+require "async"
+require "async/condition"
+require "async/semaphore"
+require_relative "errors"
+
+module AsyncRabbitMQ
+  # Represents an AMQP channel multiplexed over a Session's connection.
+  #
+  # Duck-typed stream interface: #each (yields deliveries) and #write (publishes).
+  # Does NOT inherit Async::IO::Stream — a channel is logical, not physical IO.
+  class Channel
+    attr_reader :channel_id
+
+    def initialize(channel_id, session, frame_io, frame_max:, logger:)
+      @channel_id   = channel_id
+      @session      = session
+      @frame_io     = frame_io
+      @frame_max    = frame_max
+      @logger       = logger
+
+      @state             = :closed
+      @queue             = nil
+      @consumers         = {}        # consumer_tag => block
+      @return_handler    = nil
+      @delivery_tag      = 0
+      @pending_confirms  = {}        # delivery_tag => Async::Condition
+      @confirms_enabled  = false
+      @confirm_condition = nil
+      @flow_active       = true
+      @mutex             = Async::Semaphore.new(1)
+      @reply_condition   = nil
+      @content_condition = nil
+      @pending_content   = nil
+    end
+
+    def open?
+      @state == :open
+    end
+
+    def closed?
+      @state == :closed
+    end
+
+    def open
+      @queue = @frame_io.register_channel(@channel_id)
+      # Start dispatch task BEFORE waiting so it can process the OpenOk reply.
+      start_dispatch_task
+      @frame_io.write_frame(AMQ::Protocol::Channel::Open.encode(@channel_id, "").encode)
+      wait_for(:channel_open_ok, AMQ::Protocol::Channel::OpenOk)
+      @state = :open
+      self
+    end
+
+    def close
+      return unless open?
+      @frame_io.write_frame(
+        AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0).encode
+      )
+      wait_for(:channel_close_ok, AMQ::Protocol::Channel::CloseOk)
+      @state = :closed
+      @session.channel_closed(@channel_id)
+      @queue&.push(nil)  # wake dispatch_loop so it can detect :closed and exit
+    end
+
+    # -------------------------------------------------------------------------
+    # Queue
+    # -------------------------------------------------------------------------
+
+    def queue(name, durable: false, exclusive: false, auto_delete: false, arguments: {})
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Queue::Declare.encode(
+          @channel_id, name, false, durable, exclusive, auto_delete, false, arguments
+        ).encode
+      )
+      resp = wait_for(:queue_declare_ok, AMQ::Protocol::Queue::DeclareOk)
+      Queue.new(resp.queue, resp.message_count, resp.consumer_count, self)
+    end
+
+    def queue_delete(name, if_unused: false, if_empty: false)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Queue::Delete.encode(@channel_id, name, if_unused, if_empty, false).encode
+      )
+      wait_for(:queue_delete_ok, AMQ::Protocol::Queue::DeleteOk)
+    end
+
+    def queue_purge(name)
+      assert_open!
+      @frame_io.write_frame(AMQ::Protocol::Queue::Purge.encode(@channel_id, name, false).encode)
+      wait_for(:queue_purge_ok, AMQ::Protocol::Queue::PurgeOk)
+    end
+
+    def queue_bind(queue_name, exchange:, routing_key: "", arguments: {})
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Queue::Bind.encode(
+          @channel_id, queue_name, exchange, routing_key, false, arguments
+        ).encode
+      )
+      wait_for(:queue_bind_ok, AMQ::Protocol::Queue::BindOk)
+    end
+
+    def queue_unbind(queue_name, exchange:, routing_key: "", arguments: {})
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Queue::Unbind.encode(
+          @channel_id, queue_name, exchange, routing_key, arguments
+        ).encode
+      )
+      wait_for(:queue_unbind_ok, AMQ::Protocol::Queue::UnbindOk)
+    end
+
+    # -------------------------------------------------------------------------
+    # Exchange
+    # -------------------------------------------------------------------------
+
+    def exchange(name, type: :direct, durable: false, auto_delete: false, arguments: {})
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Exchange::Declare.encode(
+          @channel_id, name, type.to_s, false, durable, auto_delete, false, false, arguments
+        ).encode
+      )
+      wait_for(:exchange_declare_ok, AMQ::Protocol::Exchange::DeclareOk)
+      Exchange.new(name, type, self)
+    end
+
+    def exchange_delete(name, if_unused: false)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Exchange::Delete.encode(@channel_id, name, if_unused, false).encode
+      )
+      wait_for(:exchange_delete_ok, AMQ::Protocol::Exchange::DeleteOk)
+    end
+
+    def exchange_bind(destination:, source:, routing_key: "", arguments: {})
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Exchange::Bind.encode(
+          @channel_id, destination, source, routing_key, false, arguments
+        ).encode
+      )
+      wait_for(:exchange_bind_ok, AMQ::Protocol::Exchange::BindOk)
+    end
+
+    def exchange_unbind(destination:, source:, routing_key: "", arguments: {})
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Exchange::Unbind.encode(
+          @channel_id, destination, source, routing_key, false, arguments
+        ).encode
+      )
+      wait_for(:exchange_unbind_ok, AMQ::Protocol::Exchange::UnbindOk)
+    end
+
+    # -------------------------------------------------------------------------
+    # Basic operations
+    # -------------------------------------------------------------------------
+
+    def basic_publish(payload, exchange: "", routing_key: "", mandatory: false, persistent: false, properties: {})
+      assert_open!
+      payload_bytes = payload.is_a?(String) ? payload.b : payload
+      delivery_mode = persistent ? 2 : 1
+      props         = { delivery_mode: delivery_mode }.merge(properties)
+
+      # Basic::Publish.encode returns [MethodFrame, HeaderFrame, BodyFrame, ...],
+      # splitting payload across multiple body frames when needed.
+      frames = AMQ::Protocol::Basic::Publish.encode(
+        @channel_id, payload_bytes, props, exchange, routing_key, mandatory, false, @frame_max
+      )
+      frames.each { |f| @frame_io.write_frame(f.encode) }
+
+      if @confirms_enabled
+        @mutex.acquire do
+          @delivery_tag += 1
+          tag = @delivery_tag
+          @pending_confirms[tag] = Async::Condition.new
+          tag
+        end
+      end
+    end
+
+    # Duck-typed #write for stream composability.
+    alias write basic_publish
+
+    def basic_get(queue_name, manual_ack: false)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Get.encode(@channel_id, queue_name, !manual_ack).encode
+      )
+      msg = wait_for_any(:basic_get_ok, :basic_get_empty,
+                         AMQ::Protocol::Basic::GetOk,
+                         AMQ::Protocol::Basic::GetEmpty)
+      return nil if msg.is_a?(AMQ::Protocol::Basic::GetEmpty)
+
+      # After GetOk, next message pair is content-header + body
+      content = wait_content
+      [msg, content[:header], content[:body]]
+    end
+
+    def basic_ack(delivery_tag, multiple: false)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Ack.encode(@channel_id, delivery_tag, multiple).encode
+      )
+    end
+
+    def basic_nack(delivery_tag, multiple: false, requeue: true)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Nack.encode(@channel_id, delivery_tag, multiple, requeue).encode
+      )
+    end
+
+    def basic_reject(delivery_tag, requeue: true)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Reject.encode(@channel_id, delivery_tag, requeue).encode
+      )
+    end
+
+    def basic_qos(prefetch_count:, prefetch_size: 0, global: false)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Qos.encode(@channel_id, prefetch_size, prefetch_count, global).encode
+      )
+      wait_for(:basic_qos_ok, AMQ::Protocol::Basic::QosOk)
+    end
+
+    # Start a consumer. The block runs in a new Async::Task per delivery.
+    # Returns the consumer tag.
+    def basic_consume(queue_name, consumer_tag: "", manual_ack: false, exclusive: false, arguments: {}, &block)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Consume.encode(
+          @channel_id, queue_name, consumer_tag, false, !manual_ack, exclusive, false, arguments
+        ).encode
+      )
+      resp = wait_for(:basic_consume_ok, AMQ::Protocol::Basic::ConsumeOk)
+      @consumers[resp.consumer_tag] = block
+      resp.consumer_tag
+    end
+
+    def basic_cancel(consumer_tag)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Cancel.encode(@channel_id, consumer_tag, false).encode
+      )
+      wait_for(:basic_cancel_ok, AMQ::Protocol::Basic::CancelOk)
+      @consumers.delete(consumer_tag)
+    end
+
+    # -------------------------------------------------------------------------
+    # Publisher confirms
+    # -------------------------------------------------------------------------
+
+    def confirm_select
+      assert_open!
+      @frame_io.write_frame(AMQ::Protocol::Confirm::Select.encode(@channel_id, false).encode)
+      wait_for(:confirm_select_ok, AMQ::Protocol::Confirm::SelectOk)
+      @confirms_enabled  = true
+      @delivery_tag      = 0
+      @pending_confirms  = {}
+      @confirm_condition = Async::Condition.new
+    end
+
+    # Block the current fiber until all published messages are confirmed.
+    # Raises ConnectionError if the session disconnects while waiting.
+    def wait_for_confirms
+      return true if @pending_confirms.empty?
+
+      until @pending_confirms.empty?
+        @confirm_condition.wait
+        raise ConnectionError, "Session disconnected while waiting for confirms" unless open?
+      end
+      true
+    end
+
+    # -------------------------------------------------------------------------
+    # Return handler
+    # -------------------------------------------------------------------------
+
+    def on_return(&block)
+      @return_handler = block
+    end
+
+    attr_reader :return_handler
+
+    # -------------------------------------------------------------------------
+    # Flow control
+    # -------------------------------------------------------------------------
+
+    def flow(active)
+      assert_open!
+      @frame_io.write_frame(AMQ::Protocol::Channel::Flow.encode(@channel_id, active).encode)
+      wait_for(:channel_flow_ok, AMQ::Protocol::Channel::FlowOk)
+      @flow_active = active
+    end
+
+    # -------------------------------------------------------------------------
+    # Duck-typed stream: #each yields deliveries
+    # -------------------------------------------------------------------------
+
+    def each(&block)
+      assert_open!
+      tag = basic_consume("", manual_ack: false, &block)
+      # Block until the channel or consumer is closed
+      Async::Condition.new.wait
+    ensure
+      basic_cancel(tag) rescue nil
+    end
+
+    # -------------------------------------------------------------------------
+    # Internal: called by Session when connection dies during recovery
+    # to unblock any fibers waiting on reply or content conditions.
+    # -------------------------------------------------------------------------
+
+    def interrupt_wait!(error = nil)
+      error ||= ConnectionError.new(code: 0, text: "Connection lost during recovery")
+      @reply_condition&.signal(error)
+      @reply_condition   = nil
+      @content_condition&.signal(error)
+      @content_condition = nil
+      @queue&.push(nil) rescue nil
+    rescue => e
+      # ignore — best-effort unblock
+    end
+
+    # -------------------------------------------------------------------------
+    # Internal: called by Session after reconnect
+    # -------------------------------------------------------------------------
+
+    def reopen_after_recovery(new_frame_io)
+      @frame_io = new_frame_io
+      @queue    = @frame_io.register_channel(@channel_id)
+      start_dispatch_task
+      @frame_io.write_frame(AMQ::Protocol::Channel::Open.encode(@channel_id, "").encode)
+      wait_for(:channel_open_ok, AMQ::Protocol::Channel::OpenOk)
+      @state = :open
+
+      if @confirms_enabled
+        @frame_io.write_frame(AMQ::Protocol::Confirm::Select.encode(@channel_id, false).encode)
+        wait_for(:confirm_select_ok, AMQ::Protocol::Confirm::SelectOk)
+      end
+
+      re_register_consumers
+    end
+
+    private
+
+    # -------------------------------------------------------------------------
+    # Frame dispatch
+    # -------------------------------------------------------------------------
+
+    def start_dispatch_task
+      Async::Task.current.async { dispatch_loop }
+    end
+
+    def dispatch_loop
+      loop do
+        msg = @queue.pop
+        break if msg.nil?
+        handle_message(msg)
+      end
+    rescue => e
+      @logger.error("Channel #{@channel_id} dispatch error: #{e.class}: #{e.message}")
+    end
+
+    def handle_message(msg)
+      type, *rest = msg
+
+      case type
+      when :method
+        handle_method(rest[0])
+      when :content
+        @pending_content = { header: rest[0], body: rest[1] }
+        @content_condition&.signal(@pending_content)
+        @content_condition = nil
+      when :heartbeat
+        # connection-level, ignore at channel layer
+      end
+    end
+
+    def handle_method(method)
+      case method
+      when AMQ::Protocol::Basic::Deliver
+        # Pop content directly — must not suspend dispatch_loop via wait_content.
+        # After Deliver, the broker sends header+body frames immediately on this channel.
+        content_msg = @queue.pop
+        _, header, body = content_msg
+        consumer = @consumers[method.consumer_tag]
+        if consumer
+          Async { consumer.call(method, header, body) }
+        else
+          @logger.warn("Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
+        end
+
+      when AMQ::Protocol::Basic::Return
+        # Same pattern: pop content directly.
+        content_msg = @queue.pop
+        _, header, body = content_msg
+        if @return_handler
+          Async { @return_handler.call(method, header, body) }
+        else
+          @logger.warn("Unhandled basic.return on channel #{@channel_id} — register on_return to handle")
+        end
+
+      when AMQ::Protocol::Basic::Ack
+        handle_confirm_ack(method)
+
+      when AMQ::Protocol::Basic::Nack
+        handle_confirm_nack(method)
+
+      when AMQ::Protocol::Channel::Close
+        handle_channel_close(method)
+
+      when AMQ::Protocol::Connection::Blocked
+        @logger.warn("Connection blocked: #{method.reason}")
+
+      when AMQ::Protocol::Connection::Unblocked
+        @logger.info("Connection unblocked")
+
+      else
+        # Wake any fiber waiting on this method type
+        @reply_condition&.signal(method)
+        @reply_condition = nil
+        # Yield so the newly-woken fiber (e.g. basic_consume registering its consumer)
+        # can run before dispatch_loop processes the next queued message.
+        Async::Task.current.yield
+      end
+    end
+
+    def handle_confirm_ack(method)
+      @mutex.acquire do
+        if method.multiple
+          @pending_confirms.reject! { |tag, _| tag <= method.delivery_tag }
+        else
+          @pending_confirms.delete(method.delivery_tag)
+        end
+        @confirm_condition&.signal
+      end
+    end
+
+    def handle_confirm_nack(method)
+      @mutex.acquire do
+        if method.multiple
+          @pending_confirms.reject! { |tag, _| tag <= method.delivery_tag }
+        else
+          @pending_confirms.delete(method.delivery_tag)
+        end
+        @confirm_condition&.signal
+      end
+    end
+
+    def handle_channel_close(method)
+      code = method.reply_code
+      text = method.reply_text
+      @frame_io.write_frame(
+        AMQ::Protocol::Channel::CloseOk.encode(@channel_id).encode
+      )
+      @state = :closed
+      @session.channel_closed(@channel_id)
+
+      error = if FrameIO::SOFT_ERROR_CODES.include?(code)
+        ChannelError.new(code: code, text: text, channel_id: @channel_id)
+      else
+        ConnectionError.new(code: code, text: text)
+      end
+
+      # Wake any waiting fiber with the error
+      @reply_condition&.signal(error)
+      @reply_condition = nil
+      # Stop dispatch_loop
+      @queue&.push(nil)
+    end
+
+    # -------------------------------------------------------------------------
+    # Synchronous wait helpers
+    # -------------------------------------------------------------------------
+
+    def wait_for(_name, expected_class)
+      condition = @reply_condition = Async::Condition.new
+      result    = condition.wait
+
+      if result.is_a?(ChannelError) || result.is_a?(ConnectionError)
+        raise result
+      end
+
+      unless result.is_a?(expected_class)
+        raise ChannelError.new("Expected #{expected_class} but got #{result.class}",
+                               channel_id: @channel_id)
+      end
+      result
+    end
+
+    def wait_for_any(_name1, _name2, *expected_classes)
+      condition = @reply_condition = Async::Condition.new
+      result    = condition.wait
+
+      if result.is_a?(ChannelError) || result.is_a?(ConnectionError)
+        raise result
+      end
+
+      unless expected_classes.any? { |c| result.is_a?(c) }
+        raise ChannelError.new("Unexpected method #{result.class}", channel_id: @channel_id)
+      end
+      result
+    end
+
+    def wait_content
+      if @pending_content
+        content = @pending_content
+        @pending_content = nil
+        return content
+      end
+
+      condition = @content_condition = Async::Condition.new
+      condition.wait
+    end
+
+    def re_register_consumers
+      @consumers.each do |tag, block|
+        basic_consume("", consumer_tag: tag, manual_ack: true, &block) rescue nil
+      end
+    end
+
+    def assert_open!
+      raise NotOpenError, "Channel #{@channel_id} is not open" unless open?
+    end
+  end
+end

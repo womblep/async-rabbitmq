@@ -1,0 +1,135 @@
+require "simplecov"
+SimpleCov.start do
+  add_filter "/spec/"
+  # Only enforce coverage minimum when integration tests actually ran (RabbitMQ available).
+  minimum_coverage ENV["ENFORCE_COVERAGE"] ? 90 : 0
+end
+
+require "async"
+require "async/rspec"
+require "async_rabbitmq"
+require "uri"
+require "securerandom"
+
+# Integration test helpers — require a live RabbitMQ.
+# Tests are skipped automatically when RABBITMQ_URL is not set.
+RABBITMQ_URL   = ENV.fetch("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672")
+RABBITMQ_HOST  = URI.parse(RABBITMQ_URL.sub("amqp://", "http://")).host rescue "127.0.0.1"
+RABBITMQ_PORT  = (ENV["RABBITMQ_PORT"] || 5672).to_i
+RABBITMQ_MGMT  = (ENV["RABBITMQ_MGMT_PORT"] || 15672).to_i
+
+# ---------------------------------------------------------------------------
+# Toxiproxy — optional TCP fault injection. Tests that require it call
+# `toxiproxy_rabbitmq` which returns the Toxiproxy::Proxy, or they call
+# `toxiproxy_available?` to skip gracefully when the daemon is not running.
+# ---------------------------------------------------------------------------
+TOXIPROXY_HOST = ENV.fetch("TOXIPROXY_HOST", "http://127.0.0.1:8474")
+TOXIPROXY_PORT = (ENV["TOXIPROXY_RABBITMQ_PORT"] || 11111).to_i
+
+require "toxiproxy"
+Toxiproxy.host = TOXIPROXY_HOST
+
+module IntegrationHelpers
+  # Returns true when a live RabbitMQ is reachable.
+  def rabbitmq_available?
+    require "socket"
+    TCPSocket.new(RABBITMQ_HOST, RABBITMQ_PORT).close
+    true
+  rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT
+    false
+  end
+
+  # Returns true when the toxiproxy daemon is reachable.
+  # Populates the rabbitmq proxy on first call.
+  def toxiproxy_available?
+    return @toxiproxy_available if defined?(@toxiproxy_available)
+    Toxiproxy.populate([{
+      name:     "rabbitmq",
+      listen:   "127.0.0.1:#{TOXIPROXY_PORT}",
+      upstream: "#{RABBITMQ_HOST}:#{RABBITMQ_PORT}",
+    }])
+    @toxiproxy_available = true
+  rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, StandardError
+    @toxiproxy_available = false
+  end
+
+  # Returns the Toxiproxy::Proxy for RabbitMQ traffic.
+  def toxiproxy_rabbitmq
+    Toxiproxy[:rabbitmq]
+  end
+
+  # Create a new isolated vhost for this test and return a connected Session.
+  # Create an isolated vhost, open a Session, yield, then clean up.
+  # Optional frame_max: lets callers test with a custom frame size.
+  def isolated_session(vhost: nil, frame_max: nil)
+    vhost ||= "test-#{SecureRandom.hex(6)}"
+    create_vhost(vhost)
+    opts = { host: RABBITMQ_HOST, port: RABBITMQ_PORT, vhost: vhost }
+    opts[:frame_max] = frame_max if frame_max
+    session = AsyncRabbitMQ::Session.new(**opts)
+    session.connect
+    yield session, vhost
+  ensure
+    session&.close rescue nil
+    delete_vhost(vhost) rescue nil
+  end
+
+  def create_vhost(vhost)
+    http_put("/api/vhosts/#{URI.encode_www_form_component(vhost)}")
+    http_put("/api/permissions/#{URI.encode_www_form_component(vhost)}/guest",
+             { configure: ".*", write: ".*", read: ".*" }.to_json)
+  end
+
+  def delete_vhost(vhost)
+    http_delete("/api/vhosts/#{URI.encode_www_form_component(vhost)}")
+  end
+
+  def http_put(path, body = nil)
+    mgmt_request(:put, path, body)
+  end
+
+  def http_delete(path)
+    mgmt_request(:delete, path)
+  end
+
+  def mgmt_request(method, path, body = nil)
+    require "net/http"
+    uri = URI("http://#{RABBITMQ_HOST}:#{RABBITMQ_MGMT}#{path}")
+    req = case method
+          when :put    then Net::HTTP::Put.new(uri)
+          when :delete then Net::HTTP::Delete.new(uri)
+          end
+    req["Content-Type"] = "application/json"
+    req.basic_auth("guest", "guest")
+    req.body = body if body
+    Net::HTTP.start(uri.host, uri.port) { |http| http.request(req) }
+  end
+end
+
+RSpec.configure do |config|
+  config.include IntegrationHelpers, :integration
+
+  # Wrap each integration test in Sync { } so async 2.x APIs work (Async::Task.current, etc.).
+  config.around(:each, :integration) do |example|
+    if rabbitmq_available?
+      Sync { example.run }
+    else
+      skip "RabbitMQ not available (set RABBITMQ_URL or start Docker)"
+    end
+  end
+
+  config.expect_with :rspec do |expectations|
+    expectations.include_chain_clauses_in_custom_matcher_descriptions = true
+  end
+
+  config.mock_with :rspec do |mocks|
+    mocks.verify_partial_doubles = true
+  end
+
+  config.shared_context_metadata_behavior = :apply_to_host_groups
+  config.filter_run_when_matching :focus
+  config.disable_monkey_patching!
+  config.warnings = true
+  config.order = :random
+  Kernel.srand config.seed
+end
