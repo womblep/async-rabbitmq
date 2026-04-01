@@ -43,28 +43,17 @@ from `@consumers` and invokes an optional `on_cancel` callback registered via `C
 
 ---
 
-## P1 — Spec Compliance Gaps (v1 scope)
+## P1 — Spec Compliance Gaps (v1 scope) — ✅ ALL RESOLVED
 
-### SPEC GAP: Server-initiated channel.flow not handled
-**File:** `lib/async_rabbitmq/channel.rb:425-431` (else clause)
-**What:** The broker can send `channel.flow(false)` to throttle the client. The current
-implementation only handles client→server direction. An inbound `Channel::Flow` falls into
-the `else` branch and (incorrectly) signals `@reply_condition`.
-**Fix:** Add `when AMQ::Protocol::Channel::Flow` case that sets `@flow_active = method.active`
-and sends back `Channel::FlowOk` — same as the client-initiated path but reversed.
-**Effort:** XS
+### ✅ SPEC GAP: Server-initiated channel.flow not handled
+**Fixed:** Added `when AMQ::Protocol::Channel::Flow` in `handle_method`. Sets `@flow_active`
+and immediately sends back `Channel::FlowOk`.
 
 ---
 
-### SPEC GAP: @confirm_condition not re-created on recovery
-**File:** `lib/async_rabbitmq/channel.rb:258-266`, `channel.rb:334-348`
-**What:** `@confirm_condition` is created once in `confirm_select` and reused across
-reconnects. `reopen_after_recovery` re-enables confirms on the new connection but does not
-reset `@confirm_condition`. A waiter holding a reference to the old condition object and
-new acks signalling the same condition can cause subtle ordering bugs.
-**Fix:** In `reopen_after_recovery`, after re-sending `Confirm::Select`, reset
-`@confirm_condition = Async::Condition.new` and clear `@pending_confirms`.
-**Effort:** XS
+### ✅ SPEC GAP: @confirm_condition not re-created on recovery
+**Fixed:** `reopen_after_recovery` now resets `@confirm_condition`, `@pending_confirms`, and
+`@delivery_tag` after successfully re-enabling confirms on the new connection.
 
 ---
 
