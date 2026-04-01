@@ -23,7 +23,9 @@
       "Read(//d/Ruby34-x64/lib/ruby/gems/3.4.0/gems/**)",
       "Bash(find D:/Ruby34-x64/lib/ruby/gems/3.4.0/gems -name *.rb -path *async-rspec*)",
       "Bash(find D:/Ruby34-x64/lib/ruby/gems/3.4.0/gems -name *.rb -path *async*)",
-      "Bash(ruby -r json -e \":*)"
+      "Bash(ruby -r json -e \":*)",
+      "Skill(browse)",
+      "Skill(browse:*)"
     ]
   }
 }
