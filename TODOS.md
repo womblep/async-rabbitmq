@@ -1,5 +1,115 @@
 # TODOS — async-rabbitmq
 
+## P0 — Bugs (must fix before v1)
+
+### BUG: re_register_consumers uses empty queue name — recovery is silently broken
+**File:** `lib/async_rabbitmq/channel.rb:522-525`
+**What:** `re_register_consumers` calls `basic_consume("", ...)` — always passes an empty queue
+name because the channel only stores `consumer_tag → block`, never the queue name. Every
+recovery attempt will get a 404 NOT_FOUND from the broker and silently skip all consumers.
+**Fix:** Store `consumer_tag → { queue_name:, block:, manual_ack: }` in `@consumers` in
+`basic_consume`, then use the stored queue name in `re_register_consumers`.
+**Effort:** XS
+
+---
+
+### BUG: wait_for_confirms hangs forever on disconnect
+**File:** `lib/async_rabbitmq/channel.rb:270-277`, `channel.rb:319-328`
+**What:** `interrupt_wait!` signals `@reply_condition` and `@content_condition` but never
+signals `@confirm_condition`. A fiber blocked in `wait_for_confirms` when the connection
+drops will hang indefinitely instead of raising `ConnectionError` as the design doc specifies.
+**Fix:** In `interrupt_wait!`, call `@confirm_condition&.signal(error)` and reset it to nil.
+**Effort:** XS
+
+---
+
+### BUG: Channel#each always fails — empty queue name
+**File:** `lib/async_rabbitmq/channel.rb:306-312`
+**What:** `Channel#each` calls `basic_consume("")` with an empty queue name. This is the
+duck-typed stream interface advertised as a core v1 feature. It will always 404.
+**Fix:** `#each` must take a queue name argument (e.g. `def each(queue_name, ...)`) or be
+redesigned. Update design doc API surface accordingly.
+**Effort:** XS
+
+---
+
+### BUG: @pending_confirms stores dead Async::Condition objects
+**File:** `lib/async_rabbitmq/channel.rb:174-180`
+**What:** `basic_publish` stores `@pending_confirms[tag] = Async::Condition.new` but these
+per-tag conditions are never waited on or signalled. `wait_for_confirms` only checks
+`@pending_confirms.empty?`. The conditions accumulate in memory until the hash is cleared
+and serve no purpose.
+**Fix:** Either remove the `Async::Condition` (just store `true` or the tag itself) or
+implement per-tag waiting properly. For now, storing the tag is sufficient.
+**Effort:** XS
+
+---
+
+### BUG: connection.blocked / connection.unblocked not processed
+**File:** `lib/async_rabbitmq/channel.rb:418-426`, `lib/async_rabbitmq/frame_io.rb`
+**What:** `connection.blocked` and `connection.unblocked` arrive on channel 0. Channel 0 has
+no `Channel` object and no dispatch task — `wait_channel0_method` only runs during handshake
+and close. These frames are routed to the channel-0 queue but never consumed. The design
+doc requires publish to yield when blocked and resume when unblocked. Currently neither
+happens. Test 07 passes only because it manually injects into the channel-0 queue; nothing
+reads that queue during normal operation.
+**Fix:** Dedicate a long-lived task to drain channel-0 frames after handshake completes.
+Handle `Connection::Blocked` by setting a `@blocked` flag that causes `write_frame` to
+yield until `Connection::Unblocked` clears it.
+**Effort:** S
+
+---
+
+### BUG: Server-initiated basic.cancel not handled
+**File:** `lib/async_rabbitmq/channel.rb:425-431` (else clause)
+**What:** RabbitMQ sends `basic.cancel` server→client when a queue is deleted or during HA
+failover. This lands in `handle_method`'s `else` branch and signals `@reply_condition`. If
+a fiber is waiting in `wait_for`, it raises `ChannelError("Expected X but got Basic::Cancel")`.
+If no fiber is waiting, the frame is silently dropped. Either way, the cancelled consumer
+remains in `@consumers` pointing at a dead tag.
+**Fix:** Add an explicit `when AMQ::Protocol::Basic::Cancel` case in `handle_method` that
+removes the consumer from `@consumers` and optionally calls a user-supplied `on_cancel`
+callback.
+**Effort:** S
+
+---
+
+### BUG: Soft error codes 311/312/313 misclassified as hard errors
+**File:** `lib/async_rabbitmq/frame_io.rb:26`
+**What:** `SOFT_ERROR_CODES = [403, 404, 405, 406]` is incomplete. The AMQP spec defines
+three additional channel-level soft errors: 311 (content-too-large), 312 (no-route), and
+313 (no-consumers). If the broker closes a channel with one of these codes, the code
+misclassifies it as a hard error and triggers full session recovery unnecessarily.
+**Fix:** Add 311, 312, 313 to `SOFT_ERROR_CODES`.
+**Effort:** XS
+
+---
+
+## P1 — Spec Compliance Gaps (v1 scope)
+
+### SPEC GAP: Server-initiated channel.flow not handled
+**File:** `lib/async_rabbitmq/channel.rb:425-431` (else clause)
+**What:** The broker can send `channel.flow(false)` to throttle the client. The current
+implementation only handles client→server direction. An inbound `Channel::Flow` falls into
+the `else` branch and (incorrectly) signals `@reply_condition`.
+**Fix:** Add `when AMQ::Protocol::Channel::Flow` case that sets `@flow_active = method.active`
+and sends back `Channel::FlowOk` — same as the client-initiated path but reversed.
+**Effort:** XS
+
+---
+
+### SPEC GAP: @confirm_condition not re-created on recovery
+**File:** `lib/async_rabbitmq/channel.rb:258-266`, `channel.rb:334-348`
+**What:** `@confirm_condition` is created once in `confirm_select` and reused across
+reconnects. `reopen_after_recovery` re-enables confirms on the new connection but does not
+reset `@confirm_condition`. A waiter holding a reference to the old condition object and
+new acks signalling the same condition can cause subtle ordering bugs.
+**Fix:** In `reopen_after_recovery`, after re-sending `Confirm::Select`, reset
+`@confirm_condition = Async::Condition.new` and clear `@pending_confirms`.
+**Effort:** XS
+
+---
+
 ## P2 — v2 Work (after v1 stable)
 
 ### Metrics / Instrumentation Hooks
