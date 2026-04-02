@@ -134,11 +134,12 @@ module IntegrationHelpers
   # Create a new isolated vhost for this test and return a connected Session.
   # Create an isolated vhost, open a Session, yield, then clean up.
   # Optional frame_max: lets callers test with a custom frame size.
-  def isolated_session(vhost: nil, frame_max: nil)
+  def isolated_session(vhost: nil, frame_max: nil, auth_mechanism: nil)
     vhost ||= "test-#{SecureRandom.hex(6)}"
     create_vhost(vhost)
     opts = { host: RABBITMQ_HOST, port: RABBITMQ_PORT, vhost: vhost }
     opts[:frame_max] = frame_max if frame_max
+    opts[:auth_mechanism] = auth_mechanism if auth_mechanism
     session = AsyncRabbitMQ::Session.new(**opts)
     session.connect
     yield session, vhost
