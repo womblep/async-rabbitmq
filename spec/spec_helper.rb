@@ -10,6 +10,7 @@ require "async/rspec"
 require "async_rabbitmq"
 require "uri"
 require "securerandom"
+require "socket"
 
 # Integration test helpers — require a live RabbitMQ.
 # Tests are skipped automatically when RABBITMQ_URL is not set.
@@ -20,9 +21,12 @@ RABBITMQ_TLS_PORT = (ENV["RABBITMQ_TLS_PORT"] || 15681).to_i
 RABBITMQ_MGMT     = (ENV["RABBITMQ_MGMT_PORT"] || 15680).to_i
 
 # ---------------------------------------------------------------------------
-# Toxiproxy — optional TCP fault injection. Tests that require it call
-# `toxiproxy_rabbitmq` which returns the Toxiproxy::Proxy, or they call
-# `toxiproxy_available?` to skip gracefully when the daemon is not running.
+# Toxiproxy — optional TCP fault injection.
+#
+# TOXIPROXY_RABBITMQ_UPSTREAM defaults to "rabbitmq:5672" (the Docker service
+# name) because docker-compose is the standard way to run the test suite.
+# If you run toxiproxy directly on the host, set:
+#   TOXIPROXY_RABBITMQ_UPSTREAM=127.0.0.1:5672
 # ---------------------------------------------------------------------------
 TOXIPROXY_HOST                  = ENV.fetch("TOXIPROXY_HOST",                  "http://127.0.0.1:18474")
 TOXIPROXY_PORT                  = (ENV["TOXIPROXY_RABBITMQ_PORT"] || 21111).to_i
@@ -35,10 +39,57 @@ TOXIPROXY_RABBITMQ_TLS_LISTEN   = ENV.fetch("TOXIPROXY_RABBITMQ_TLS_LISTEN",   "
 require "toxiproxy"
 Toxiproxy.host = TOXIPROXY_HOST
 
+# ---------------------------------------------------------------------------
+# ServiceBootstrap — starts docker-compose services automatically when
+# RabbitMQ is not reachable. Checks once at load time; services are left
+# running between test runs for speed. Stop manually with:
+#   docker compose -f spec/docker-compose.yml down
+# ---------------------------------------------------------------------------
+module ServiceBootstrap
+  COMPOSE_FILE = File.expand_path("docker-compose.yml", __dir__)
+  CERTS_DIR    = File.expand_path("docker/certs",       __dir__)
+  GEN_CERTS    = File.expand_path("docker/gen-certs.sh", __dir__)
+
+  def self.ensure_running!
+    return if port_open?(RABBITMQ_HOST, RABBITMQ_PORT)
+
+    $stderr.puts "--> RabbitMQ not detected — starting docker compose services..."
+    generate_certs unless certs_present?
+    compose_up
+    $stderr.puts "--> Services ready."
+  end
+
+  def self.certs_present?
+    File.exist?(File.join(CERTS_DIR, "ca_certificate.pem"))
+  end
+
+  def self.generate_certs
+    $stderr.puts "--> Generating TLS certificates..."
+    system("bash", GEN_CERTS) or raise "gen-certs.sh failed (exit #{$?.exitstatus})"
+  end
+
+  # --wait blocks until every service with a healthcheck reports healthy,
+  # so RabbitMQ is guaranteed ready before this returns.
+  def self.compose_up
+    system("docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--wait") \
+      or raise "docker compose up failed (exit #{$?.exitstatus})"
+  end
+
+  def self.port_open?(host, port)
+    TCPSocket.new(host, port).close
+    true
+  rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, SocketError
+    false
+  end
+end
+
+ServiceBootstrap.ensure_running!
+
+# ---------------------------------------------------------------------------
+# Integration test helpers.
+# ---------------------------------------------------------------------------
 module IntegrationHelpers
-  # Returns true when a live RabbitMQ is reachable.
   def rabbitmq_available?
-    require "socket"
     TCPSocket.new(RABBITMQ_HOST, RABBITMQ_PORT).close
     true
   rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT
@@ -136,7 +187,7 @@ RSpec.configure do |config|
     if rabbitmq_available?
       Sync { example.run }
     else
-      skip "RabbitMQ not available (set RABBITMQ_URL or start Docker)"
+      skip "RabbitMQ not available"
     end
   end
 

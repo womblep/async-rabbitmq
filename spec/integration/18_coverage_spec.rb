@@ -99,7 +99,6 @@ RSpec.describe "Coverage completion", :integration do
       isolated_session do |session, _|
         ch = session.open_channel
         q  = ch.queue("test.each.#{SecureRandom.hex(4)}", durable: false)
-        # Publish before consuming — ch.each uses the last-declared queue on the channel
         q.publish("hello from each")
 
         received = []
