@@ -272,8 +272,13 @@ module AsyncRabbitMQ
       msg = wait_channel0_method(AMQ::Protocol::Connection::Start)
       send_connection_start_ok
 
-      # connection.tune
-      msg = wait_channel0_method(AMQ::Protocol::Connection::Tune)
+      # connection.tune (broker may send connection.secure challenges first)
+      msg = wait_channel0_method(AMQ::Protocol::Connection::Tune, AMQ::Protocol::Connection::Secure)
+      while msg.is_a?(AMQ::Protocol::Connection::Secure)
+        @logger.warn("Received connection.secure SASL challenge — responding with empty string (only PLAIN auth is supported)")
+        @frame_io.write_frame(AMQ::Protocol::Connection::SecureOk.encode("").encode)
+        msg = wait_channel0_method(AMQ::Protocol::Connection::Tune, AMQ::Protocol::Connection::Secure)
+      end
       @negotiated_hb   = negotiate_heartbeat(msg.heartbeat)
       @negotiated_fm   = negotiate_frame_max(msg.frame_max)
       @negotiated_cmax = msg.channel_max == 0 ? 2047 : msg.channel_max
@@ -284,17 +289,17 @@ module AsyncRabbitMQ
       wait_channel0_method(AMQ::Protocol::Connection::OpenOk)
     end
 
-    def wait_channel0_method(expected_class)
+    def wait_channel0_method(*expected_classes)
       queue = @frame_io.channel_queue(0)
       loop do
         msg = queue.pop
         # nil sentinel — pushed by frame_io.stop or interrupt during recovery
-        raise ConnectionError, "Connection closed while waiting for #{expected_class}" if msg.nil?
+        raise ConnectionError, "Connection closed while waiting for #{expected_classes.join(', ')}" if msg.nil?
         next unless msg[0] == :method
         method = msg[1]
         # ConnectionError pushed directly by trigger_recovery to unblock this wait
         raise method if method.is_a?(ConnectionError) || method.is_a?(ChannelError)
-        if method.is_a?(expected_class)
+        if expected_classes.any? { |c| method.is_a?(c) }
           return method
         elsif method.is_a?(AMQ::Protocol::Connection::Close)
           code = method.reply_code

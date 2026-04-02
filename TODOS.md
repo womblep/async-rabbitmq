@@ -185,17 +185,11 @@ This is a valid AMQP 0-9-1 use-case (spec §3.1.2) and works today, but has no t
 
 ## P2 — v2 Work (after v1 stable)
 
-### IMPL GAP: connection.secure / connection.secure-ok not handled
+### ~~IMPL GAP: connection.secure / connection.secure-ok not handled~~ ✅ DONE
 **File:** `lib/async_rabbitmq/session.rb` — `handshake`
-**What:** The AMQP 0-9-1 handshake allows the broker to send `connection.secure` (SASL
-challenge) between `connection.start-ok` and `connection.tune`. The current `wait_channel0_method`
-loop skips unknown method types with `next`, so a `connection.secure` frame would cause the
-handshake to loop indefinitely. Standard RabbitMQ with PLAIN auth never sends this, but
-brokers using DIGEST-MD5 or GSSAPI would hang.
-**Fix:** In `handshake`, after sending `start-ok`, loop handling `connection.secure` (log a
-warning and send `connection.secure-ok` with empty response) until `connection.tune` arrives.
-**Effort:** XS
-**Depends on:** v1 stable (low urgency — PLAIN auth covers all current RabbitMQ deployments)
+**Resolved:** Handshake now loops on `Connection::Secure` frames between `start-ok` and `tune`,
+responding with `SecureOk("")` and logging a warning. `wait_channel0_method` accepts multiple
+expected classes via splat.
 
 ---
 
