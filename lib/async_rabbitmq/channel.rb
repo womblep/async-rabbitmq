@@ -252,6 +252,16 @@ module AsyncRabbitMQ
       @consumers.delete(consumer_tag)
     end
 
+    # Ask the broker to redeliver all unacknowledged messages on this channel.
+    # RabbitMQ only supports requeue: true; requeue: false raises a channel error.
+    def basic_recover(requeue: true)
+      assert_open!
+      @frame_io.write_frame(
+        AMQ::Protocol::Basic::Recover.encode(@channel_id, requeue).encode
+      )
+      wait_for(:basic_recover_ok, AMQ::Protocol::Basic::RecoverOk)
+    end
+
     # -------------------------------------------------------------------------
     # Publisher confirms
     # -------------------------------------------------------------------------
