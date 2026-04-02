@@ -9,7 +9,7 @@ Gem::Specification.new do |spec|
                        "Channels are duck-typed streams. Connection recovery is built-in."
   spec.homepage      = "https://github.com/russellthedev/async-rabbitmq"
   spec.license       = "MIT"
-  spec.required_ruby_version = ">= 3.2"
+  spec.required_ruby_version = ">= 3.3"
 
   spec.files         = Dir["lib/**/*.rb", "LICENSE", "README.md"]
   spec.require_paths = ["lib"]
