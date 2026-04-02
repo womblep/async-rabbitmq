@@ -23,6 +23,10 @@ RSpec.describe "connection.blocked / connection.unblocked", :integration do
       # Connection must stay open
       sleep 0.1
       expect(session.open?).to be true
+
+      # Unblock before closing so ch.close's write_frame doesn't hang
+      queue0.push([:method, AMQ::Protocol::Connection::Unblocked.new]) if queue0
+      sleep 0.05
       ch.close
     end
   end

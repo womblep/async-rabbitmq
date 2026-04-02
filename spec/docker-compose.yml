@@ -1,0 +1,37 @@
+# Test infrastructure — RabbitMQ + Toxiproxy.
+#
+# spec_helper.rb starts these automatically when RabbitMQ is not reachable.
+# You can also manage them manually:
+#
+#   docker compose -f spec/docker-compose.yml up -d
+#   docker compose -f spec/docker-compose.yml down
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    ports:
+      - "15682:5672"   # AMQP (plain)
+      - "15681:5671"   # AMQP over TLS
+      - "15680:15672"  # Management HTTP API
+    volumes:
+      - ./docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - ./docker/certs:/etc/rabbitmq/certs:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    ports:
+      - "18474:8474"   # Toxiproxy control API
+      - "21111:11111"  # Proxied AMQP → rabbitmq:5672
+      - "21112:11112"  # Proxied AMQPS → rabbitmq:5671
+    command:
+      - "-host=0.0.0.0"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy

@@ -13,18 +13,24 @@ require "securerandom"
 
 # Integration test helpers — require a live RabbitMQ.
 # Tests are skipped automatically when RABBITMQ_URL is not set.
-RABBITMQ_URL   = ENV.fetch("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672")
-RABBITMQ_HOST  = URI.parse(RABBITMQ_URL.sub("amqp://", "http://")).host rescue "127.0.0.1"
-RABBITMQ_PORT  = (ENV["RABBITMQ_PORT"] || 5672).to_i
-RABBITMQ_MGMT  = (ENV["RABBITMQ_MGMT_PORT"] || 15672).to_i
+RABBITMQ_URL      = ENV.fetch("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:15682")
+RABBITMQ_HOST     = URI.parse(RABBITMQ_URL.sub("amqp://", "http://")).host rescue "127.0.0.1"
+RABBITMQ_PORT     = (ENV["RABBITMQ_PORT"] || 15682).to_i
+RABBITMQ_TLS_PORT = (ENV["RABBITMQ_TLS_PORT"] || 15681).to_i
+RABBITMQ_MGMT     = (ENV["RABBITMQ_MGMT_PORT"] || 15680).to_i
 
 # ---------------------------------------------------------------------------
 # Toxiproxy — optional TCP fault injection. Tests that require it call
 # `toxiproxy_rabbitmq` which returns the Toxiproxy::Proxy, or they call
 # `toxiproxy_available?` to skip gracefully when the daemon is not running.
 # ---------------------------------------------------------------------------
-TOXIPROXY_HOST = ENV.fetch("TOXIPROXY_HOST", "http://127.0.0.1:8474")
-TOXIPROXY_PORT = (ENV["TOXIPROXY_RABBITMQ_PORT"] || 11111).to_i
+TOXIPROXY_HOST                  = ENV.fetch("TOXIPROXY_HOST",                  "http://127.0.0.1:18474")
+TOXIPROXY_PORT                  = (ENV["TOXIPROXY_RABBITMQ_PORT"] || 21111).to_i
+TOXIPROXY_TLS_PORT              = (ENV["TOXIPROXY_RABBITMQ_TLS_PORT"] || 21112).to_i
+TOXIPROXY_RABBITMQ_UPSTREAM     = ENV.fetch("TOXIPROXY_RABBITMQ_UPSTREAM",     "rabbitmq:5672")
+TOXIPROXY_RABBITMQ_LISTEN       = ENV.fetch("TOXIPROXY_RABBITMQ_LISTEN",       "0.0.0.0:11111")
+TOXIPROXY_RABBITMQ_TLS_UPSTREAM = ENV.fetch("TOXIPROXY_RABBITMQ_TLS_UPSTREAM", "rabbitmq:5671")
+TOXIPROXY_RABBITMQ_TLS_LISTEN   = ENV.fetch("TOXIPROXY_RABBITMQ_TLS_LISTEN",   "0.0.0.0:11112")
 
 require "toxiproxy"
 Toxiproxy.host = TOXIPROXY_HOST
@@ -40,22 +46,38 @@ module IntegrationHelpers
   end
 
   # Returns true when the toxiproxy daemon is reachable.
-  # Populates the rabbitmq proxy on first call.
+  # Creates the rabbitmq and rabbitmq_tls proxies if they don't already exist.
   def toxiproxy_available?
     return @toxiproxy_available if defined?(@toxiproxy_available)
-    Toxiproxy.populate([{
-      name:     "rabbitmq",
-      listen:   "127.0.0.1:#{TOXIPROXY_PORT}",
-      upstream: "#{RABBITMQ_HOST}:#{RABBITMQ_PORT}",
-    }])
+    proxies_to_create = []
+    begin Toxiproxy[:rabbitmq]; rescue Toxiproxy::NotFound
+      proxies_to_create << {
+        name:     "rabbitmq",
+        listen:   TOXIPROXY_RABBITMQ_LISTEN,
+        upstream: TOXIPROXY_RABBITMQ_UPSTREAM,
+      }
+    end
+    begin Toxiproxy[:rabbitmq_tls]; rescue Toxiproxy::NotFound
+      proxies_to_create << {
+        name:     "rabbitmq_tls",
+        listen:   TOXIPROXY_RABBITMQ_TLS_LISTEN,
+        upstream: TOXIPROXY_RABBITMQ_TLS_UPSTREAM,
+      }
+    end
+    Toxiproxy.populate(proxies_to_create) unless proxies_to_create.empty?
     @toxiproxy_available = true
   rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, StandardError
     @toxiproxy_available = false
   end
 
-  # Returns the Toxiproxy::Proxy for RabbitMQ traffic.
+  # Returns the Toxiproxy::Proxy for RabbitMQ AMQP traffic.
   def toxiproxy_rabbitmq
     Toxiproxy[:rabbitmq]
+  end
+
+  # Returns the Toxiproxy::Proxy for RabbitMQ TLS traffic.
+  def toxiproxy_rabbitmq_tls
+    Toxiproxy[:rabbitmq_tls]
   end
 
   # Create a new isolated vhost for this test and return a connected Session.

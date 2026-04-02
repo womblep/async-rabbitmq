@@ -36,6 +36,7 @@ RSpec.describe "Connection negotiation", :integration do
     toxiproxy_rabbitmq.down do
       session = AsyncRabbitMQ::Session.new(host: RABBITMQ_HOST, port: TOXIPROXY_PORT)
       expect { session.connect }.to raise_error(AsyncRabbitMQ::ConnectionTimeoutError)
+      session.close rescue nil
     end
   end
 

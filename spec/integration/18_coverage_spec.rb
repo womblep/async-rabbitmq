@@ -104,7 +104,7 @@ RSpec.describe "Coverage completion", :integration do
 
         received = []
         each_task = Async::Task.current.async do
-          ch.each do |_delivery, _headers, body|
+          ch.each(q.name) do |_delivery, _headers, body|
             received << body
           end
         end

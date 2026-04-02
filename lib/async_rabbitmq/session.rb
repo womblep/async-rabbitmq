@@ -56,6 +56,7 @@ module AsyncRabbitMQ
       @negotiated_cmax   = nil
       @recovery_in_progress = false
       @closed_by_user    = false
+      @connecting        = false
       @open_condition    = nil
       @last_frame_at     = nil
       @heartbeat_task    = nil
@@ -71,6 +72,7 @@ module AsyncRabbitMQ
     # Raises NotOpenError if already connected.
     def connect
       raise NotOpenError, "Session is already connected" if open?
+      @connecting = true
       @session_root_task = Async::Task.current
       Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
         raw_socket = open_socket
@@ -81,11 +83,15 @@ module AsyncRabbitMQ
         start_channel0_monitor_task
         @state = :open
       end
+      @connecting = false
     rescue Async::TimeoutError
+      cleanup_after_failed_connect
       raise ConnectionTimeoutError, "AMQP handshake did not complete within #{CONNECT_TIMEOUT}s"
     rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, SocketError => e
+      cleanup_after_failed_connect
       raise ConnectionTimeoutError, "Could not connect to #{@host}:#{@port} — #{e.message}"
     rescue OpenSSL::SSL::SSLError => e
+      cleanup_after_failed_connect
       raise ConnectionTimeoutError, "TLS handshake failed connecting to #{@host}:#{@port} — #{e.message}"
     end
 
@@ -157,6 +163,7 @@ module AsyncRabbitMQ
     # Called by FrameIO when a connection-level error triggers recovery.
     def trigger_recovery(error)
       return if @closed_by_user
+      return if @connecting
 
       @logger.warn("Connection lost (#{error.class}: #{error.message}). Starting recovery...")
 
@@ -208,6 +215,18 @@ module AsyncRabbitMQ
     end
 
     private
+
+    # Stop any in-flight frame_io / recovery tasks spawned during a failed connect.
+    def cleanup_after_failed_connect
+      @closed_by_user = true
+      @recovery_task&.cancel rescue nil
+      @recovery_task = nil
+      @heartbeat_task&.cancel rescue nil
+      @channel0_task&.cancel rescue nil
+      @frame_io&.stop rescue nil
+      @frame_io = nil
+      @state = :closed
+    end
 
     def open_socket
       if @tls
