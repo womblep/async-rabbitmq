@@ -57,14 +57,9 @@ and immediately sends back `Channel::FlowOk`.
 
 ---
 
-### IMPL GAP: basic.recover not implemented
-**File:** `lib/async_rabbitmq/channel.rb` (method missing entirely)
-**What:** The AMQP 0-9-1 spec defines `basic.recover(requeue)` → `basic.recover-ok`. It tells
-the broker to redeliver all unacknowledged messages on the channel. RabbitMQ supports
-`requeue: true`; `requeue: false` is rejected with a channel error.
-**Fix:** Add `Channel#basic_recover(requeue: true)` that sends `Basic::Recover.encode` and
-waits for `Basic::RecoverOk`. Document that `requeue: false` raises `ChannelError` on RabbitMQ.
-**Effort:** XS
+### ~~IMPL GAP: basic.recover not implemented~~ ✅ DONE
+**File:** `lib/async_rabbitmq/channel.rb` — `Channel#basic_recover(requeue: true)`
+**Resolved:** Added method + integration spec (`spec/integration/19_basic_recover_spec.rb`).
 
 ---
 
