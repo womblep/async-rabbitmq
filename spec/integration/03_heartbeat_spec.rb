@@ -59,6 +59,7 @@ RSpec.describe "Heartbeat", :integration do
     expect(
       session.open? || session.instance_variable_get(:@recovery_in_progress)
     ).to be true
+    session.close rescue nil
   end
 
   it "adds network latency via toxiproxy and still completes handshake", :toxiproxy do

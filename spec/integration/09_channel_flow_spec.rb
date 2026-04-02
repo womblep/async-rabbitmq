@@ -1,43 +1,25 @@
 require "spec_helper"
 
 # Step 9: channel.flow — client-side publish throttling.
-# NOTE: RabbitMQ 3.9+ deprecated channel.flow. Modern brokers close the
-# connection instead of sending FlowOk. Both tests skip gracefully when
-# the broker does not support this method.
+# NOTE: RabbitMQ 3.9+ deprecated channel.flow and closes the connection
+# with 540 NOT_IMPLEMENTED when active=false. active=true is accepted as
+# a no-op since flow is already active by default.
 RSpec.describe "Channel flow control", :integration do
 
-  it "sends channel.flow(false) and receives FlowOk" do
+  it "sends channel.flow(false) and broker rejects with NOT_IMPLEMENTED" do
     isolated_session do |session, _|
       ch = session.open_channel
-      begin
+      expect {
         ch.flow(false)
-      rescue AsyncRabbitMQ::ConnectionError, AsyncRabbitMQ::ChannelError => e
-        skip "Broker does not support channel.flow (deprecated in RabbitMQ 3.9+): #{e.message}"
-      end
-      # Restore flow before closing
-      begin
-        ch.flow(true)
-      rescue AsyncRabbitMQ::ConnectionError, AsyncRabbitMQ::ChannelError
-        # Already closing; swallow
-      end
-      ch.close rescue nil
+      }.to raise_error(AsyncRabbitMQ::ConnectionError, /NOT_IMPLEMENTED/)
     end
   end
 
-  it "sends channel.flow(true) to resume" do
+  it "sends channel.flow(true) which succeeds as a no-op" do
     isolated_session do |session, _|
       ch = session.open_channel
-      begin
-        ch.flow(false)
-      rescue AsyncRabbitMQ::ConnectionError, AsyncRabbitMQ::ChannelError => e
-        skip "Broker does not support channel.flow (deprecated in RabbitMQ 3.9+): #{e.message}"
-      end
-      begin
-        ch.flow(true)
-      rescue AsyncRabbitMQ::ConnectionError, AsyncRabbitMQ::ChannelError => e
-        skip "Broker does not support channel.flow (deprecated in RabbitMQ 3.9+): #{e.message}"
-      end
-      ch.close rescue nil
+      expect { ch.flow(true) }.not_to raise_error
+      ch.close
     end
   end
 end

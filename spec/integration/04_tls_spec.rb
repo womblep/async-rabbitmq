@@ -3,7 +3,7 @@ require "spec_helper"
 # Step 4: TLS connect — direct TLS, minimum TLS 1.2.
 RSpec.describe "TLS connection", :integration do
 
-  let(:tls_port)  { (ENV["RABBITMQ_TLS_PORT"] || 5671).to_i }
+  let(:tls_port)  { RABBITMQ_TLS_PORT }
   let(:tls_cert)  { ENV["RABBITMQ_TLS_CERT"] }
   let(:tls_key)   { ENV["RABBITMQ_TLS_KEY"] }
   let(:tls_ca)    { ENV["RABBITMQ_TLS_CA"] }
