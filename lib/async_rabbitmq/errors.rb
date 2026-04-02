@@ -36,4 +36,7 @@ module AsyncRabbitMQ
 
   # Raised when an operation is attempted on a closed channel or session.
   class NotOpenError < Error; end
+
+  # Raised when SASL negotiation fails (no common mechanism, bad credentials).
+  class AuthenticationError < Error; end
 end

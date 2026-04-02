@@ -6,6 +6,7 @@ require "logger"
 require_relative "errors"
 require_relative "frame_io"
 require_relative "channel"
+require_relative "sasl"
 
 module AsyncRabbitMQ
   # Represents one AMQP connection to a RabbitMQ broker.
@@ -33,18 +34,20 @@ module AsyncRabbitMQ
       tls_context: nil,
       heartbeat: 60,
       frame_max: 131_072,
+      auth_mechanism: nil,
       logger: Logger.new($stdout)
     )
-      @host        = host
-      @port        = port
-      @vhost       = vhost
-      @username    = username
-      @password    = password
-      @tls         = tls
-      @tls_context = tls_context
-      @heartbeat   = heartbeat
-      @frame_max   = frame_max
-      @logger      = logger
+      @host           = host
+      @port           = port
+      @vhost          = vhost
+      @username       = username
+      @password       = password
+      @tls            = tls
+      @tls_context    = tls_context
+      @heartbeat      = heartbeat
+      @frame_max      = frame_max
+      @auth_mechanism = auth_mechanism
+      @logger         = logger
 
       @state             = :closed
       @frame_io          = nil
@@ -93,6 +96,9 @@ module AsyncRabbitMQ
     rescue OpenSSL::SSL::SSLError => e
       cleanup_after_failed_connect
       raise ConnectionTimeoutError, "TLS handshake failed connecting to #{@host}:#{@port} — #{e.message}"
+    rescue AuthenticationError
+      cleanup_after_failed_connect
+      raise
     end
 
     def open?
@@ -268,12 +274,23 @@ module AsyncRabbitMQ
       # Send AMQP protocol header directly on the socket
       @frame_io.instance_variable_get(:@socket).write(PROTOCOL_HEADER)
 
-      # connection.start
-      msg = wait_channel0_method(AMQ::Protocol::Connection::Start)
-      send_connection_start_ok
+      # connection.start — negotiate SASL mechanism
+      start = wait_channel0_method(AMQ::Protocol::Connection::Start)
+      sasl = SASL.negotiate(
+        start.mechanisms,
+        preferred: @auth_mechanism,
+        username: @username,
+        password: @password
+      )
+      send_connection_start_ok(sasl)
 
-      # connection.tune
-      msg = wait_channel0_method(AMQ::Protocol::Connection::Tune)
+      # connection.tune (broker may send connection.secure challenges first)
+      msg = wait_channel0_method(AMQ::Protocol::Connection::Tune, AMQ::Protocol::Connection::Secure)
+      while msg.is_a?(AMQ::Protocol::Connection::Secure)
+        @logger.debug("Received connection.secure SASL challenge for #{sasl.mechanism_name}")
+        @frame_io.write_frame(AMQ::Protocol::Connection::SecureOk.encode(sasl.challenge_response(msg.challenge)).encode)
+        msg = wait_channel0_method(AMQ::Protocol::Connection::Tune, AMQ::Protocol::Connection::Secure)
+      end
       @negotiated_hb   = negotiate_heartbeat(msg.heartbeat)
       @negotiated_fm   = negotiate_frame_max(msg.frame_max)
       @negotiated_cmax = msg.channel_max == 0 ? 2047 : msg.channel_max
@@ -284,17 +301,17 @@ module AsyncRabbitMQ
       wait_channel0_method(AMQ::Protocol::Connection::OpenOk)
     end
 
-    def wait_channel0_method(expected_class)
+    def wait_channel0_method(*expected_classes)
       queue = @frame_io.channel_queue(0)
       loop do
         msg = queue.pop
         # nil sentinel — pushed by frame_io.stop or interrupt during recovery
-        raise ConnectionError, "Connection closed while waiting for #{expected_class}" if msg.nil?
+        raise ConnectionError, "Connection closed while waiting for #{expected_classes.join(', ')}" if msg.nil?
         next unless msg[0] == :method
         method = msg[1]
         # ConnectionError pushed directly by trigger_recovery to unblock this wait
         raise method if method.is_a?(ConnectionError) || method.is_a?(ChannelError)
-        if method.is_a?(expected_class)
+        if expected_classes.any? { |c| method.is_a?(c) }
           return method
         elsif method.is_a?(AMQ::Protocol::Connection::Close)
           code = method.reply_code
@@ -308,12 +325,12 @@ module AsyncRabbitMQ
       end
     end
 
-    def send_connection_start_ok
+    def send_connection_start_ok(sasl)
       @frame_io.write_frame(
         AMQ::Protocol::Connection::StartOk.encode(
           {},
-          "PLAIN",
-          "\x00#{@username}\x00#{@password}",
+          sasl.mechanism_name,
+          sasl.initial_response,
           "en_US"
         ).encode
       )
