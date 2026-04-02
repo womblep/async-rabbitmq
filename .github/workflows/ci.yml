@@ -40,8 +40,55 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
 
-      # spec_helper.rb starts docker compose automatically (gen-certs + compose up --wait),
-      # so no separate service containers or wait steps are needed here.
+      - name: Generate TLS certificates
+        run: bash spec/docker/gen-certs.sh
+
+      - name: Create Docker network
+        run: docker network create test-net
+
+      - name: Start RabbitMQ
+        run: |
+          docker run -d --name rabbitmq --network test-net \
+            -p 15682:5672 -p 15681:5671 -p 15680:15672 \
+            -v ${{ github.workspace }}/spec/docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro \
+            -v ${{ github.workspace }}/spec/docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro \
+            -v ${{ github.workspace }}/spec/docker/certs:/etc/rabbitmq/certs:ro \
+            rabbitmq:4-management-alpine
+
+      - name: Wait for RabbitMQ to be healthy
+        run: |
+          echo "Waiting for RabbitMQ..."
+          for i in $(seq 1 30); do
+            if docker exec rabbitmq rabbitmq-diagnostics -q ping 2>/dev/null; then
+              echo "RabbitMQ is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "RabbitMQ failed to start"
+          docker logs rabbitmq
+          exit 1
+
+      - name: Start Toxiproxy
+        run: |
+          docker run -d --name toxiproxy --network test-net \
+            -p 18474:8474 -p 21111:11111 -p 21112:11112 \
+            ghcr.io/shopify/toxiproxy:2.9.0 \
+            -host=0.0.0.0
+
+      - name: Wait for Toxiproxy
+        run: |
+          for i in $(seq 1 10); do
+            if curl -sf http://127.0.0.1:18474/version >/dev/null 2>&1; then
+              echo "Toxiproxy is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Toxiproxy failed to start"
+          docker logs toxiproxy
+          exit 1
+
       - name: Run tests
         run: bundle exec rspec spec/integration/
 
@@ -51,3 +98,9 @@ jobs:
         with:
           name: coverage-ruby-${{ matrix.ruby }}
           path: coverage/
+
+      - name: Cleanup containers
+        if: always()
+        run: |
+          docker rm -f toxiproxy rabbitmq 2>/dev/null || true
+          docker network rm test-net 2>/dev/null || true
