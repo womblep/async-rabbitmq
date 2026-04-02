@@ -49,10 +49,19 @@ jobs:
       - name: Create Docker network
         run: docker network create test-net
 
+      - name: Prepare RabbitMQ data directory
+        run: |
+          mkdir -p /tmp/rabbitmq-data
+          echo -n 'ci-test-cookie' > /tmp/rabbitmq-data/.erlang.cookie
+          chmod 600 /tmp/rabbitmq-data/.erlang.cookie
+          # RabbitMQ container runs as uid 999 (rabbitmq user)
+          sudo chown -R 999:999 /tmp/rabbitmq-data
+
       - name: Start RabbitMQ
         run: |
           docker run -d --name rabbitmq --network test-net \
             -p 15682:5672 -p 15681:5671 -p 15680:15672 \
+            -v /tmp/rabbitmq-data:/var/lib/rabbitmq \
             -v ${{ github.workspace }}/spec/docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro \
             -v ${{ github.workspace }}/spec/docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro \
             -v ${{ github.workspace }}/spec/docker/certs:/etc/rabbitmq/certs:ro \
