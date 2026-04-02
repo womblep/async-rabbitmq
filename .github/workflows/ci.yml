@@ -41,7 +41,10 @@ jobs:
           bundler-cache: true
 
       - name: Generate TLS certificates
-        run: bash spec/docker/gen-certs.sh
+        run: |
+          bash spec/docker/gen-certs.sh
+          # Make certs readable by the RabbitMQ container (runs as uid 999)
+          chmod 644 spec/docker/certs/*.pem
 
       - name: Create Docker network
         run: docker network create test-net
