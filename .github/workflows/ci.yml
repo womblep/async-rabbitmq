@@ -53,6 +53,7 @@ jobs:
         run: |
           docker run -d --name rabbitmq --network test-net \
             -p 15682:5672 -p 15681:5671 -p 15680:15672 \
+            -e RABBITMQ_ERLANG_COOKIE=ci-test-cookie \
             -v ${{ github.workspace }}/spec/docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro \
             -v ${{ github.workspace }}/spec/docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro \
             -v ${{ github.workspace }}/spec/docker/certs:/etc/rabbitmq/certs:ro \
