@@ -67,6 +67,7 @@ module AsyncRabbitMQ
     # Queue
     # -------------------------------------------------------------------------
 
+    # Pass an empty string as +name+ to let the broker generate a unique name (amq.gen-*).
     def queue(name, durable: false, exclusive: false, auto_delete: false, arguments: {})
       assert_open!
       @frame_io.write_frame(
