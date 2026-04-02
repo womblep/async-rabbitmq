@@ -85,15 +85,10 @@ without creating the exchange. The `passive:` keyword is missing from `Channel#e
 
 ---
 
-### IMPL GAP: server-generated queue name undocumented / untested
+### ~~IMPL GAP: server-generated queue name undocumented / untested~~ ✅ DONE
 **File:** `lib/async_rabbitmq/channel.rb` — `Channel#queue`
-**What:** Passing an empty string as the queue name causes the broker to generate a unique name
-and return it in `DeclareOk`. This works today but is untested and not mentioned in any doc or
-comment. Easy to overlook.
-**Fix:** Add an integration test in `11_queue_operations_spec.rb` verifying that
-`ch.queue("")` returns a queue whose name is non-empty. Add a code comment in `Channel#queue`
-noting this behaviour.
-**Effort:** XS
+**Resolved:** Added code comment and integration test in `11_queue_operations_spec.rb` verifying
+`ch.queue("")` returns a broker-generated `amq.gen-*` name.
 
 ---
 

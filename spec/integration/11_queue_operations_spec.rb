@@ -48,6 +48,16 @@ RSpec.describe "Queue operations", :integration do
     end
   end
 
+  it "generates a unique name when declared with an empty string" do
+    isolated_session do |session, _|
+      ch = session.open_channel
+      q  = ch.queue("")
+      expect(q.name).not_to be_empty
+      expect(q.name).to match(/\Aamq\.gen-/), "expected server-generated name starting with amq.gen-"
+      ch.close
+    end
+  end
+
   it "deletes a queue" do
     isolated_session do |session, _|
       ch = session.open_channel
