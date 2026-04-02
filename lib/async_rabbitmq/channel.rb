@@ -67,11 +67,11 @@ module AsyncRabbitMQ
     # Queue
     # -------------------------------------------------------------------------
 
-    def queue(name, durable: false, exclusive: false, auto_delete: false, arguments: {})
+    def queue(name, passive: false, durable: false, exclusive: false, auto_delete: false, arguments: {})
       assert_open!
       @frame_io.write_frame(
         AMQ::Protocol::Queue::Declare.encode(
-          @channel_id, name, false, durable, exclusive, auto_delete, false, arguments
+          @channel_id, name, passive, durable, exclusive, auto_delete, false, arguments
         ).encode
       )
       resp = wait_for(:queue_declare_ok, AMQ::Protocol::Queue::DeclareOk)
@@ -116,11 +116,11 @@ module AsyncRabbitMQ
     # Exchange
     # -------------------------------------------------------------------------
 
-    def exchange(name, type: :direct, durable: false, auto_delete: false, arguments: {})
+    def exchange(name, type: :direct, passive: false, durable: false, auto_delete: false, arguments: {})
       assert_open!
       @frame_io.write_frame(
         AMQ::Protocol::Exchange::Declare.encode(
-          @channel_id, name, type.to_s, false, durable, auto_delete, false, false, arguments
+          @channel_id, name, type.to_s, passive, durable, auto_delete, false, false, arguments
         ).encode
       )
       wait_for(:exchange_declare_ok, AMQ::Protocol::Exchange::DeclareOk)

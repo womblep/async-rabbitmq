@@ -68,7 +68,7 @@ waits for `Basic::RecoverOk`. Document that `requeue: false` raises `ChannelErro
 
 ---
 
-### IMPL GAP: queue.declare passive flag not exposed
+### ~~IMPL GAP: queue.declare passive flag not exposed~~ DONE
 **File:** `lib/async_rabbitmq/channel.rb` — `Channel#queue`
 **What:** The spec defines `queue.declare(passive: true)` as a way to assert a queue exists
 without creating it. If the queue does not exist the broker raises 404. This is a standard
@@ -80,7 +80,7 @@ pattern for defensive startup checks. The `passive:` keyword is not forwarded in
 
 ---
 
-### IMPL GAP: exchange.declare passive flag not exposed
+### ~~IMPL GAP: exchange.declare passive flag not exposed~~ DONE
 **File:** `lib/async_rabbitmq/channel.rb` — `Channel#exchange`
 **What:** Same pattern as queue passive — `exchange.declare(passive: true)` asserts existence
 without creating the exchange. The `passive:` keyword is missing from `Channel#exchange`.
