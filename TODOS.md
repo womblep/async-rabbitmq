@@ -85,101 +85,53 @@ without creating the exchange. The `passive:` keyword is missing from `Channel#e
 
 ---
 
-### ~~IMPL GAP: server-generated queue name undocumented / untested~~ ✅ DONE
-**File:** `lib/async_rabbitmq/channel.rb` — `Channel#queue`
-**Resolved:** Added code comment and integration test in `11_queue_operations_spec.rb` verifying
-`ch.queue("")` returns a broker-generated `amq.gen-*` name.
+### ~~IMPL GAP: server-generated queue name undocumented / untested~~ DONE
+**Resolved:** Added code comment in `Channel#queue` and integration test in
+`spec/integration/21_test_gap_coverage_spec.rb`.
 
 ---
 
 ## P1 — Test Coverage Gaps (v1 scope, code exists but no test)
 
-### TEST GAP: Server-initiated basic.cancel not tested
-**File:** `spec/integration/13_consumer_spec.rb`
-**What:** The `when AMQ::Protocol::Basic::Cancel` handler was added in the P0-6 fix but there
-is no integration test that exercises it. Without a test, a future refactor could silently
-break consumer cleanup on HA failover or queue deletion.
-**How to test:** Declare an auto-delete queue, start a consumer, then delete the queue via a
-second channel → broker sends `basic.cancel` to the first channel. Assert the consumer tag is
-removed from `@consumers` and the `on_cancel` callback fires.
-**Effort:** XS
+### ~~TEST GAP: Server-initiated basic.cancel not tested~~ DONE
+### ~~TEST GAP: on_cancel callback not tested~~ DONE
+**Resolved:** Both covered in `spec/integration/21_test_gap_coverage_spec.rb` — injects
+`Basic::Cancel` frame, verifies consumer removal and `on_cancel` callback fires.
 
 ---
 
-### TEST GAP: on_cancel callback not tested
-**File:** `spec/integration/13_consumer_spec.rb`
-**What:** `Channel#on_cancel` is new public API (P0-6) with no test.
-**How to test:** Register `ch.on_cancel { |tag| ... }`, trigger a server-initiated cancel (see
-above), verify the block was called with the correct consumer tag.
-**Effort:** XS
+### ~~TEST GAP: write_frame blocking while connection.blocked not tested~~ DONE
+**Resolved:** Covered in `spec/integration/21_test_gap_coverage_spec.rb` — verifies
+`write_frame` suspends while blocked and resumes after `set_unblocked`.
 
 ---
 
-### TEST GAP: write_frame blocking while connection.blocked not tested
-**File:** `spec/integration/07_connection_blocked_spec.rb`
-**What:** The `07` spec pushes frames directly into the channel-0 queue (logs a warning) but
-never verifies that `write_frame` actually suspends while blocked and resumes after unblocked.
-The actual backpressure gate in `FrameIO#write_frame` is untested.
-**How to test:** Call `frame_io.set_blocked("test")`, spawn a fiber that calls
-`frame_io.write_frame(some_data)`, assert it hasn't returned after a small yield, then call
-`frame_io.set_unblocked` and assert the fiber completes.
-**Effort:** XS
+### ~~TEST GAP: wait_for_confirms raises ConnectionError on disconnect~~ DONE
+**Resolved:** Covered in `spec/integration/21_test_gap_coverage_spec.rb` — kills socket
+during `wait_for_confirms`, verifies ConnectionError or channel closure.
 
 ---
 
-### TEST GAP: wait_for_confirms raises ConnectionError on disconnect
-**File:** `spec/integration/15_publisher_confirms_spec.rb`
-**What:** The P0-2 fix ensures `interrupt_wait!` signals `@confirm_condition`, but there is no
-test that kills the connection while a fiber is blocked in `wait_for_confirms` and verifies it
-raises `ConnectionError` rather than hanging.
-**How to test:** Enable confirms, publish a message to a slow queue, call `wait_for_confirms`
-concurrently in a fiber, kill the socket, assert the fiber raises `ConnectionError`.
-**Effort:** S
+### ~~TEST GAP: publisher confirms work correctly after recovery~~ DONE
+**Resolved:** Covered in `spec/integration/21_test_gap_coverage_spec.rb` — uses toxiproxy
+to cut connection, verifies `wait_for_confirms` succeeds after recovery.
 
 ---
 
-### TEST GAP: publisher confirms work correctly after recovery
-**File:** `spec/integration/18_coverage_spec.rb`
-**What:** The existing recovery + confirms test only checks `session.open?` after reconnect. It
-does not verify that `wait_for_confirms` actually succeeds for a publish made after recovery —
-i.e. that `@confirm_condition`, `@pending_confirms`, and `@delivery_tag` were correctly reset
-by the P1-2 fix.
-**How to test:** After the socket-kill + sleep, call `ch.basic_publish` then `ch.wait_for_confirms`
-and assert it returns `true`.
-**Effort:** XS
+### ~~TEST GAP: server-initiated channel.flow not tested~~ DONE
+**Resolved:** Covered in `spec/integration/21_test_gap_coverage_spec.rb` — injects
+`Channel::Flow` frame, stubs `write_frame` to capture FlowOk, verifies `@flow_active` toggle.
 
 ---
 
-### TEST GAP: server-initiated channel.flow not tested
-**File:** `spec/integration/09_channel_flow_spec.rb`
-**What:** The P1-1 fix handles `Channel::Flow` arriving from the broker but the spec only tests
-the client→server direction (`ch.flow(false/true)`). Server→client flow is untested.
-**How to test:** Inject a `Channel::Flow(active: false)` frame into the channel's dispatch queue
-and verify `channel.instance_variable_get(:@flow_active)` becomes `false` and a `FlowOk` frame
-was written.
-**Effort:** XS
+### ~~TEST GAP: soft error codes 311/312/313 raise ChannelError not ConnectionError~~ DONE
+**Resolved:** Covered in `spec/integration/21_test_gap_coverage_spec.rb` — injects
+`Channel::Close(312)`, verifies ChannelError raised and connection stays alive.
 
 ---
 
-### TEST GAP: soft error codes 311/312/313 raise ChannelError not ConnectionError
-**File:** `spec/integration/06_channel_errors_spec.rb`
-**What:** The P0-7 fix added 311/312/313 to `SOFT_ERROR_CODES` but there is no test that
-actually triggers one of these codes to confirm the classification.
-**How to test:** Code 312 (no-route) can be triggered by publishing with `mandatory: true` to
-a direct exchange that has no matching queue binding, then registering `on_return`. The channel
-must stay open (soft error); if it closes, the fix is broken.
-Alternatively: code 313 (no-consumers) if RabbitMQ emits it. Check which codes RabbitMQ 4.x
-actually sends and add targeted cases.
-**Effort:** S
-
----
-
-### TEST GAP: server-generated queue name (queue(""))
-**File:** `spec/integration/11_queue_operations_spec.rb`
-**What:** Passing an empty name to `ch.queue("")` causes the broker to generate a unique name.
-This is a valid AMQP 0-9-1 use-case (spec §3.1.2) and works today, but has no test.
-**How to test:** `q = ch.queue(""); expect(q.name).not_to be_empty`.
-**Effort:** XS
+### ~~TEST GAP: server-generated queue name (queue(""))~~ DONE
+**Resolved:** Covered in `spec/integration/21_test_gap_coverage_spec.rb`.
 
 ---
 
