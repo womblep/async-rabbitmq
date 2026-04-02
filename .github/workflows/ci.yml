@@ -57,7 +57,7 @@ jobs:
             -v ${{ github.workspace }}/spec/docker/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro \
             -v ${{ github.workspace }}/spec/docker/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro \
             -v ${{ github.workspace }}/spec/docker/certs:/etc/rabbitmq/certs:ro \
-            rabbitmq:4-management
+            rabbitmq:4-management-alpine
 
       - name: Wait for RabbitMQ to be healthy
         run: |
