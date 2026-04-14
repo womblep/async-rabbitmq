@@ -23,16 +23,31 @@ module AsyncRabbitMQ
     RECOVERY_JITTER     = 0.25   # ±25%
     PROTOCOL_HEADER     = "AMQP\x00\x00\x09\x01".b.freeze
 
-    attr_reader :host, :port, :vhost, :username
+    attr_reader :host, :port, :vhost, :username, :addresses
 
-    # Build a Session from an AMQP URI string.
+    # Build a Session from one or more AMQP URI strings.
     #
     #   Session.from_uri("amqp://user:pass@rabbit:5672/myvhost")
     #   Session.from_uri("amqps://rabbit/myvhost", tls_context: ctx)
+    #   Session.from_uri("amqp://rabbit1:5672/vh", "amqp://rabbit2:5672/vh")
     #
-    # Keyword arguments override anything parsed from the URI.
-    def self.from_uri(uri_string, **kwargs)
-      opts = parse_amqp_uri(uri_string)
+    # When multiple URIs are given, credentials, vhost, and TLS settings are
+    # taken from the first URI.  Each URI contributes a host:port pair to the
+    # +addresses+ list used for failover.
+    #
+    # Keyword arguments override anything parsed from the URI(s).
+    def self.from_uri(*uri_strings, **kwargs)
+      raise ArgumentError, "at least one URI string is required" if uri_strings.empty?
+
+      first_opts = parse_amqp_uri(uri_strings.first)
+      address_list = uri_strings.map do |u|
+        parsed = parse_amqp_uri(u)
+        "#{parsed[:host] || 'localhost'}:#{parsed[:port] || 5672}"
+      end
+
+      # Connection-level settings come from the first URI; addresses from all.
+      opts = first_opts.except(:host, :port)
+      opts[:addresses] = address_list
       new(**opts.merge(kwargs))
     end
 
@@ -64,6 +79,9 @@ module AsyncRabbitMQ
     def initialize(
       host: "localhost",
       port: 5672,
+      hosts: nil,
+      addresses: nil,
+      hosts_shuffle_strategy: :shuffle,
       vhost: "/",
       username: "guest",
       password: "guest",
@@ -79,8 +97,10 @@ module AsyncRabbitMQ
       recovery_max_interval: RECOVERY_MAX,
       logger: Logger.new($stdout)
     )
-      @host                 = host
-      @port                 = port
+      @addresses = build_address_list(host, port, hosts, addresses)
+      @host                 = @addresses.first[0]
+      @port                 = @addresses.first[1]
+      @hosts_shuffle_strategy = hosts_shuffle_strategy
       @vhost                = vhost
       @username             = username
       @password             = password
@@ -129,28 +149,52 @@ module AsyncRabbitMQ
       raise NotOpenError, "Session is already connected" if open?
       @connecting = true
       @session_root_task = Async::Task.current
-      Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
-        raw_socket = open_socket
-        @frame_io  = build_frame_io(raw_socket)
-        @frame_io.start
-        handshake
-        start_heartbeat_task
-        start_channel0_monitor_task
-        @state = :open
+
+      last_error = nil
+      shuffled_addresses.each do |target_host, target_port|
+        begin
+          Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
+            raw_socket = open_socket(target_host, target_port)
+            @frame_io  = build_frame_io(raw_socket)
+            @frame_io.start
+            handshake
+            start_heartbeat_task
+            start_channel0_monitor_task
+            @host  = target_host
+            @port  = target_port
+            @state = :open
+          end
+          @connecting = false
+          return
+        rescue Async::TimeoutError => e
+          @frame_io&.stop rescue nil
+          @frame_io = nil
+          last_error = e
+        rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, SocketError => e
+          @frame_io&.stop rescue nil
+          @frame_io = nil
+          last_error = e
+        rescue OpenSSL::SSL::SSLError => e
+          @frame_io&.stop rescue nil
+          @frame_io = nil
+          last_error = e
+        rescue AuthenticationError
+          cleanup_after_failed_connect
+          raise
+        end
       end
-      @connecting = false
-    rescue Async::TimeoutError
+
+      # All addresses exhausted
       cleanup_after_failed_connect
-      raise ConnectionTimeoutError, "AMQP handshake did not complete within #{CONNECT_TIMEOUT}s"
-    rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, SocketError => e
-      cleanup_after_failed_connect
-      raise ConnectionTimeoutError, "Could not connect to #{@host}:#{@port} — #{e.message}"
-    rescue OpenSSL::SSL::SSLError => e
-      cleanup_after_failed_connect
-      raise ConnectionTimeoutError, "TLS handshake failed connecting to #{@host}:#{@port} — #{e.message}"
-    rescue AuthenticationError
-      cleanup_after_failed_connect
-      raise
+      tried = @addresses.map { |h, p| "#{h}:#{p}" }.join(", ")
+      case last_error
+      when Async::TimeoutError
+        raise ConnectionTimeoutError, "AMQP handshake did not complete within #{CONNECT_TIMEOUT}s (tried #{tried})"
+      when OpenSSL::SSL::SSLError
+        raise ConnectionTimeoutError, "TLS handshake failed (tried #{tried}) — #{last_error.message}"
+      else
+        raise ConnectionTimeoutError, "Could not connect to any host (tried #{tried}) — #{last_error&.message}"
+      end
     end
 
     def open?
@@ -312,6 +356,35 @@ module AsyncRabbitMQ
 
     private
 
+    # Build the canonical [host, port] list from the various input forms.
+    #
+    #   addresses: ["rabbit1:5672", "rabbit2:5673"]    -> [["rabbit1",5672], ["rabbit2",5673]]
+    #   hosts: ["rabbit1", "rabbit2"], port: 5672       -> [["rabbit1",5672], ["rabbit2",5672]]
+    #   host: "rabbit1", port: 5672 (default)           -> [["rabbit1",5672]]
+    def build_address_list(host, port, hosts, addresses)
+      if addresses && !addresses.empty?
+        addresses.map do |addr|
+          h, p = addr.to_s.split(":", 2)
+          [h, p ? p.to_i : port]
+        end
+      elsif hosts && !hosts.empty?
+        hosts.map { |h| [h.to_s, port] }
+      else
+        [[host.to_s, port]]
+      end
+    end
+
+    # Return the address list in the order they should be tried for this
+    # connect/recovery cycle.
+    def shuffled_addresses
+      case @hosts_shuffle_strategy
+      when :shuffle then @addresses.shuffle
+      when :none    then @addresses.dup
+      when Proc     then @hosts_shuffle_strategy.call(@addresses)
+      else               @addresses.shuffle
+      end
+    end
+
     # Stop any in-flight frame_io / recovery tasks spawned during a failed connect.
     def cleanup_after_failed_connect
       @closed_by_user = true
@@ -324,17 +397,17 @@ module AsyncRabbitMQ
       @state = :closed
     end
 
-    def open_socket
+    def open_socket(target_host = @host, target_port = @port)
       if @tls
         require "openssl"
         ctx        = @tls_context || build_tls_context
-        raw        = TCPSocket.new(@host, @port)
+        raw        = TCPSocket.new(target_host, target_port)
         ssl        = OpenSSL::SSL::SSLSocket.new(raw, ctx)
-        ssl.hostname = @host
+        ssl.hostname = target_host
         ssl.connect
         ssl
       else
-        TCPSocket.new(@host, @port)
+        TCPSocket.new(target_host, target_port)
       end
     end
 
@@ -535,14 +608,29 @@ module AsyncRabbitMQ
 
         @logger.info("Recovery attempt #{attempts} (delay was #{delay.round(1)}s)...")
         @on_recovery_attempt&.call(attempts)
-        begin
-          # Wrap the entire reconnect in a timeout so a dead socket doesn't hang forever.
-          Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
-            raw_socket = open_socket
-            @frame_io  = build_frame_io(raw_socket)
-            @frame_io.start
-            handshake
+
+        connected = false
+        shuffled_addresses.each do |target_host, target_port|
+          break if @closed_by_user
+          begin
+            # Wrap the entire reconnect in a timeout so a dead socket doesn't hang forever.
+            Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
+              raw_socket = open_socket(target_host, target_port)
+              @frame_io  = build_frame_io(raw_socket)
+              @frame_io.start
+              handshake
+            end
+            @host = target_host
+            @port = target_port
+            connected = true
+            break
+          rescue => e
+            @frame_io&.stop rescue nil
+            @logger.debug("Recovery: #{target_host}:#{target_port} failed — #{e.class}: #{e.message}")
           end
+        end
+
+        if connected
           @heartbeat_task&.cancel rescue nil
           start_heartbeat_task
           start_channel0_monitor_task
@@ -559,9 +647,8 @@ module AsyncRabbitMQ
           @on_recovery&.call(self)
           @recovery_task = nil
           return
-        rescue => e
-          @frame_io&.stop rescue nil
-          @logger.warn("Recovery attempt #{attempts} failed: #{e.class}: #{e.message}")
+        else
+          @logger.warn("Recovery attempt #{attempts} failed: no reachable host")
           delay = [delay * 2, @recovery_max_interval].min
           break if @closed_by_user
         end
