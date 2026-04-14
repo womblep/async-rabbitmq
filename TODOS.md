@@ -148,28 +148,19 @@ expected classes via splat.
 
 ---
 
-### ⚙️ IMPL GAP: No way to disable auto-recovery (`automatically_recover: false`)
-**File:** `lib/async_rabbitmq/session.rb`
-**Bunny:** `Bunny.new(automatically_recover: false)` disables auto-recovery entirely.
-**What:** Our Session always attempts exponential-backoff recovery on disconnect. Some use cases
-(short-lived scripts, test harnesses, supervisors that manage their own reconnect) need to
-disable this and get a clean `ConnectionError` instead.
-**Fix:** Add `auto_recover: true` keyword to `Session#initialize`. When `false`, `trigger_recovery`
-raises `ConnectionError` immediately instead of entering the recovery loop.
-**Effort:** S
+### ~~⚙️ IMPL GAP: No way to disable auto-recovery (`automatically_recover: false`)~~ ✅ DONE
+**Resolved:** Added `auto_recover: true` keyword to `Session#initialize`. When `false`,
+`trigger_recovery` sets state to `:closed` and interrupts channel waiters instead of entering
+the recovery loop.
+Integration test in `spec/integration/23_uri_and_recovery_options_spec.rb`.
 
 ---
 
-### ⚙️ IMPL GAP: Recovery options not configurable
-**File:** `lib/async_rabbitmq/session.rb`
-**Bunny:** `recovery_attempts:`, `network_recovery_interval:`, `recover_from_connection_close:`,
-plus callbacks `recovery_attempt_started`, `recovery_completed`, `recovery_attempts_exhausted`.
-**What:** Our recovery uses hardcoded constants (`RECOVERY_INITIAL = 1.0`, `RECOVERY_MAX = 30.0`,
-unlimited retries). Users cannot limit retry count, tune backoff, or hook into recovery events.
-**Fix:** Add constructor keywords: `recovery_attempts: nil` (nil = unlimited),
-`recovery_interval: 1.0`, `recovery_max_interval: 30.0`. Add callback registration:
-`Session#on_recovery_attempt`, `#on_recovery`, `#on_recovery_exhausted`.
-**Effort:** S
+### ~~⚙️ IMPL GAP: Recovery options not configurable~~ ✅ DONE
+**Resolved:** Added `recovery_attempts:` (nil = unlimited), `recovery_interval:` (default 1.0),
+`recovery_max_interval:` (default 30.0) keywords. Added `Session#on_recovery_attempt`,
+`#on_recovery`, `#on_recovery_exhausted` callback registration methods.
+Integration tests in `spec/integration/23_uri_and_recovery_options_spec.rb`.
 
 ---
 
@@ -199,13 +190,11 @@ to `Session#initialize`. On connect and recovery, iterate through the list. Use 
 
 ---
 
-### ⚙️ IMPL GAP: URI connection string parsing
-**File:** `lib/async_rabbitmq/session.rb`
-**Bunny:** `Bunny.new("amqp://user:pass@host:5672/vhost")` parses AMQP URIs.
-**What:** No support for AMQP URI connection strings. Users must pass individual keywords.
-**Fix:** Accept a URI string as the first argument to `Session#initialize` (or a class method
-`Session.from_uri`). Parse scheme (amqp/amqps), userinfo, host, port, vhost path.
-**Effort:** S
+### ~~⚙️ IMPL GAP: URI connection string parsing~~ ✅ DONE
+**Resolved:** Added `Session.from_uri("amqp://user:pass@host:5672/vhost")` class method.
+Parses scheme (amqp/amqps → tls), userinfo, host, port, vhost. Keyword arguments override
+parsed values. Supports percent-encoded vhosts.
+Integration tests in `spec/integration/23_uri_and_recovery_options_spec.rb`.
 
 ---
 
