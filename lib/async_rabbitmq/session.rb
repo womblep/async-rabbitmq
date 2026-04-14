@@ -35,19 +35,21 @@ module AsyncRabbitMQ
       heartbeat: 60,
       frame_max: 131_072,
       auth_mechanism: nil,
+      connection_name: nil,
       logger: Logger.new($stdout)
     )
-      @host           = host
-      @port           = port
-      @vhost          = vhost
-      @username       = username
-      @password       = password
-      @tls            = tls
-      @tls_context    = tls_context
-      @heartbeat      = heartbeat
-      @frame_max      = frame_max
-      @auth_mechanism = auth_mechanism
-      @logger         = logger
+      @host            = host
+      @port            = port
+      @vhost           = vhost
+      @username        = username
+      @password        = password
+      @tls             = tls
+      @tls_context     = tls_context
+      @heartbeat       = heartbeat
+      @frame_max       = frame_max
+      @auth_mechanism  = auth_mechanism
+      @connection_name = connection_name
+      @logger          = logger
 
       @state             = :closed
       @frame_io          = nil
@@ -68,6 +70,8 @@ module AsyncRabbitMQ
       @recovery_wakeup   = nil    # Async::Condition to interrupt the retry sleep
       @session_root_task = nil    # top-level task; recovery is spawned here so it
                                   # survives reader-task Cancel propagation
+      @on_blocked        = nil
+      @on_unblocked      = nil
     end
 
     # Connect and complete AMQP handshake. Raises ConnectionTimeoutError if
@@ -139,6 +143,17 @@ module AsyncRabbitMQ
       @channel_mutex.acquire { @channels[channel_id] = channel }
       channel.open
       channel
+    end
+
+    # Register a callback invoked when the broker sends connection.blocked.
+    # The block receives the reason string from the broker.
+    def on_blocked(&block)
+      @on_blocked = block
+    end
+
+    # Register a callback invoked when the broker sends connection.unblocked.
+    def on_unblocked(&block)
+      @on_unblocked = block
     end
 
     # Called by Channel when it closes itself.
@@ -326,9 +341,16 @@ module AsyncRabbitMQ
     end
 
     def send_connection_start_ok(sasl)
+      props = {
+        "product"     => "async-rabbitmq",
+        "version"     => AsyncRabbitMQ::VERSION,
+        "platform"    => "Ruby #{RUBY_VERSION}",
+        "information" => "https://github.com/womblep/async-rabbitmq",
+      }
+      props["connection_name"] = @connection_name if @connection_name
       @frame_io.write_frame(
         AMQ::Protocol::Connection::StartOk.encode(
-          {},
+          props,
           sasl.mechanism_name,
           sasl.initial_response,
           "en_US"
@@ -486,8 +508,10 @@ module AsyncRabbitMQ
         case method
         when AMQ::Protocol::Connection::Blocked
           @frame_io&.set_blocked(method.reason)
+          @on_blocked&.call(method.reason)
         when AMQ::Protocol::Connection::Unblocked
           @frame_io&.set_unblocked
+          @on_unblocked&.call
         end
         # All other channel-0 methods during normal operation (e.g. stray HeartbeatFrames
         # routed here) are intentionally ignored; the handshake path uses wait_channel0_method

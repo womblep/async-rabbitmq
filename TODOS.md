@@ -173,25 +173,17 @@ unlimited retries). Users cannot limit retry count, tune backoff, or hook into r
 
 ---
 
-### ⚙️ IMPL GAP: Session#on_blocked / #on_unblocked callbacks not exposed
-**File:** `lib/async_rabbitmq/session.rb`
-**Bunny:** `session.on_blocked { |reason| }`, `session.on_unblocked { }`.
-**What:** We handle `connection.blocked`/`connection.unblocked` internally (backpressure gate in
-`FrameIO`), but don't expose callbacks for user code to react (e.g. log, alert, pause producers).
-**Fix:** Add `Session#on_blocked(&block)` and `Session#on_unblocked(&block)`. Invoke from
-`channel0_monitor_loop` alongside the existing `set_blocked`/`set_unblocked` calls.
-**Effort:** XS
+### ~~⚙️ IMPL GAP: Session#on_blocked / #on_unblocked callbacks not exposed~~ ✅ DONE
+**Resolved:** Added `Session#on_blocked(&block)` and `Session#on_unblocked(&block)`. Callbacks
+invoked from `channel0_monitor_loop` alongside `set_blocked`/`set_unblocked`.
+Integration test in `spec/integration/22_callbacks_and_properties_spec.rb`.
 
 ---
 
-### ⚙️ IMPL GAP: Channel#on_error callback not exposed
-**File:** `lib/async_rabbitmq/channel.rb`
-**Bunny:** `channel.on_error { |ch, amq_method| }`.
-**What:** When the broker sends `channel.close` (soft error), we raise `ChannelError` to the
-waiting fiber but don't invoke a user-registered callback. Applications that open channels
-in background tasks need a way to be notified of channel-level errors.
-**Fix:** Add `Channel#on_error(&block)`. Invoke from `handle_channel_close` before raising.
-**Effort:** XS
+### ~~⚙️ IMPL GAP: Channel#on_error callback not exposed~~ ✅ DONE
+**Resolved:** Added `Channel#on_error(&block)` — callback receives `(channel, method)`.
+Invoked from `handle_channel_close` before raising the error.
+Integration test in `spec/integration/22_callbacks_and_properties_spec.rb`.
 
 ---
 
@@ -217,14 +209,11 @@ to `Session#initialize`. On connect and recovery, iterate through the list. Use 
 
 ---
 
-### ⚙️ IMPL GAP: `connection_name:` not forwarded in client properties
-**File:** `lib/async_rabbitmq/session.rb` — `send_connection_start_ok`
-**Bunny:** `Bunny.new(connection_name: "my-app")` — shows up in RabbitMQ management UI.
-**What:** We send an empty `{}` as client properties in `StartOk`. Bunny sends product name,
-version, platform, and `connection_name`. This is visible in the Management UI connections tab.
-**Fix:** Populate the client properties hash with `product: "async-rabbitmq"`,
-`version: AsyncRabbitMQ::VERSION`, `connection_name:` from constructor keyword.
-**Effort:** XS
+### ~~⚙️ IMPL GAP: `connection_name:` not forwarded in client properties~~ ✅ DONE
+**Resolved:** `send_connection_start_ok` now sends `product`, `version`, `platform`,
+`information`, and optional `connection_name` in client properties. Added `connection_name:`
+keyword to `Session#initialize`.
+Integration test in `spec/integration/22_callbacks_and_properties_spec.rb`.
 
 ---
 
