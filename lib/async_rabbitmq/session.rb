@@ -2,6 +2,7 @@ require "async"
 require "async/condition"
 require "async/semaphore"
 require "socket"
+require "uri"
 require "logger"
 require_relative "errors"
 require_relative "frame_io"
@@ -11,8 +12,8 @@ require_relative "sasl"
 module AsyncRabbitMQ
   # Represents one AMQP connection to a RabbitMQ broker.
   #
-  # Recovery: exponential backoff, initial 1s, max 30s, ±25% jitter, unlimited retries.
-  # Re-registers consumers and re-publishes pending confirms after reconnect.
+  # Recovery: exponential backoff with configurable interval, max interval,
+  # and retry limit. Re-registers consumers after reconnect.
   #
   # Pool interface: implements reusable?, viable?, concurrency, close for Async::Pool.
   class Session
@@ -23,6 +24,42 @@ module AsyncRabbitMQ
     PROTOCOL_HEADER     = "AMQP\x00\x00\x09\x01".b.freeze
 
     attr_reader :host, :port, :vhost, :username
+
+    # Build a Session from an AMQP URI string.
+    #
+    #   Session.from_uri("amqp://user:pass@rabbit:5672/myvhost")
+    #   Session.from_uri("amqps://rabbit/myvhost", tls_context: ctx)
+    #
+    # Keyword arguments override anything parsed from the URI.
+    def self.from_uri(uri_string, **kwargs)
+      opts = parse_amqp_uri(uri_string)
+      new(**opts.merge(kwargs))
+    end
+
+    # Parse an amqp:// or amqps:// URI into keyword arguments for Session.new.
+    def self.parse_amqp_uri(uri_string)
+      uri = URI.parse(uri_string)
+      scheme = uri.scheme&.downcase
+      raise ArgumentError, "Expected amqp:// or amqps:// URI, got #{scheme}://" unless %w[amqp amqps].include?(scheme)
+
+      opts = {}
+      opts[:tls]      = (scheme == "amqps")
+      opts[:host]     = uri.host                          if uri.host && !uri.host.empty?
+      opts[:port]     = uri.port                          if uri.port
+      opts[:port]   ||= (scheme == "amqps" ? 5671 : 5672)
+      opts[:username] = URI.decode_www_form_component(uri.user)     if uri.user
+      opts[:password] = URI.decode_www_form_component(uri.password) if uri.password
+
+      # Vhost is the URI path with the leading "/" stripped; an empty path means "/".
+      if uri.path && !uri.path.empty?
+        vhost = URI.decode_www_form_component(uri.path.sub(%r{\A/}, ""))
+        opts[:vhost] = vhost.empty? ? "/" : vhost
+      end
+
+      opts
+    end
+
+    private_class_method :parse_amqp_uri
 
     def initialize(
       host: "localhost",
@@ -36,20 +73,28 @@ module AsyncRabbitMQ
       frame_max: 131_072,
       auth_mechanism: nil,
       connection_name: nil,
+      auto_recover: true,
+      recovery_attempts: nil,
+      recovery_interval: RECOVERY_INITIAL,
+      recovery_max_interval: RECOVERY_MAX,
       logger: Logger.new($stdout)
     )
-      @host            = host
-      @port            = port
-      @vhost           = vhost
-      @username        = username
-      @password        = password
-      @tls             = tls
-      @tls_context     = tls_context
-      @heartbeat       = heartbeat
-      @frame_max       = frame_max
-      @auth_mechanism  = auth_mechanism
-      @connection_name = connection_name
-      @logger          = logger
+      @host                 = host
+      @port                 = port
+      @vhost                = vhost
+      @username             = username
+      @password             = password
+      @tls                  = tls
+      @tls_context          = tls_context
+      @heartbeat            = heartbeat
+      @frame_max            = frame_max
+      @auth_mechanism       = auth_mechanism
+      @connection_name      = connection_name
+      @auto_recover         = auto_recover
+      @recovery_attempts    = recovery_attempts    # nil = unlimited
+      @recovery_interval    = recovery_interval
+      @recovery_max_interval = recovery_max_interval
+      @logger               = logger
 
       @state             = :closed
       @frame_io          = nil
@@ -70,8 +115,11 @@ module AsyncRabbitMQ
       @recovery_wakeup   = nil    # Async::Condition to interrupt the retry sleep
       @session_root_task = nil    # top-level task; recovery is spawned here so it
                                   # survives reader-task Cancel propagation
-      @on_blocked        = nil
-      @on_unblocked      = nil
+      @on_blocked              = nil
+      @on_unblocked            = nil
+      @on_recovery_attempt     = nil
+      @on_recovery             = nil
+      @on_recovery_exhausted   = nil
     end
 
     # Connect and complete AMQP handshake. Raises ConnectionTimeoutError if
@@ -156,6 +204,25 @@ module AsyncRabbitMQ
       @on_unblocked = block
     end
 
+    # Register a callback invoked at the start of each recovery attempt.
+    # The block receives the attempt number (1-based).
+    def on_recovery_attempt(&block)
+      @on_recovery_attempt = block
+    end
+
+    # Register a callback invoked after recovery succeeds.
+    # The block receives the session.
+    def on_recovery(&block)
+      @on_recovery = block
+    end
+
+    # Register a callback invoked when recovery attempts are exhausted.
+    # Only fires when recovery_attempts is set to a finite number.
+    # The block receives the session.
+    def on_recovery_exhausted(&block)
+      @on_recovery_exhausted = block
+    end
+
     # Called by Channel when it closes itself.
     def channel_closed(channel_id)
       @channel_mutex.acquire { @channels.delete(channel_id) }
@@ -185,6 +252,14 @@ module AsyncRabbitMQ
     def trigger_recovery(error)
       return if @closed_by_user
       return if @connecting
+
+      unless @auto_recover
+        @state = :closed
+        conn_error = ConnectionError.new(code: 0, text: "Connection lost: #{error.message}")
+        @channels.each_value { |ch| ch.interrupt_wait!(conn_error) rescue nil }
+        @frame_io&.stop rescue nil
+        return
+      end
 
       @logger.warn("Connection lost (#{error.class}: #{error.message}). Starting recovery...")
 
@@ -429,13 +504,23 @@ module AsyncRabbitMQ
     end
 
     def recover_loop
-      delay = RECOVERY_INITIAL
+      delay = @recovery_interval
       attempts = 0
 
       loop do
         break if @closed_by_user
 
         attempts += 1
+
+        # Check retry limit (nil = unlimited)
+        if @recovery_attempts && attempts > @recovery_attempts
+          @logger.warn("Recovery exhausted after #{@recovery_attempts} attempt(s)")
+          @state = :closed
+          @recovery_in_progress = false
+          @on_recovery_exhausted&.call(self)
+          return
+        end
+
         jitter    = delay * RECOVERY_JITTER * (rand * 2 - 1)
         wait_secs = delay + jitter
 
@@ -449,6 +534,7 @@ module AsyncRabbitMQ
         break if @closed_by_user
 
         @logger.info("Recovery attempt #{attempts} (delay was #{delay.round(1)}s)...")
+        @on_recovery_attempt&.call(attempts)
         begin
           # Wrap the entire reconnect in a timeout so a dead socket doesn't hang forever.
           Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
@@ -470,12 +556,13 @@ module AsyncRabbitMQ
 
           # Re-open channels and re-register consumers
           reopen_channels
+          @on_recovery&.call(self)
           @recovery_task = nil
           return
         rescue => e
           @frame_io&.stop rescue nil
           @logger.warn("Recovery attempt #{attempts} failed: #{e.class}: #{e.message}")
-          delay = [delay * 2, RECOVERY_MAX].min
+          delay = [delay * 2, @recovery_max_interval].min
           break if @closed_by_user
         end
       end
