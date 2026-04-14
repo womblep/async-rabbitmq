@@ -178,15 +178,12 @@ Integration test in `spec/integration/22_callbacks_and_properties_spec.rb`.
 
 ---
 
-### ⚙️ IMPL GAP: Multi-host failover (`hosts:` / `addresses:`)
+### ✅ DONE: Multi-host failover (`hosts:` / `addresses:`)
 **File:** `lib/async_rabbitmq/session.rb`
-**Bunny:** `Bunny.new(hosts: ["rabbit1", "rabbit2"])` or `addresses: ["rabbit1:5672", "rabbit2:5672"]`.
-Shuffles and tries each host on initial connect and on recovery.
-**What:** Our Session takes a single `host:` + `port:`. No failover to alternative nodes.
-**Fix:** Add `hosts:` (array of hostnames) and/or `addresses:` (array of "host:port" strings)
-to `Session#initialize`. On connect and recovery, iterate through the list. Use the existing
-`hosts_shuffle_strategy` pattern from Bunny (default: `Array#shuffle`).
-**Effort:** M
+Implemented `hosts:`, `addresses:`, and `hosts_shuffle_strategy:` parameters on `Session#initialize`.
+`Session.from_uri` accepts multiple URI strings. Both `connect` and `recover_loop` iterate
+through the shuffled address list, failing over to the next host on connection errors.
+**Tests:** `spec/integration/24_multi_host_failover_spec.rb`
 
 ---
 
