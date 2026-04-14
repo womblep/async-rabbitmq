@@ -28,6 +28,7 @@ module AsyncRabbitMQ
       @confirm_condition = nil
       @flow_active       = true
       @on_cancel         = nil
+      @on_error          = nil
       @mutex             = Async::Semaphore.new(1)
       @reply_condition   = nil
       @content_condition = nil
@@ -307,6 +308,13 @@ module AsyncRabbitMQ
       @on_cancel = block
     end
 
+    # Register a callback invoked when the broker closes this channel due to an
+    # error (e.g. 404 queue not found). The block receives the channel and the
+    # AMQ::Protocol::Channel::Close method frame.
+    def on_error(&block)
+      @on_error = block
+    end
+
     # -------------------------------------------------------------------------
     # Flow control
     # -------------------------------------------------------------------------
@@ -504,6 +512,7 @@ module AsyncRabbitMQ
       )
       @state = :closed
       @session.channel_closed(@channel_id)
+      @on_error&.call(self, method)
 
       error = if FrameIO::SOFT_ERROR_CODES.include?(code)
         ChannelError.new(code: code, text: text, channel_id: @channel_id)
