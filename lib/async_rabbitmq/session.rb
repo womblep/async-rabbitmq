@@ -237,6 +237,34 @@ module AsyncRabbitMQ
       channel
     end
 
+    # Open a channel, yield it to the block, and ensure it is closed afterward.
+    def with_channel
+      ch = open_channel
+      begin
+        yield ch
+      ensure
+        ch.close rescue nil
+      end
+    end
+
+    # Check whether a queue exists on the broker without creating it.
+    # Opens a temporary channel and performs a passive declare.
+    def queue_exists?(name)
+      with_channel { |ch| ch.queue(name, passive: true) }
+      true
+    rescue ChannelError
+      false
+    end
+
+    # Check whether an exchange exists on the broker without creating it.
+    # Opens a temporary channel and performs a passive declare.
+    def exchange_exists?(name)
+      with_channel { |ch| ch.exchange(name, passive: true) }
+      true
+    rescue ChannelError
+      false
+    end
+
     # Register a callback invoked when the broker sends connection.blocked.
     # The block receives the reason string from the broker.
     def on_blocked(&block)

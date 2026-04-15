@@ -203,97 +203,58 @@ Integration test in `spec/integration/22_callbacks_and_properties_spec.rb`.
 
 ---
 
-### 🔧 IMPL GAP: `exchange.declare` missing `internal:` flag
-**File:** `lib/async_rabbitmq/channel.rb` — `Channel#exchange`
-**Bunny:** `ch.exchange("name", type: :fanout, internal: true)`.
-**What:** The `internal:` keyword is not forwarded to `Exchange::Declare.encode`. Internal
-exchanges cannot be published to directly — only via exchange-to-exchange bindings.
-**Fix:** Add `internal: false` keyword to `Channel#exchange` and forward it.
-**Effort:** XS
+### ~~🔧 IMPL GAP: `exchange.declare` missing `internal:` flag~~ ✅ DONE
+**Resolved:** Added `internal: false` keyword to `Channel#exchange`, forwarded to
+`Exchange::Declare.encode`. `Exchange` object now stores and exposes `internal?` predicate.
 
 ---
 
-### 🔧 IMPL GAP: Convenience exchange type helpers missing
-**File:** `lib/async_rabbitmq/channel.rb`
-**Bunny:** `ch.direct("name")`, `ch.fanout("name")`, `ch.topic("name")`, `ch.headers("name")`,
-`ch.default_exchange`.
-**What:** Users must always pass `type:` to `Channel#exchange`. Bunny provides shorthand methods.
-**Fix:** Add `Channel#direct(name, **opts)`, `#fanout(name, **opts)`, `#topic(name, **opts)`,
-`#headers(name, **opts)`, `#default_exchange`. Each delegates to `exchange(name, type: X, **opts)`.
-**Effort:** XS
+### ~~🔧 IMPL GAP: Convenience exchange type helpers missing~~ ✅ DONE
+**Resolved:** Added `Channel#direct`, `#fanout`, `#topic`, `#headers`, `#default_exchange`.
+Each delegates to `Channel#exchange` with the appropriate type.
 
 ---
 
-### 🔧 IMPL GAP: Convenience queue helpers missing
-**File:** `lib/async_rabbitmq/channel.rb`
-**Bunny:** `ch.temporary_queue`, `ch.quorum_queue("name")`.
-**What:** No shorthand for common queue patterns.
-**Fix:** Add `Channel#temporary_queue(**opts)` → `queue("", exclusive: true, auto_delete: true, **opts)`.
-Add `Channel#quorum_queue(name, **opts)` → `queue(name, durable: true, arguments: {"x-queue-type" => "quorum"}.merge(opts.delete(:arguments) || {}), **opts)`.
-**Effort:** XS
+### ~~🔧 IMPL GAP: Convenience queue helpers missing~~ ✅ DONE
+**Resolved:** Added `Channel#temporary_queue` (exclusive + auto_delete) and
+`Channel#quorum_queue(name)` (durable + x-queue-type argument).
 
 ---
 
-### 🔧 IMPL GAP: `Queue#status` not implemented
-**File:** `lib/async_rabbitmq/queue.rb`
-**Bunny:** `q.status` → `{message_count: N, consumer_count: N}` (re-declares passive to refresh).
-**What:** Our Queue stores `message_count` and `consumer_count` from the initial declare but
-never refreshes them. Bunny re-declares with `passive: true` to get current counts.
-**Fix:** Add `Queue#status` that calls `channel.queue(name, passive: true)` and returns a hash.
-Depends on the `passive:` flag being implemented first.
-**Effort:** XS (after passive flag)
+### ~~🔧 IMPL GAP: `Queue#status` not implemented~~ ✅ DONE
+**Resolved:** Added `Queue#status` — re-declares with `passive: true` and returns
+`{ message_count:, consumer_count: }` hash with refreshed counts.
 
 ---
 
-### 🔧 IMPL GAP: Queue/Exchange predicate methods missing
-**File:** `lib/async_rabbitmq/queue.rb`, `lib/async_rabbitmq/exchange.rb`
-**Bunny:** `q.durable?`, `q.auto_delete?`, `q.exclusive?`, `q.server_named?`;
-`ex.durable?`, `ex.auto_delete?`, `ex.internal?`, `ex.predefined?`.
-**What:** Our Queue/Exchange objects don't expose their declaration options as predicates.
-**Fix:** Store opts at construction time and add predicate methods.
-**Effort:** XS
+### ~~🔧 IMPL GAP: Queue/Exchange predicate methods missing~~ ✅ DONE
+**Resolved:** Queue now stores opts and exposes `durable?`, `auto_delete?`, `exclusive?`,
+`server_named?`. Exchange now exposes `durable?`, `auto_delete?`, `internal?`, `predefined?`.
 
 ---
 
-### 🔧 IMPL GAP: `Session#queue_exists?` / `#exchange_exists?` missing
-**File:** `lib/async_rabbitmq/session.rb`
-**Bunny:** `session.queue_exists?("name")`, `session.exchange_exists?("name")`.
-**What:** Convenience methods that open a temporary channel, do a passive declare, and return
-true/false (catching the 404 ChannelError). Useful for startup health checks.
-**Fix:** Implement on Session. Depends on passive flag being implemented first.
-**Effort:** XS (after passive flag)
+### ~~🔧 IMPL GAP: `Session#queue_exists?` / `#exchange_exists?` missing~~ ✅ DONE
+**Resolved:** Added `Session#queue_exists?(name)` and `#exchange_exists?(name)`. Each uses
+`with_channel` to do a passive declare and returns true/false (catching ChannelError).
 
 ---
 
-### 🔧 IMPL GAP: `Session#with_channel` convenience missing
-**File:** `lib/async_rabbitmq/session.rb`
-**Bunny:** `session.with_channel { |ch| ... }` — auto-opens and auto-closes a channel.
-**What:** No block-scoped channel helper. Users must manually open and close.
-**Fix:** Add `Session#with_channel { |ch| ... }` that opens a channel, yields, and ensures close.
-**Effort:** XS
+### ~~🔧 IMPL GAP: `Session#with_channel` convenience missing~~ ✅ DONE
+**Resolved:** Added `Session#with_channel { |ch| ... }` — opens a channel, yields, and
+ensures close in an ensure block.
 
 ---
 
-### 🔧 IMPL GAP: `basic_publish` message properties limited
-**File:** `lib/async_rabbitmq/channel.rb` — `Channel#basic_publish`
-**Bunny:** Supports `content_type:`, `content_encoding:`, `headers:`, `priority:`,
-`correlation_id:`, `reply_to:`, `expiration:`, `message_id:`, `timestamp:`, `type:`,
-`user_id:`, `app_id:` as top-level keyword arguments.
-**What:** Our `basic_publish` accepts `properties: {}` hash but doesn't validate or provide
-named keywords for common AMQP properties. Bunny surfaces them as first-class kwargs.
-**Fix:** Add named keyword arguments for the standard 14 AMQP basic properties, passing them
-through to the properties hash. Keep `properties:` as an escape hatch for custom properties.
-**Effort:** S
+### ~~🔧 IMPL GAP: `basic_publish` message properties limited~~ ✅ DONE
+**Resolved:** Added named kwargs for all 12 standard AMQP basic properties (`content_type:`,
+`content_encoding:`, `headers:`, `priority:`, `correlation_id:`, `reply_to:`, `expiration:`,
+`message_id:`, `timestamp:`, `type:`, `user_id:`, `app_id:`). `properties:` hash retained
+as an escape hatch.
 
 ---
 
-### 🔧 IMPL GAP: `Exchange#on_return` missing
-**File:** `lib/async_rabbitmq/exchange.rb`
-**Bunny:** `exchange.on_return { |return_info, properties, content| }`.
-**What:** Return handler is only on Channel (`ch.on_return`). Bunny also allows registering
-on the Exchange object for convenience.
-**Fix:** Add `Exchange#on_return(&block)` that delegates to the underlying channel.
-**Effort:** XS
+### ~~🔧 IMPL GAP: `Exchange#on_return` missing~~ ✅ DONE
+**Resolved:** Added `Exchange#on_return(&block)` that delegates to `@channel.on_return`.
 
 ---
 

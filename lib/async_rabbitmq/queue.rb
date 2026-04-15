@@ -4,11 +4,38 @@ module AsyncRabbitMQ
   class Queue
     attr_reader :name, :message_count, :consumer_count
 
-    def initialize(name, message_count, consumer_count, channel)
+    def initialize(name, message_count, consumer_count, channel, durable: false, exclusive: false, auto_delete: false)
       @name           = name
       @message_count  = message_count
       @consumer_count = consumer_count
       @channel        = channel
+      @durable        = durable
+      @exclusive      = exclusive
+      @auto_delete    = auto_delete
+    end
+
+    def durable?
+      @durable
+    end
+
+    def exclusive?
+      @exclusive
+    end
+
+    def auto_delete?
+      @auto_delete
+    end
+
+    def server_named?
+      @name.start_with?("amq.gen-")
+    end
+
+    # Re-declare with passive: true to refresh message_count and consumer_count.
+    def status
+      q = @channel.queue(@name, passive: true)
+      @message_count  = q.message_count
+      @consumer_count = q.consumer_count
+      { message_count: @message_count, consumer_count: @consumer_count }
     end
 
     def subscribe(manual_ack: false, **opts, &block)

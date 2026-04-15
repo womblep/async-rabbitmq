@@ -4,10 +4,37 @@ module AsyncRabbitMQ
   class Exchange
     attr_reader :name, :type
 
-    def initialize(name, type, channel)
-      @name    = name
-      @type    = type
-      @channel = channel
+    PREDEFINED_EXCHANGES = %w[
+      amq.direct amq.fanout amq.topic amq.headers amq.match amq.rabbitmq.trace
+    ].freeze
+
+    def initialize(name, type, channel, durable: false, auto_delete: false, internal: false)
+      @name        = name
+      @type        = type
+      @channel     = channel
+      @durable     = durable
+      @auto_delete = auto_delete
+      @internal    = internal
+    end
+
+    def durable?
+      @durable
+    end
+
+    def auto_delete?
+      @auto_delete
+    end
+
+    def internal?
+      @internal
+    end
+
+    def predefined?
+      @name == "" || PREDEFINED_EXCHANGES.include?(@name)
+    end
+
+    def on_return(&block)
+      @channel.on_return(&block)
     end
 
     def publish(payload, routing_key: "", **opts)
