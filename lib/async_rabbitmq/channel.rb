@@ -78,7 +78,17 @@ module AsyncRabbitMQ
         ).encode
       )
       resp = wait_for(:queue_declare_ok, AMQ::Protocol::Queue::DeclareOk)
-      Queue.new(resp.queue, resp.message_count, resp.consumer_count, self)
+      Queue.new(resp.queue, resp.message_count, resp.consumer_count, self,
+                durable: durable, exclusive: exclusive, auto_delete: auto_delete)
+    end
+
+    def temporary_queue(**opts)
+      queue("", exclusive: true, auto_delete: true, **opts)
+    end
+
+    def quorum_queue(name, **opts)
+      args = { "x-queue-type" => "quorum" }.merge(opts.delete(:arguments) || {})
+      queue(name, durable: true, arguments: args, **opts)
     end
 
     def queue_delete(name, if_unused: false, if_empty: false)
@@ -119,15 +129,35 @@ module AsyncRabbitMQ
     # Exchange
     # -------------------------------------------------------------------------
 
-    def exchange(name, type: :direct, passive: false, durable: false, auto_delete: false, arguments: {})
+    def exchange(name, type: :direct, passive: false, durable: false, auto_delete: false, internal: false, arguments: {})
       assert_open!
       @frame_io.write_frame(
         AMQ::Protocol::Exchange::Declare.encode(
-          @channel_id, name, type.to_s, passive, durable, auto_delete, false, false, arguments
+          @channel_id, name, type.to_s, passive, durable, auto_delete, internal, false, arguments
         ).encode
       )
       wait_for(:exchange_declare_ok, AMQ::Protocol::Exchange::DeclareOk)
-      Exchange.new(name, type, self)
+      Exchange.new(name, type, self, durable: durable, auto_delete: auto_delete, internal: internal)
+    end
+
+    def direct(name, **opts)
+      exchange(name, type: :direct, **opts)
+    end
+
+    def fanout(name, **opts)
+      exchange(name, type: :fanout, **opts)
+    end
+
+    def topic(name, **opts)
+      exchange(name, type: :topic, **opts)
+    end
+
+    def headers(name, **opts)
+      exchange(name, type: :headers, **opts)
+    end
+
+    def default_exchange
+      Exchange.new("", :direct, self, durable: true, auto_delete: false, internal: false)
     end
 
     def exchange_delete(name, if_unused: false)
@@ -162,11 +192,27 @@ module AsyncRabbitMQ
     # Basic operations
     # -------------------------------------------------------------------------
 
-    def basic_publish(payload, exchange: "", routing_key: "", mandatory: false, persistent: false, properties: {})
+    def basic_publish(payload, exchange: "", routing_key: "", mandatory: false, persistent: false,
+                      content_type: nil, content_encoding: nil, headers: nil, priority: nil,
+                      correlation_id: nil, reply_to: nil, expiration: nil, message_id: nil,
+                      timestamp: nil, type: nil, user_id: nil, app_id: nil, properties: {})
       assert_open!
       payload_bytes = payload.is_a?(String) ? payload.b : payload
       delivery_mode = persistent ? 2 : 1
-      props         = { delivery_mode: delivery_mode }.merge(properties)
+      props         = { delivery_mode: delivery_mode }
+      props[:content_type]     = content_type     if content_type
+      props[:content_encoding] = content_encoding if content_encoding
+      props[:headers]          = headers          if headers
+      props[:priority]         = priority         if priority
+      props[:correlation_id]   = correlation_id   if correlation_id
+      props[:reply_to]         = reply_to         if reply_to
+      props[:expiration]       = expiration        if expiration
+      props[:message_id]       = message_id       if message_id
+      props[:timestamp]        = timestamp        if timestamp
+      props[:type]             = type             if type
+      props[:user_id]          = user_id          if user_id
+      props[:app_id]           = app_id           if app_id
+      props.merge!(properties)
 
       # Basic::Publish.encode returns [MethodFrame, HeaderFrame, BodyFrame, ...],
       # splitting payload across multiple body frames when needed.
