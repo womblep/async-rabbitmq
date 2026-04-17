@@ -228,18 +228,20 @@ module AsyncRabbitMQ
     end
 
     # Open a new channel. Returns an AsyncRabbitMQ::Channel.
-    def open_channel
+    # +pool_size+ bounds concurrent consumer-handler fibers on the channel
+    # (Bunny-parity: default 1). basic_qos will auto-adjust it to prefetch_count.
+    def open_channel(pool_size: 1)
       raise NotOpenError, "Session is not open" unless open?
       channel_id = next_channel_id
-      channel    = Channel.new(channel_id, self, @frame_io, frame_max: @negotiated_fm || @frame_max, logger: @logger)
+      channel    = Channel.new(channel_id, self, @frame_io, frame_max: @negotiated_fm || @frame_max, logger: @logger, pool_size: pool_size)
       @channel_mutex.acquire { @channels[channel_id] = channel }
       channel.open
       channel
     end
 
     # Open a channel, yield it to the block, and ensure it is closed afterward.
-    def with_channel
-      ch = open_channel
+    def with_channel(pool_size: 1)
+      ch = open_channel(pool_size: pool_size)
       begin
         yield ch
       ensure

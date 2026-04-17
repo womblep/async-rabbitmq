@@ -9,9 +9,13 @@ module AsyncRabbitMQ
   # Duck-typed stream interface: #each (yields deliveries) and #write (publishes).
   # Does NOT inherit Async::IO::Stream — a channel is logical, not physical IO.
   class Channel
-    attr_reader :channel_id
+    attr_reader :channel_id, :pool_size
 
-    def initialize(channel_id, session, frame_io, frame_max:, logger:)
+    # +pool_size+ bounds the number of consumer-handler fibers that can run
+    # concurrently on this channel (Bunny-parity: default 1 = serialized).
+    # Resizable at runtime via #pool_size=; basic_qos adjusts it automatically
+    # when prefetch_count > 0 so the two stay coupled.
+    def initialize(channel_id, session, frame_io, frame_max:, logger:, pool_size: 1)
       @channel_id   = channel_id
       @session      = session
       @frame_io     = frame_io
@@ -33,6 +37,15 @@ module AsyncRabbitMQ
       @reply_condition   = nil
       @content_condition = nil
       @pending_content   = nil
+      @pool_size         = validate_pool_size!(pool_size)
+      @pool_sem          = Async::Semaphore.new(@pool_size)
+    end
+
+    # Resize the consumer-handler concurrency cap. Shrinking does not evict
+    # already-running handlers; new deliveries park until permits free up.
+    def pool_size=(n)
+      @pool_size      = validate_pool_size!(n)
+      @pool_sem.limit = @pool_size
     end
 
     def open?
@@ -276,9 +289,15 @@ module AsyncRabbitMQ
         AMQ::Protocol::Basic::Qos.encode(@channel_id, prefetch_size, prefetch_count, global).encode
       )
       wait_for(:basic_qos_ok, AMQ::Protocol::Basic::QosOk)
+      # Keep the handler pool coupled to prefetch: no point buffering 10 unacked
+      # messages at the broker if only 1 can run at a time. prefetch_count == 0
+      # means "unlimited" in AMQP; leave the pool alone so the user can still cap it.
+      self.pool_size = prefetch_count if prefetch_count > 0
     end
 
-    # Start a consumer. The block runs in a new Async::Task per delivery.
+    # Start a consumer. The block runs in a new Async::Task per delivery,
+    # gated by the channel's pool_size semaphore so at most +pool_size+
+    # handlers run concurrently across all consumers on this channel.
     # Returns the consumer tag.
     def basic_consume(queue_name, consumer_tag: "", manual_ack: false, exclusive: false, arguments: {}, &block)
       assert_open!
@@ -473,7 +492,7 @@ module AsyncRabbitMQ
         _, header, body = content_msg
         entry = @consumers[method.consumer_tag]
         if entry
-          Async { entry[:block].call(method, header, body) }
+          Async { @pool_sem.acquire { entry[:block].call(method, header, body) } }
         else
           @logger.warn("Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
         end
@@ -630,6 +649,11 @@ module AsyncRabbitMQ
 
     def assert_open!
       raise NotOpenError, "Channel #{@channel_id} is not open" unless open?
+    end
+
+    def validate_pool_size!(n)
+      raise ArgumentError, "pool_size must be a positive Integer (got #{n.inspect})" unless n.is_a?(Integer) && n > 0
+      n
     end
   end
 end
