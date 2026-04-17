@@ -1,3 +1,14 @@
+# Load .env file from project root if present (no dotenv dependency required).
+env_file = File.expand_path("../../.env", __FILE__)
+if File.exist?(env_file)
+  File.readlines(env_file).each do |line|
+    line = line.strip
+    next if line.empty? || line.start_with?("#")
+    key, value = line.split("=", 2)
+    ENV[key] ||= value  # don't overwrite explicitly set vars
+  end
+end
+
 require "simplecov"
 SimpleCov.start do
   add_filter "/spec/"
