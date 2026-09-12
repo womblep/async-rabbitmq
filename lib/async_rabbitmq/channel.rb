@@ -37,6 +37,8 @@ module AsyncRabbitMQ
       @on_cancel         = nil
       @on_error          = nil
       @mutex             = Async::Semaphore.new(1)
+      @publish_sem       = Async::Semaphore.new(1)   # one publish's frames go out contiguously
+      @rpc_sem           = Async::Semaphore.new(1)   # one request/reply in flight per channel
       @reply_condition   = nil
       @content_condition = nil
       @pending_content   = nil
@@ -63,18 +65,14 @@ module AsyncRabbitMQ
       @queue = @frame_io.register_channel(@channel_id)
       # Start dispatch task BEFORE waiting so it can process the OpenOk reply.
       start_dispatch_task
-      @frame_io.write_frame(AMQ::Protocol::Channel::Open.encode(@channel_id, "").encode)
-      wait_for(:channel_open_ok, AMQ::Protocol::Channel::OpenOk)
+      rpc(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk, check_open: false)
       @state = :open
       self
     end
 
     def close
       return unless open?
-      @frame_io.write_frame(
-        AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0).encode
-      )
-      wait_for(:channel_close_ok, AMQ::Protocol::Channel::CloseOk)
+      rpc(AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0), AMQ::Protocol::Channel::CloseOk)
       @state = :closed
       @session.channel_closed(@channel_id)
       @queue&.push(nil)  # wake dispatch_loop so it can detect :closed and exit
@@ -88,13 +86,10 @@ module AsyncRabbitMQ
     # Pass an empty string as +name+ to let the broker generate a unique name
     # (returned in the Queue object). AMQP 0-9-1 spec §3.1.2.
     def queue(name, passive: false, durable: false, exclusive: false, auto_delete: false, arguments: {})
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Queue::Declare.encode(
-          @channel_id, name, passive, durable, exclusive, auto_delete, false, arguments
-        ).encode
+      resp = rpc(
+        AMQ::Protocol::Queue::Declare.encode(@channel_id, name, passive, durable, exclusive, auto_delete, false, arguments),
+        AMQ::Protocol::Queue::DeclareOk
       )
-      resp = wait_for(:queue_declare_ok, AMQ::Protocol::Queue::DeclareOk)
       Queue.new(resp.queue, resp.message_count, resp.consumer_count, self,
                 durable: durable, exclusive: exclusive, auto_delete: auto_delete)
     end
@@ -109,37 +104,25 @@ module AsyncRabbitMQ
     end
 
     def queue_delete(name, if_unused: false, if_empty: false)
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Queue::Delete.encode(@channel_id, name, if_unused, if_empty, false).encode
-      )
-      wait_for(:queue_delete_ok, AMQ::Protocol::Queue::DeleteOk)
+      rpc(AMQ::Protocol::Queue::Delete.encode(@channel_id, name, if_unused, if_empty, false), AMQ::Protocol::Queue::DeleteOk)
     end
 
     def queue_purge(name)
-      assert_open!
-      @frame_io.write_frame(AMQ::Protocol::Queue::Purge.encode(@channel_id, name, false).encode)
-      wait_for(:queue_purge_ok, AMQ::Protocol::Queue::PurgeOk)
+      rpc(AMQ::Protocol::Queue::Purge.encode(@channel_id, name, false), AMQ::Protocol::Queue::PurgeOk)
     end
 
     def queue_bind(queue_name, exchange:, routing_key: "", arguments: {})
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Queue::Bind.encode(
-          @channel_id, queue_name, exchange, routing_key, false, arguments
-        ).encode
+      rpc(
+        AMQ::Protocol::Queue::Bind.encode(@channel_id, queue_name, exchange, routing_key, false, arguments),
+        AMQ::Protocol::Queue::BindOk
       )
-      wait_for(:queue_bind_ok, AMQ::Protocol::Queue::BindOk)
     end
 
     def queue_unbind(queue_name, exchange:, routing_key: "", arguments: {})
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Queue::Unbind.encode(
-          @channel_id, queue_name, exchange, routing_key, arguments
-        ).encode
+      rpc(
+        AMQ::Protocol::Queue::Unbind.encode(@channel_id, queue_name, exchange, routing_key, arguments),
+        AMQ::Protocol::Queue::UnbindOk
       )
-      wait_for(:queue_unbind_ok, AMQ::Protocol::Queue::UnbindOk)
     end
 
     # -------------------------------------------------------------------------
@@ -147,13 +130,10 @@ module AsyncRabbitMQ
     # -------------------------------------------------------------------------
 
     def exchange(name, type: :direct, passive: false, durable: false, auto_delete: false, internal: false, arguments: {})
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Exchange::Declare.encode(
-          @channel_id, name, type.to_s, passive, durable, auto_delete, internal, false, arguments
-        ).encode
+      rpc(
+        AMQ::Protocol::Exchange::Declare.encode(@channel_id, name, type.to_s, passive, durable, auto_delete, internal, false, arguments),
+        AMQ::Protocol::Exchange::DeclareOk
       )
-      wait_for(:exchange_declare_ok, AMQ::Protocol::Exchange::DeclareOk)
       Exchange.new(name, type, self, durable: durable, auto_delete: auto_delete, internal: internal)
     end
 
@@ -178,31 +158,21 @@ module AsyncRabbitMQ
     end
 
     def exchange_delete(name, if_unused: false)
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Exchange::Delete.encode(@channel_id, name, if_unused, false).encode
-      )
-      wait_for(:exchange_delete_ok, AMQ::Protocol::Exchange::DeleteOk)
+      rpc(AMQ::Protocol::Exchange::Delete.encode(@channel_id, name, if_unused, false), AMQ::Protocol::Exchange::DeleteOk)
     end
 
     def exchange_bind(destination:, source:, routing_key: "", arguments: {})
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Exchange::Bind.encode(
-          @channel_id, destination, source, routing_key, false, arguments
-        ).encode
+      rpc(
+        AMQ::Protocol::Exchange::Bind.encode(@channel_id, destination, source, routing_key, false, arguments),
+        AMQ::Protocol::Exchange::BindOk
       )
-      wait_for(:exchange_bind_ok, AMQ::Protocol::Exchange::BindOk)
     end
 
     def exchange_unbind(destination:, source:, routing_key: "", arguments: {})
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Exchange::Unbind.encode(
-          @channel_id, destination, source, routing_key, false, arguments
-        ).encode
+      rpc(
+        AMQ::Protocol::Exchange::Unbind.encode(@channel_id, destination, source, routing_key, false, arguments),
+        AMQ::Protocol::Exchange::UnbindOk
       )
-      wait_for(:exchange_unbind_ok, AMQ::Protocol::Exchange::UnbindOk)
     end
 
     # -------------------------------------------------------------------------
@@ -236,10 +206,16 @@ module AsyncRabbitMQ
       frames = AMQ::Protocol::Basic::Publish.encode(
         @channel_id, payload_bytes, props, exchange, routing_key, mandatory, false, @frame_max
       )
-      frames.each { |f| @frame_io.write_frame(f.encode, publish: true) }
+      # One publish's frames must reach the wire contiguously: write_frame can
+      # yield (full queue, connection.blocked) and a second publisher on this
+      # channel slipping in between the method, header and body frames is a
+      # protocol error (505 UNEXPECTED_FRAME). Holding the semaphore across the
+      # writes and the tag assignment also keeps confirm tags in wire order.
+      @publish_sem.acquire do
+        assert_open!
+        frames.each { |f| @frame_io.write_frame(f.encode, publish: true) }
 
-      if @confirms_enabled
-        @mutex.acquire do
+        if @confirms_enabled
           @delivery_tag += 1
           tag = @delivery_tag
           @pending_confirms[tag] = tag
@@ -252,17 +228,15 @@ module AsyncRabbitMQ
     alias write basic_publish
 
     def basic_get(queue_name, manual_ack: false)
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Basic::Get.encode(@channel_id, queue_name, !manual_ack).encode
-      )
-      msg = wait_for_any(:basic_get_ok, :basic_get_empty,
-                         AMQ::Protocol::Basic::GetOk,
-                         AMQ::Protocol::Basic::GetEmpty)
-      return nil if msg.is_a?(AMQ::Protocol::Basic::GetEmpty)
+      msg, content = @rpc_sem.acquire do
+        assert_open!
+        @frame_io.write_frame(AMQ::Protocol::Basic::Get.encode(@channel_id, queue_name, !manual_ack).encode)
+        m = wait_for_any(AMQ::Protocol::Basic::GetOk, AMQ::Protocol::Basic::GetEmpty)
+        # After GetOk the content header + body follow on this channel.
+        [m, m.is_a?(AMQ::Protocol::Basic::GetOk) ? wait_content : nil]
+      end
+      return nil if content.nil?
 
-      # After GetOk, next message pair is content-header + body
-      content = wait_content
       [msg, content[:header], content[:body]]
     end
 
@@ -288,11 +262,7 @@ module AsyncRabbitMQ
     end
 
     def basic_qos(prefetch_count:, prefetch_size: 0, global: false)
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Basic::Qos.encode(@channel_id, prefetch_size, prefetch_count, global).encode
-      )
-      wait_for(:basic_qos_ok, AMQ::Protocol::Basic::QosOk)
+      rpc(AMQ::Protocol::Basic::Qos.encode(@channel_id, prefetch_size, prefetch_count, global), AMQ::Protocol::Basic::QosOk)
       # Keep the handler pool coupled to prefetch: no point buffering 10 unacked
       # messages at the broker if only 1 can run at a time. prefetch_count == 0
       # means "unlimited" in AMQP; leave the pool alone so the user can still cap it.
@@ -304,23 +274,16 @@ module AsyncRabbitMQ
     # handlers run concurrently across all consumers on this channel.
     # Returns the consumer tag.
     def basic_consume(queue_name, consumer_tag: "", manual_ack: false, exclusive: false, arguments: {}, &block)
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Basic::Consume.encode(
-          @channel_id, queue_name, consumer_tag, false, !manual_ack, exclusive, false, arguments
-        ).encode
+      resp = rpc(
+        AMQ::Protocol::Basic::Consume.encode(@channel_id, queue_name, consumer_tag, false, !manual_ack, exclusive, false, arguments),
+        AMQ::Protocol::Basic::ConsumeOk
       )
-      resp = wait_for(:basic_consume_ok, AMQ::Protocol::Basic::ConsumeOk)
       @consumers[resp.consumer_tag] = { queue_name: queue_name, block: block, manual_ack: manual_ack }
       resp.consumer_tag
     end
 
     def basic_cancel(consumer_tag)
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Basic::Cancel.encode(@channel_id, consumer_tag, false).encode
-      )
-      wait_for(:basic_cancel_ok, AMQ::Protocol::Basic::CancelOk)
+      rpc(AMQ::Protocol::Basic::Cancel.encode(@channel_id, consumer_tag, false), AMQ::Protocol::Basic::CancelOk)
       @consumers.delete(consumer_tag)
       wake_each_waiters(consumer_tag)
     end
@@ -328,11 +291,7 @@ module AsyncRabbitMQ
     # Ask the broker to redeliver all unacknowledged messages on this channel.
     # RabbitMQ only supports requeue: true; requeue: false raises a channel error.
     def basic_recover(requeue: true)
-      assert_open!
-      @frame_io.write_frame(
-        AMQ::Protocol::Basic::Recover.encode(@channel_id, requeue).encode
-      )
-      wait_for(:basic_recover_ok, AMQ::Protocol::Basic::RecoverOk)
+      rpc(AMQ::Protocol::Basic::Recover.encode(@channel_id, requeue), AMQ::Protocol::Basic::RecoverOk)
     end
 
     # -------------------------------------------------------------------------
@@ -340,9 +299,7 @@ module AsyncRabbitMQ
     # -------------------------------------------------------------------------
 
     def confirm_select
-      assert_open!
-      @frame_io.write_frame(AMQ::Protocol::Confirm::Select.encode(@channel_id, false).encode)
-      wait_for(:confirm_select_ok, AMQ::Protocol::Confirm::SelectOk)
+      rpc(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
       @confirms_enabled  = true
       @delivery_tag      = 0
       @pending_confirms  = {}
@@ -404,9 +361,7 @@ module AsyncRabbitMQ
     # -------------------------------------------------------------------------
 
     def flow(active)
-      assert_open!
-      @frame_io.write_frame(AMQ::Protocol::Channel::Flow.encode(@channel_id, active).encode)
-      wait_for(:channel_flow_ok, AMQ::Protocol::Channel::FlowOk)
+      rpc(AMQ::Protocol::Channel::Flow.encode(@channel_id, active), AMQ::Protocol::Channel::FlowOk)
       @flow_active = active
     end
 
@@ -459,13 +414,11 @@ module AsyncRabbitMQ
       @frame_io = new_frame_io
       @queue    = @frame_io.register_channel(@channel_id)
       start_dispatch_task
-      @frame_io.write_frame(AMQ::Protocol::Channel::Open.encode(@channel_id, "").encode)
-      wait_for(:channel_open_ok, AMQ::Protocol::Channel::OpenOk)
+      rpc(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk, check_open: false)
       @state = :open
 
       if @confirms_enabled
-        @frame_io.write_frame(AMQ::Protocol::Confirm::Select.encode(@channel_id, false).encode)
-        wait_for(:confirm_select_ok, AMQ::Protocol::Confirm::SelectOk)
+        rpc(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
         # Reset confirms state for the new connection — old pending tags are gone
         # and the old condition object is stale (any prior waiter already unblocked
         # via interrupt_wait! with a ConnectionError).
@@ -638,31 +591,26 @@ module AsyncRabbitMQ
     # Synchronous wait helpers
     # -------------------------------------------------------------------------
 
-    def wait_for(_name, expected_class)
-      condition = @reply_condition = Async::Condition.new
-      result    = condition.wait
-
-      if result.is_a?(ChannelError) || result.is_a?(ConnectionError)
-        raise result
+    # Send one method frame and wait for its reply. Serialised per channel:
+    # AMQP 0-9-1 replies carry no correlation id, so a second request in flight
+    # on the same channel would be handed the first one's answer.
+    def rpc(frame, *expected_classes, check_open: true)
+      @rpc_sem.acquire do
+        assert_open! if check_open
+        @frame_io.write_frame(frame.encode)
+        wait_for_any(*expected_classes)
       end
-
-      unless result.is_a?(expected_class)
-        raise ChannelError.new("Expected #{expected_class} but got #{result.class}",
-                               channel_id: @channel_id)
-      end
-      result
     end
 
-    def wait_for_any(_name1, _name2, *expected_classes)
+    def wait_for_any(*expected_classes)
       condition = @reply_condition = Async::Condition.new
       result    = condition.wait
 
-      if result.is_a?(ChannelError) || result.is_a?(ConnectionError)
-        raise result
-      end
+      raise result if result.is_a?(Exception)
 
       unless expected_classes.any? { |c| result.is_a?(c) }
-        raise ChannelError.new("Unexpected method #{result.class}", channel_id: @channel_id)
+        raise ChannelError.new("Expected #{expected_classes.join(' or ')} but got #{result.class}",
+                               channel_id: @channel_id)
       end
       result
     end
