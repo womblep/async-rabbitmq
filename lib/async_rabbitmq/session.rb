@@ -215,9 +215,9 @@ module AsyncRabbitMQ
           @frame_io&.stop rescue nil
           @frame_io = nil
           last_error = e
-        rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, Errno::ECONNRESET,
-               Errno::EPIPE, EOFError, IOError, SocketError => e
-          # TCP connect failed, or the peer dropped the connection mid-handshake.
+        rescue SystemCallError, EOFError, IOError, SocketError => e
+          # TCP connect failed (refused, unreachable, timed out) or the peer
+          # dropped the connection mid-handshake (reset, EOF, shutdown).
           @frame_io&.stop rescue nil
           @frame_io = nil
           last_error = e

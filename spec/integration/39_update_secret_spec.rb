@@ -23,7 +23,7 @@ RSpec.describe "Session#update_secret", :integration do
 
       # Drop the connection: recovery must present the *new* secret, which the
       # broker refuses, so recovery is abandoned rather than looping forever.
-      session.instance_variable_get(:@frame_io).instance_variable_get(:@socket).close rescue nil
+      sever_connection!(session)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
       sleep 0.1 until session.closed? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
 

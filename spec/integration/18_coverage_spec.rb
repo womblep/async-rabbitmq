@@ -133,12 +133,7 @@ RSpec.describe "Coverage completion", :integration do
         ch.queue("test.recovery-reopen.#{SecureRandom.hex(4)}", durable: true)
 
         # Force the underlying TCP connection closed
-        session.instance_variable_get(:@frame_io)
-               .instance_variable_get(:@socket)
-               .close rescue nil
-
-        # Recovery: ~1s initial sleep + reconnect + channel reopen
-        sleep 4
+        recover_connection!(session)
 
         expect(session.open?).to be true
         # Channel should be usable after reopen_after_recovery
@@ -153,11 +148,7 @@ RSpec.describe "Coverage completion", :integration do
         ch.queue("test.recovery-confirms.#{SecureRandom.hex(4)}", durable: true)
         ch.confirm_select   # enables confirms — reopen_after_recovery must re-select
 
-        session.instance_variable_get(:@frame_io)
-               .instance_variable_get(:@socket)
-               .close rescue nil
-
-        sleep 4
+        recover_connection!(session)
 
         expect(session.open?).to be true
         session.close rescue nil

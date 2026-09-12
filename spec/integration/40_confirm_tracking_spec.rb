@@ -82,8 +82,7 @@ RSpec.describe "publisher confirm tracking", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
       ch.confirm_select(tracking: true, outstanding_limit: 7)
-      session.instance_variable_get(:@frame_io).instance_variable_get(:@socket).close rescue nil
-      20.times { break if session.open? && ch.open?; sleep 0.2 }
+      recover_connection!(session)
       expect(ch.tracking_confirms?).to be true
       expect(ch.outstanding_limit).to eq(7)
       ch.close

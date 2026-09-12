@@ -90,7 +90,7 @@ RSpec.describe "Session#connect broker-refused handshake", :integration do
       host: RABBITMQ_HOST, port: RABBITMQ_PORT, connect_timeout: 20, logger: Logger.new(nil)
     )
     allow(session).to receive(:send_connection_start_ok).and_wrap_original do |m, *args|
-      session.instance_variable_get(:@frame_io).instance_variable_get(:@socket).close
+      sever_connection!(session)
       m.call(*args)
     end
 

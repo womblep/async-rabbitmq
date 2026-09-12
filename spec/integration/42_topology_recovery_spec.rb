@@ -11,13 +11,8 @@ RSpec.describe "topology recovery", :integration do
   # (on_recovery fires after channels are reopened, topology replayed and
   # consumers re-registered).
   def recover!(session, ch)
-    recovered = false
-    session.on_recovery { |_s| recovered = true }
     expect(ch.open?).to be true
-    session.instance_variable_get(:@frame_io).instance_variable_get(:@socket).close rescue nil
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-    sleep 0.1 until recovered || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-    expect(recovered).to be true
+    recover_connection!(session)
     expect(ch.open?).to be true
   end
 

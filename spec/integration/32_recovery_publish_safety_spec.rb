@@ -60,8 +60,7 @@ RSpec.describe "channel state and publish safety across recovery", :integration 
       # with its encoded frames, but never received by the broker.
       ch.instance_variable_get(:@pending_confirms)[99] = encoded_publish(ch, session, "replayed after drop", q.name)
 
-      session.instance_variable_get(:@frame_io).instance_variable_get(:@socket).close rescue nil
-      wait_until { session.open? && ch.open? }
+      recover_connection!(session)
 
       expect(ch.wait_for_confirms).to be true
       expect(ch.unconfirmed_tags).to be_empty

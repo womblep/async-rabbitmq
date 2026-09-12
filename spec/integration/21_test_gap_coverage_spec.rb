@@ -103,9 +103,7 @@ RSpec.describe "P1 test gap coverage", :integration do
         sleep 0.2
 
         # Kill the socket to trigger recovery/interrupt
-        session.instance_variable_get(:@frame_io)
-               .instance_variable_get(:@socket)
-               .close rescue nil
+        sever_connection!(session)
 
         # Wait for recovery + the waiter to be interrupted
         sleep 4

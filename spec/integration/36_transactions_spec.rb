@@ -52,8 +52,7 @@ RSpec.describe "transactions", :integration do
       q  = ch.queue("test.tx.recover.#{SecureRandom.hex(4)}", durable: true)
       ch.tx_select
 
-      session.instance_variable_get(:@frame_io).instance_variable_get(:@socket).close rescue nil
-      20.times { break if session.open? && ch.open?; sleep 0.2 }
+      recover_connection!(session)
       expect(ch.open?).to be true
 
       # Without tx.select on the new channel, tx.commit would be a 406 channel error.
