@@ -3,15 +3,19 @@ require_relative "lib/async_rabbitmq/version"
 Gem::Specification.new do |spec|
   spec.name          = "async-rabbitmq"
   spec.version       = AsyncRabbitMQ::VERSION
-  spec.authors       = ["Russell"]
+  spec.authors       = ["Russell Penney"]
   spec.summary       = "Fiber-native Ruby AMQP 0-9-1 client built on the Async ecosystem"
-  spec.description   = "An async-io based RabbitMQ client using Fibers instead of threads. " \
-                       "Channels are duck-typed streams. Connection recovery is built-in."
-  spec.homepage      = "https://github.com/russellthedev/async-rabbitmq"
+  spec.description   = "A RabbitMQ client for the async fiber scheduler: no threads, " \
+                       "channels are duck-typed streams, connection and topology recovery are built in."
+  spec.homepage      = "https://github.com/womblep/async-rabbitmq"
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 3.3"
 
-  spec.files         = Dir["lib/**/*.rb", "LICENSE", "README.md"]
+  spec.files         = Dir["lib/**/*.rb", "LICENSE", "README.md", "CHANGELOG.md"]
+  spec.metadata      = {
+    "changelog_uri"   => "https://github.com/womblep/async-rabbitmq/blob/main/CHANGELOG.md",
+    "source_code_uri" => "https://github.com/womblep/async-rabbitmq",
+  }
   spec.require_paths = ["lib"]
 
   spec.add_dependency "async",        "~> 2.0"

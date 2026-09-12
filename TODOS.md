@@ -260,7 +260,7 @@ as an escape hatch.
 
 ## P2 — v2 Work (after v1 stable)
 
-### IMPL GAP: Transactions (tx.select / tx.commit / tx.rollback) not implemented
+### ~~IMPL GAP: Transactions (tx.select / tx.commit / tx.rollback) not implemented~~ ✅ DONE (#37, 0.2.0)
 **File:** new `lib/async_rabbitmq/channel.rb` methods
 **What:** The AMQP 0-9-1 `tx` class is marked `ok` in the RabbitMQ 4.2 spec. Publisher
 confirms are the recommended alternative, but some legacy workloads require transactions.
@@ -301,7 +301,10 @@ publish/bind/unbind/delete/purge, Exchange#publish/delete/bind.
 
 ---
 
-### Topology Re-Declaration on Recovery
+### ~~Topology Re-Declaration on Recovery~~ ✅ DONE (#35, 0.2.0)
+**Resolved:** session-level `TopologyRegistry` records declares/bindings and replays them after
+reconnect (exchanges, queues with server-named renames, bindings, then consumers); `on_recovery`
+callback also exists. Opt out with `recover_topology: false`.
 **What:** `session.on_recovery { |session| ... }` callback that fires after each
 successful reconnect. Callers use it to re-declare non-durable queues and exchanges.
 **Why:** Without this, auto-recovery silently fails for non-durable topology after a
@@ -330,4 +333,4 @@ who want to kick the tires without writing Ruby.
 ## Resolved Decisions
 
 1. **Gem name:** `async-rabbitmq`
-2. **Minimum Ruby version:** 3.2
+2. **Minimum Ruby version:** 3.3 (3.2 support dropped 2026-04-02)
