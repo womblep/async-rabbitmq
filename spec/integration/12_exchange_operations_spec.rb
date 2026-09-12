@@ -23,7 +23,7 @@ RSpec.describe "Exchange operations", :integration do
 
       ex.publish("payload", routing_key: "rk")
 
-      _di, _h, body = ch.basic_get(q.name)
+      _di, _h, body = ch.basic_get(q.name, manual_ack: false)
       expect(body).to eq("payload".b)
       ch.close
     end
@@ -38,7 +38,7 @@ RSpec.describe "Exchange operations", :integration do
 
       ex.publish("order", routing_key: "orders.new")
 
-      _di, _h, body = ch.basic_get(q.name)
+      _di, _h, body = ch.basic_get(q.name, manual_ack: false)
       expect(body).to eq("order".b)
       ch.close
     end
@@ -55,8 +55,8 @@ RSpec.describe "Exchange operations", :integration do
 
       ex.publish("broadcast")
 
-      _di1, _h, b1 = ch.basic_get(q1.name)
-      _di2, _h, b2 = ch.basic_get(q2.name)
+      _di1, _h, b1 = ch.basic_get(q1.name, manual_ack: false)
+      _di2, _h, b2 = ch.basic_get(q2.name, manual_ack: false)
       expect(b1).to eq("broadcast".b)
       expect(b2).to eq("broadcast".b)
       ch.close

@@ -38,6 +38,14 @@ module AsyncRabbitMQ
       { message_count: @message_count, consumer_count: @consumer_count }
     end
 
+    # Synchronously fetch one message: [delivery_info, header, body], or nil if
+    # the queue is empty. Defaults to manual acknowledgement like Bunny: a
+    # message fetched and then dropped by the caller is requeued, not lost.
+    def pop(manual_ack: true)
+      @channel.basic_get(@name, manual_ack: manual_ack)
+    end
+    alias get pop
+
     def subscribe(manual_ack: false, **opts, &block)
       @channel.basic_consume(@name, manual_ack: manual_ack, **opts, &block)
     end

@@ -23,7 +23,7 @@ RSpec.describe "Basic AMQP operations", :integration do
       ch = session.open_channel
       q  = ch.queue("test.empty", durable: true)
 
-      result = ch.basic_get(q.name)
+      result = ch.basic_get(q.name, manual_ack: false)
       expect(result).to be_nil
       ch.close
     end
@@ -71,7 +71,7 @@ RSpec.describe "Basic AMQP operations", :integration do
       di, _h, _body = ch.basic_get(q.name, manual_ack: true)
       ch.basic_nack(di.delivery_tag, requeue: false)
 
-      result = ch.basic_get(q.name)
+      result = ch.basic_get(q.name, manual_ack: false)
       expect(result).to be_nil
       ch.close
     end

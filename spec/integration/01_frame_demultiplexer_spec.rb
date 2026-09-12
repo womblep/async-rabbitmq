@@ -12,7 +12,7 @@ RSpec.describe "Frame demultiplexer — publish/get round-trip", :integration do
 
       ch.basic_publish(payload, routing_key: q.name)
 
-      delivery_info, _headers, body = ch.basic_get(q.name)
+      delivery_info, _headers, body = ch.basic_get(q.name, manual_ack: false)
       expect(delivery_info).not_to be_nil
       expect(body).to eq(payload.b)
 
@@ -31,8 +31,8 @@ RSpec.describe "Frame demultiplexer — publish/get round-trip", :integration do
       ch1.basic_publish("msg-ch1", routing_key: q1.name)
       ch2.basic_publish("msg-ch2", routing_key: q2.name)
 
-      _di1, _h1, body1 = ch1.basic_get(q1.name)
-      _di2, _h2, body2 = ch2.basic_get(q2.name)
+      _di1, _h1, body1 = ch1.basic_get(q1.name, manual_ack: false)
+      _di2, _h2, body2 = ch2.basic_get(q2.name, manual_ack: false)
 
       expect(body1).to eq("msg-ch1".b)
       expect(body2).to eq("msg-ch2".b)

@@ -20,7 +20,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
 
       # Verify each queue has exactly its message
       channels.each_with_index do |ch, i|
-        _di, _h, body = ch.basic_get(queues[i].name)
+        _di, _h, body = ch.basic_get(queues[i].name, manual_ack: false)
         expect(body).to eq("msg-#{i}".b), "Queue #{i} got wrong message: #{body.inspect}"
       end
 
@@ -42,7 +42,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
 
       channels.each_with_index do |ch, i|
         received = []
-        while (msg = ch.basic_get(queues[i].name))
+        while (msg = ch.basic_get(queues[i].name, manual_ack: false))
           received << msg[2].to_s
         end
         expect(received.size).to eq(100)

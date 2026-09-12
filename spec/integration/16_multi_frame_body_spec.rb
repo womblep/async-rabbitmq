@@ -16,7 +16,7 @@ RSpec.describe "Multi-frame body reassembly", :integration do
 
       ch.basic_publish(payload, routing_key: q.name)
 
-      _di, _headers, received = ch.basic_get(q.name)
+      _di, _headers, received = ch.basic_get(q.name, manual_ack: false)
 
       expect(received.bytesize).to eq(payload.bytesize)
       expect(received).to eq(payload.b)
@@ -34,7 +34,7 @@ RSpec.describe "Multi-frame body reassembly", :integration do
       q  = ch.queue("test.smallframe", durable: true)
 
       ch.basic_publish(payload, routing_key: q.name)
-      _di, _headers, received = ch.basic_get(q.name)
+      _di, _headers, received = ch.basic_get(q.name, manual_ack: false)
 
       expect(received.bytesize).to eq(payload.bytesize)
       ch.close

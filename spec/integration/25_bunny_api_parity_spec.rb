@@ -388,7 +388,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           content_encoding: "utf-8"
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         expect(props[:content_type]).to eq("application/json")
         expect(props[:content_encoding]).to eq("utf-8")
@@ -408,7 +408,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           reply_to: "reply.queue"
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         expect(props[:correlation_id]).to eq("abc-123")
         expect(props[:reply_to]).to eq("reply.queue")
@@ -431,7 +431,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           app_id: "test-suite"
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         expect(props[:message_id]).to eq("msg-456")
         expect(props[:timestamp].to_i).to eq(ts)
@@ -448,7 +448,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
 
         ch.basic_publish("high-pri", routing_key: q.name, priority: 5)
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         expect(header.properties[:priority]).to eq(5)
         ch.close
       end
@@ -461,7 +461,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
 
         ch.basic_publish("ttl-msg", routing_key: q.name, expiration: "60000")
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         expect(header.properties[:expiration]).to eq("60000")
         ch.close
       end
@@ -478,7 +478,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           headers: { "x-retry-count" => 3, "x-source" => "test" }
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         expect(header.properties[:headers]).to include("x-retry-count" => 3, "x-source" => "test")
         ch.close
       end
@@ -496,7 +496,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           properties: { content_type: "application/octet-stream", app_id: "from-hash" }
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         # properties: hash merges on top of named kwargs
         expect(props[:content_type]).to eq("application/octet-stream")

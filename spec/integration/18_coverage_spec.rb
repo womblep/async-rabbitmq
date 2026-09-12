@@ -28,7 +28,7 @@ RSpec.describe "Coverage completion", :integration do
         ch = session.open_channel
         q  = ch.queue("test.queue-publish.#{SecureRandom.hex(4)}", durable: true)
         q.publish("hello from queue api")
-        _di, _hdr, body = ch.basic_get(q.name)
+        _di, _hdr, body = ch.basic_get(q.name, manual_ack: false)
         expect(body).to eq("hello from queue api".b)
         ch.close
       end
@@ -41,7 +41,7 @@ RSpec.describe "Coverage completion", :integration do
         ch.basic_publish("msg1", routing_key: q.name)
         ch.basic_publish("msg2", routing_key: q.name)
         q.purge
-        expect(ch.basic_get(q.name)).to be_nil
+        expect(ch.basic_get(q.name, manual_ack: false)).to be_nil
         ch.close
       end
     end

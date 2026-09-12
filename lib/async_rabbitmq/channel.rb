@@ -243,7 +243,11 @@ module AsyncRabbitMQ
     # Duck-typed #write for stream composability.
     alias write basic_publish
 
-    def basic_get(queue_name, manual_ack: false)
+    # Synchronously fetch one message: [delivery_info, header, body], or nil if
+    # the queue is empty. Defaults to manual acknowledgement (as Bunny does):
+    # a message fetched and then dropped by the caller is requeued, not lost.
+    # Pass manual_ack: false to have the broker discard it on delivery.
+    def basic_get(queue_name, manual_ack: true)
       msg, content = @rpc_sem.acquire do
         assert_open!
         @frame_io.write_frame(AMQ::Protocol::Basic::Get.encode(@channel_id, queue_name, !manual_ack).encode)

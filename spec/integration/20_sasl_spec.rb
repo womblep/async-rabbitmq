@@ -9,7 +9,7 @@ RSpec.describe "SASL mechanism negotiation", :integration do
       ch = session.open_channel
       q  = ch.queue("test.sasl.plain", durable: true)
       ch.basic_publish("sasl-plain-test", routing_key: q.name)
-      _, _h, body = ch.basic_get(q.name)
+      _, _h, body = ch.basic_get(q.name, manual_ack: false)
       expect(body).to eq("sasl-plain-test")
       ch.close
     end
