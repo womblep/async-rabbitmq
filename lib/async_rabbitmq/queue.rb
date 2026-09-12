@@ -2,6 +2,13 @@ module AsyncRabbitMQ
   # Represents an AMQP queue bound to a channel.
   # Created via channel.queue("name", durable: true).
   class Queue
+    # Queue types RabbitMQ knows, for Channel#durable_queue(name, type).
+    module Types
+      CLASSIC = "classic"
+      QUORUM  = "quorum"
+      STREAM  = "stream"
+    end
+
     attr_reader :name, :message_count, :consumer_count
 
     def initialize(name, message_count, consumer_count, channel, durable: false, exclusive: false, auto_delete: false)

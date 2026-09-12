@@ -108,13 +108,31 @@ module AsyncRabbitMQ
                 durable: durable, exclusive: exclusive, auto_delete: auto_delete)
     end
 
+    # Server-named queue that lives for this connection only (exclusive, auto-delete).
     def temporary_queue(**opts)
       queue("", exclusive: true, auto_delete: true, **opts)
     end
 
+    # Durable, non-exclusive, non-auto-delete queue of the given type
+    # (Queue::Types::CLASSIC, QUORUM or STREAM). A name is required: a
+    # server-named durable queue makes no sense. Durability, exclusivity and
+    # auto-delete are fixed; +passive+ and +arguments+ are honoured.
+    def durable_queue(name, type = Queue::Types::CLASSIC, passive: false, arguments: {})
+      if name.nil? || name.to_s.empty?
+        raise ArgumentError, "queue name must not be nil or empty (server-named durable queues make no sense)"
+      end
+      args = type.to_s == Queue::Types::CLASSIC ? arguments : { "x-queue-type" => type.to_s }.merge(arguments)
+      queue(name, passive: passive, durable: true, exclusive: false, auto_delete: false, arguments: args)
+    end
+
     def quorum_queue(name, **opts)
-      args = { "x-queue-type" => "quorum" }.merge(opts.delete(:arguments) || {})
-      queue(name, durable: true, arguments: args, **opts)
+      durable_queue(name, Queue::Types::QUORUM, **opts)
+    end
+
+    # A RabbitMQ stream, usable over AMQP 0-9-1 as a durable queue. Consuming
+    # from it needs basic_qos and an "x-stream-offset" consumer argument.
+    def stream(name, **opts)
+      durable_queue(name, Queue::Types::STREAM, **opts)
     end
 
     def queue_delete(name, if_unused: false, if_empty: false)

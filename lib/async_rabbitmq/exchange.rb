@@ -4,6 +4,16 @@ module AsyncRabbitMQ
   class Exchange
     attr_reader :name, :type
 
+    # Built-in and commonly used exchange types (Bunny parity).
+    TYPE_DIRECT          = "direct"
+    TYPE_FANOUT          = "fanout"
+    TYPE_TOPIC           = "topic"
+    TYPE_HEADERS         = "headers"
+    TYPE_CONSISTENT_HASH = "x-consistent-hash"
+    TYPE_MODULUS_HASH    = "x-modulus-hash"
+    TYPE_RANDOM          = "x-random"
+    TYPE_LOCAL_RANDOM    = "x-local-random"
+
     PREDEFINED_EXCHANGES = %w[
       amq.direct amq.fanout amq.topic amq.headers amq.match amq.rabbitmq.trace
     ].freeze
