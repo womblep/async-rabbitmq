@@ -172,6 +172,7 @@ module AsyncRabbitMQ
                                   # survives reader-task Cancel propagation
       @on_blocked              = nil
       @on_unblocked            = nil
+      @update_secret_condition = nil
       @on_recovery_attempt     = nil
       @on_recovery             = nil
       @on_recovery_exhausted   = nil
@@ -298,6 +299,28 @@ module AsyncRabbitMQ
       end
     end
 
+    # Rotate the secret this connection authenticated with, without
+    # reconnecting (connection.update-secret, RabbitMQ 3.8+). Used with the
+    # OAuth 2 auth backend to hand the broker a refreshed access token before
+    # the current one expires. The new secret is also used for reconnects.
+    # Raises ConnectionError if the broker refuses (e.g. an auth backend that
+    # does not support secret updates closes the connection).
+    def update_secret(new_secret, reason = "secret update")
+      raise NotOpenError, "Session is not open" unless open?
+
+      cond = @update_secret_condition = Async::Condition.new
+      @frame_io.write_frame(AMQ::Protocol::Connection::UpdateSecret.encode(new_secret, reason).encode)
+      result = Async::Task.current.with_timeout(@rpc_timeout || RPC_TIMEOUT) { cond.wait }
+      raise result if result.is_a?(Exception)
+
+      @password = new_secret
+      true
+    rescue Async::TimeoutError
+      raise RpcTimeoutError, "No reply to connection.update-secret within #{@rpc_timeout || RPC_TIMEOUT}s"
+    ensure
+      @update_secret_condition = nil
+    end
+
     # Check whether a queue exists on the broker without creating it.
     # Opens a temporary channel and performs a passive declare.
     def queue_exists?(name)
@@ -418,6 +441,7 @@ module AsyncRabbitMQ
       # on the channels park until they are reopened after reconnect.
       conn_error = ConnectionError.new(code: 0, text: "Connection lost: #{error.message}")
       @channels.values.each { |ch| ch.mark_recovering!(conn_error) rescue nil }
+      @update_secret_condition&.signal(conn_error)
 
       # Schedule recover_loop BEFORE stopping old frame_io. old_io.stop
       # cancels reader/writer tasks; if we ARE the reader task, cancel raises
@@ -822,10 +846,15 @@ module AsyncRabbitMQ
         when AMQ::Protocol::Connection::Unblocked
           @frame_io&.set_unblocked
           @on_unblocked&.call
+        when AMQ::Protocol::Connection::UpdateSecretOk
+          @update_secret_condition&.signal(method)
+        when AMQ::Protocol::Connection::Close
+          # FrameIO has already answered with close-ok and triggered recovery;
+          # fail a pending update_secret with the broker's reason.
+          @update_secret_condition&.signal(ConnectionError.new(code: method.reply_code, text: method.reply_text))
         end
-        # All other channel-0 methods during normal operation (e.g. stray HeartbeatFrames
-        # routed here) are intentionally ignored; the handshake path uses wait_channel0_method
-        # directly and does not go through this loop.
+        # Other channel-0 methods during normal operation are intentionally
+        # ignored; the handshake uses wait_channel0_method, not this loop.
       end
     rescue => e
       @logger.debug("Channel-0 monitor exited: #{e.class}: #{e.message}")
