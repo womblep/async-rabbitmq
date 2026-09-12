@@ -6,7 +6,7 @@ A fiber-native RabbitMQ (AMQP 0-9-1) client for Ruby, built on the
 reader, writer, heartbeat and every consumer handler are fibers, so it fits
 Falcon, async-http and anything else running under the fiber scheduler.
 
-Requires Ruby 3.3+ and RabbitMQ 3.13+ (tested against 4.x).
+Requires Ruby 3.4+ (CI runs 3.4 and 4.0) and RabbitMQ 3.13+ (tested against 4.x).
 
 ```ruby
 require "async"

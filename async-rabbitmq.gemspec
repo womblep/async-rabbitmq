@@ -9,7 +9,7 @@ Gem::Specification.new do |spec|
                        "channels are duck-typed streams, connection and topology recovery are built in."
   spec.homepage      = "https://github.com/womblep/async-rabbitmq"
   spec.license       = "MIT"
-  spec.required_ruby_version = ">= 3.3"
+  spec.required_ruby_version = ">= 3.4"
 
   spec.files         = Dir["lib/**/*.rb", "LICENSE", "README.md", "CHANGELOG.md"]
   spec.metadata      = {

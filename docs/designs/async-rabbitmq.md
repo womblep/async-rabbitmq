@@ -261,7 +261,7 @@ Do not move to step N+1 until step N's test is green.
 ## Resolved Decisions
 
 1. **Gem name:** `async-rabbitmq` (matches async ecosystem naming)
-2. **Minimum Ruby version:** 3.3 (originally 3.2, raised 2026-04-02)
+2. **Minimum Ruby version:** 3.4 (originally 3.2; raised 2026-04-02 and 2026-09-12)
 
 ## TODOS Reference
 

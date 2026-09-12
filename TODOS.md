@@ -333,4 +333,4 @@ who want to kick the tires without writing Ruby.
 ## Resolved Decisions
 
 1. **Gem name:** `async-rabbitmq`
-2. **Minimum Ruby version:** 3.3 (3.2 support dropped 2026-04-02)
+2. **Minimum Ruby version:** 3.4 (3.2 dropped 2026-04-02, 3.3 dropped 2026-09-12; CI runs 3.4 and 4.0)

@@ -70,7 +70,7 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
 - `basic_get` defaults to `manual_ack: true`, as in Bunny (#40).
 - `amq-protocol` requirement raised to `~> 2.9` (#30).
-- Requires Ruby 3.3 or later.
+- Requires Ruby 3.4 or later; CI runs Ruby 3.4 and 4.0.
 - A message's frames are written as one buffer.
 
 ## [0.1.1] - 2026-04-02
