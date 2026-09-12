@@ -4,6 +4,7 @@ require "async/semaphore"
 require "socket"
 require "uri"
 require "logger"
+require "amq/uri"
 require_relative "errors"
 require_relative "frame_io"
 require_relative "channel"
@@ -36,13 +37,18 @@ module AsyncRabbitMQ
     # +addresses+ list used for failover.
     #
     # Keyword arguments override anything parsed from the URI(s).
+    #
+    # The standard RabbitMQ URI query parameters are honoured: +heartbeat+,
+    # +connection_timeout+, +channel_max+, +auth_mechanism+ and, for amqps://,
+    # +verify+, +cacertfile+, +certfile+ and +keyfile+ (which build a
+    # +tls_context+ unless one is passed explicitly).
     def self.from_uri(*uri_strings, **kwargs)
       raise ArgumentError, "at least one URI string is required" if uri_strings.empty?
 
-      first_opts = parse_amqp_uri(uri_strings.first)
+      first_opts = uri_options(uri_strings.first)
       address_list = uri_strings.map do |u|
-        parsed = parse_amqp_uri(u)
-        "#{parsed[:host] || 'localhost'}:#{parsed[:port] || 5672}"
+        parsed = uri_options(u)
+        "#{parsed[:host] || 'localhost'}:#{parsed[:port]}"
       end
 
       # Connection-level settings come from the first URI; addresses from all.
@@ -51,30 +57,51 @@ module AsyncRabbitMQ
       new(**opts.merge(kwargs))
     end
 
-    # Parse an amqp:// or amqps:// URI into keyword arguments for Session.new.
-    def self.parse_amqp_uri(uri_string)
-      uri = URI.parse(uri_string)
-      scheme = uri.scheme&.downcase
-      raise ArgumentError, "Expected amqp:// or amqps:// URI, got #{scheme}://" unless %w[amqp amqps].include?(scheme)
+    # Translate an amqp:// or amqps:// URI into Session.new keyword arguments.
+    #
+    # Parsing is delegated to AMQ::URI from amq-protocol, which percent-decodes
+    # the credentials and vhost (so "pa+ss" stays "pa+ss") and validates the
+    # scheme, the single-segment vhost path and the TLS-only query parameters.
+    def self.uri_options(uri_string)
+      parsed = AMQ::URI.parse(uri_string)
+      query  = ::URI.parse(uri_string).query
+      params = query ? ::URI.decode_www_form(query).to_h : {}
 
-      opts = {}
-      opts[:tls]      = (scheme == "amqps")
-      opts[:host]     = uri.host                          if uri.host && !uri.host.empty?
-      opts[:port]     = uri.port                          if uri.port
-      opts[:port]   ||= (scheme == "amqps" ? 5671 : 5672)
-      opts[:username] = URI.decode_www_form_component(uri.user)     if uri.user
-      opts[:password] = URI.decode_www_form_component(uri.password) if uri.password
+      opts = { tls: !!parsed[:ssl], port: parsed[:port] }
+      opts[:host]     = parsed[:host] if parsed[:host]
+      opts[:username] = parsed[:user] if parsed[:user]
+      opts[:password] = parsed[:pass] if parsed[:pass]
+      # "amqp://host/" yields an empty vhost; treat it as the default "/" rather
+      # than the (rarely intended) vhost literally named "".
+      opts[:vhost] = parsed[:vhost].empty? ? "/" : parsed[:vhost] if parsed.key?(:vhost)
 
-      # Vhost is the URI path with the leading "/" stripped; an empty path means "/".
-      if uri.path && !uri.path.empty?
-        vhost = URI.decode_www_form_component(uri.path.sub(%r{\A/}, ""))
-        opts[:vhost] = vhost.empty? ? "/" : vhost
+      opts[:heartbeat]       = Integer(params["heartbeat"])          if params.key?("heartbeat")
+      opts[:connect_timeout] = Integer(params["connection_timeout"]) if params.key?("connection_timeout")
+      opts[:channel_max]     = Integer(params["channel_max"])        if params.key?("channel_max")
+      opts[:auth_mechanism]  = params["auth_mechanism"]              if params.key?("auth_mechanism")
+
+      if opts[:tls] && %w[verify cacertfile certfile keyfile].any? { |k| params.key?(k) }
+        opts[:tls_context] = tls_context_from_uri(parsed, params)
       end
 
       opts
     end
 
-    private_class_method :parse_amqp_uri
+    # Build an OpenSSL context from the TLS query parameters of an amqps:// URI.
+    # Peer verification stays on unless the URI says verify=false explicitly.
+    def self.tls_context_from_uri(parsed, params)
+      require "openssl"
+      verify = params.key?("verify") ? params["verify"] != "false" : true
+      ctx = OpenSSL::SSL::SSLContext.new
+      ctx.set_params(verify_mode: verify ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE)
+      ctx.min_version = OpenSSL::SSL::TLS1_2_VERSION
+      ctx.ca_file = parsed[:cacertfile] if parsed[:cacertfile]
+      ctx.cert    = OpenSSL::X509::Certificate.new(File.read(parsed[:certfile])) if parsed[:certfile]
+      ctx.key     = OpenSSL::PKey.read(File.read(parsed[:keyfile]))              if parsed[:keyfile]
+      ctx
+    end
+
+    private_class_method :uri_options, :tls_context_from_uri
 
     def initialize(
       host: "localhost",
@@ -89,6 +116,8 @@ module AsyncRabbitMQ
       tls_context: nil,
       heartbeat: 60,
       frame_max: 131_072,
+      channel_max: 2047,
+      connect_timeout: CONNECT_TIMEOUT,
       auth_mechanism: nil,
       connection_name: nil,
       auto_recover: true,
@@ -108,6 +137,8 @@ module AsyncRabbitMQ
       @tls_context          = tls_context
       @heartbeat            = heartbeat
       @frame_max            = frame_max
+      @channel_max          = channel_max
+      @connect_timeout      = connect_timeout
       @auth_mechanism       = auth_mechanism
       @connection_name      = connection_name
       @auto_recover         = auto_recover
@@ -143,7 +174,7 @@ module AsyncRabbitMQ
     end
 
     # Connect and complete AMQP handshake. Raises ConnectionTimeoutError if
-    # the handshake does not complete within CONNECT_TIMEOUT seconds.
+    # the handshake does not complete within +connect_timeout+ seconds.
     # Raises NotOpenError if already connected.
     def connect
       raise NotOpenError, "Session is already connected" if open?
@@ -153,7 +184,7 @@ module AsyncRabbitMQ
       last_error = nil
       shuffled_addresses.each do |target_host, target_port|
         begin
-          Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
+          Async::Task.current.with_timeout(@connect_timeout) do
             raw_socket = open_socket(target_host, target_port)
             @frame_io  = build_frame_io(raw_socket)
             @frame_io.start
@@ -189,7 +220,7 @@ module AsyncRabbitMQ
       tried = @addresses.map { |h, p| "#{h}:#{p}" }.join(", ")
       case last_error
       when Async::TimeoutError
-        raise ConnectionTimeoutError, "AMQP handshake did not complete within #{CONNECT_TIMEOUT}s (tried #{tried})"
+        raise ConnectionTimeoutError, "AMQP handshake did not complete within #{@connect_timeout}s (tried #{tried})"
       when OpenSSL::SSL::SSLError
         raise ConnectionTimeoutError, "TLS handshake failed (tried #{tried}) — #{last_error.message}"
       else
@@ -486,7 +517,7 @@ module AsyncRabbitMQ
       end
       @negotiated_hb   = negotiate_heartbeat(msg.heartbeat)
       @negotiated_fm   = negotiate_frame_max(msg.frame_max)
-      @negotiated_cmax = msg.channel_max == 0 ? 2047 : msg.channel_max
+      @negotiated_cmax = negotiate_channel_max(msg.channel_max)
       send_connection_tune_ok
 
       # connection.open
@@ -575,6 +606,13 @@ module AsyncRabbitMQ
       [@frame_max, broker_fm].min
     end
 
+    # 0 means "no limit" on either side; otherwise the lower value wins.
+    def negotiate_channel_max(broker_cmax)
+      return (@channel_max == 0 ? 2047 : @channel_max) if broker_cmax == 0
+      return broker_cmax if @channel_max == 0
+      [@channel_max, broker_cmax].min
+    end
+
     def start_heartbeat_task
       interval = @negotiated_hb || 60
       return if interval == 0
@@ -644,7 +682,7 @@ module AsyncRabbitMQ
           break if @closed_by_user
           begin
             # Wrap the entire reconnect in a timeout so a dead socket doesn't hang forever.
-            Async::Task.current.with_timeout(CONNECT_TIMEOUT) do
+            Async::Task.current.with_timeout(@connect_timeout) do
               raw_socket = open_socket(target_host, target_port)
               @frame_io  = build_frame_io(raw_socket)
               @frame_io.start
