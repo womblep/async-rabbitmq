@@ -33,6 +33,7 @@ module AsyncRabbitMQ
       @nacked_tags       = []        # tags the broker rejected since confirm_select (Bunny: nacked_set)
       @only_acks         = true      # false once a nack arrives; read and reset by wait_for_confirms
       @confirms_enabled  = false
+      @tx_mode           = false
       @confirm_condition = nil
       @flow_active       = true
       @on_cancel         = nil
@@ -356,6 +357,31 @@ module AsyncRabbitMQ
     end
 
     # -------------------------------------------------------------------------
+    # Transactions (tx.*): publishes and acks on this channel are held by the
+    # broker until tx_commit, or discarded by tx_rollback. A channel cannot be
+    # both transactional and in confirm mode (the broker rejects the switch).
+    # Transactional mode is restored after connection recovery; work that was
+    # uncommitted when the connection dropped is lost, as with any client.
+    # -------------------------------------------------------------------------
+
+    def tx_select
+      rpc(AMQ::Protocol::Tx::Select.encode(@channel_id), AMQ::Protocol::Tx::SelectOk)
+      @tx_mode = true
+    end
+
+    def tx_commit
+      rpc(AMQ::Protocol::Tx::Commit.encode(@channel_id), AMQ::Protocol::Tx::CommitOk)
+    end
+
+    def tx_rollback
+      rpc(AMQ::Protocol::Tx::Rollback.encode(@channel_id), AMQ::Protocol::Tx::RollbackOk)
+    end
+
+    def using_tx?
+      @tx_mode
+    end
+
+    # -------------------------------------------------------------------------
     # Return handler
     # -------------------------------------------------------------------------
 
@@ -465,6 +491,7 @@ module AsyncRabbitMQ
         send_and_wait(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
         republish_unconfirmed
       end
+      send_and_wait(AMQ::Protocol::Tx::Select.encode(@channel_id), AMQ::Protocol::Tx::SelectOk) if @tx_mode
 
       # Release parked publishers/RPCs before re-registering consumers: they may
       # hold the semaphores that basic_consume needs.
