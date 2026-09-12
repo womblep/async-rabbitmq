@@ -27,7 +27,9 @@ module AsyncRabbitMQ
       @consumers         = {}        # consumer_tag => {queue_name:, block:, manual_ack:}
       @return_handler    = nil
       @delivery_tag      = 0
-      @pending_confirms  = {}        # delivery_tag => Async::Condition
+      @pending_confirms  = {}        # delivery_tag => delivery_tag, awaiting basic.ack/nack
+      @nacked_tags       = []        # tags the broker rejected since confirm_select (Bunny: nacked_set)
+      @only_acks         = true      # false once a nack arrives; read and reset by wait_for_confirms
       @confirms_enabled  = false
       @confirm_condition = nil
       @flow_active       = true
@@ -341,19 +343,33 @@ module AsyncRabbitMQ
       @confirms_enabled  = true
       @delivery_tag      = 0
       @pending_confirms  = {}
+      @nacked_tags       = []
+      @only_acks         = true
       @confirm_condition = Async::Condition.new
     end
 
-    # Block the current fiber until all published messages are confirmed.
+    # Block the current fiber until every published message has been acked or
+    # nacked by the broker. Returns true if all of them were acked since the
+    # previous call, false if at least one was nacked (see #nacked_tags).
     # Raises ConnectionError if the session disconnects while waiting.
     def wait_for_confirms
-      return true if @pending_confirms.empty?
-
       until @pending_confirms.empty?
         @confirm_condition.wait
         raise ConnectionError, "Session disconnected while waiting for confirms" unless open?
       end
-      true
+      result     = @only_acks
+      @only_acks = true
+      result
+    end
+
+    # Delivery tags the broker rejected with basic.nack since confirm_select.
+    def nacked_tags
+      @nacked_tags.dup
+    end
+
+    # Delivery tags published but not yet acked or nacked.
+    def unconfirmed_tags
+      @pending_confirms.keys
     end
 
     # -------------------------------------------------------------------------
@@ -558,13 +574,18 @@ module AsyncRabbitMQ
       end
     end
 
+    # A nack resolves the tag(s) like an ack does, but the rejection is recorded
+    # so wait_for_confirms can report it instead of claiming success.
     def handle_confirm_nack(method)
       @mutex.acquire do
-        if method.multiple
-          @pending_confirms.reject! { |tag, _| tag <= method.delivery_tag }
+        rejected = if method.multiple
+          @pending_confirms.keys.select { |tag| tag <= method.delivery_tag }
         else
-          @pending_confirms.delete(method.delivery_tag)
+          [method.delivery_tag]
         end
+        rejected.each { |tag| @pending_confirms.delete(tag) }
+        @nacked_tags.concat(rejected)
+        @only_acks = false
         @confirm_condition&.signal
       end
     end

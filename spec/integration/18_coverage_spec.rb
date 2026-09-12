@@ -170,7 +170,7 @@ RSpec.describe "Coverage completion", :integration do
   # -------------------------------------------------------------------------
 
   describe "Publisher confirms: basic.nack" do
-    it "handles Basic::Nack from broker gracefully (queue max-length overflow)" do
+    it "reports a Basic::Nack from the broker as a failed confirm cycle (queue max-length overflow)" do
       isolated_session do |session, _|
         ch = session.open_channel
         ch.confirm_select
@@ -184,10 +184,13 @@ RSpec.describe "Coverage completion", :integration do
         )
         ch.basic_publish("will be nacked", routing_key: q.name)
 
-        # wait_for_confirms returns true once all delivery tags are resolved
-        # (nack removes the tag just like ack does).
+        # The nack resolves the tag but the cycle is reported as failed and the
+        # rejected tag is exposed; the next clean cycle is reported as acked.
         result = ch.wait_for_confirms
-        expect(result).to be true
+        expect(result).to be false
+        expect(ch.nacked_tags).to eq([1])
+        expect(ch.unconfirmed_tags).to be_empty
+        expect(ch.wait_for_confirms).to be true
         ch.close
       end
     end
