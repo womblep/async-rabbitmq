@@ -34,6 +34,7 @@ module AsyncRabbitMQ
       @only_acks         = true      # false once a nack arrives; read and reset by wait_for_confirms
       @confirms_enabled  = false
       @tx_mode           = false
+      @prefetch          = nil       # last basic_qos settings, restored on reopen
       @confirm_condition = nil
       @flow_active       = true
       @on_cancel         = nil
@@ -302,6 +303,7 @@ module AsyncRabbitMQ
 
     def basic_qos(prefetch_count:, prefetch_size: 0, global: false)
       rpc(AMQ::Protocol::Basic::Qos.encode(@channel_id, prefetch_size, prefetch_count, global), AMQ::Protocol::Basic::QosOk)
+      @prefetch = { count: prefetch_count, size: prefetch_size, global: global }   # restored on reopen
       # Keep the handler pool coupled to prefetch: no point buffering 10 unacked
       # messages at the broker if only 1 can run at a time. prefetch_count == 0
       # means "unlimited" in AMQP; leave the pool alone so the user can still cap it.
@@ -497,24 +499,46 @@ module AsyncRabbitMQ
     # -------------------------------------------------------------------------
 
     def reopen_after_recovery(new_frame_io)
-      @frame_io = new_frame_io
+      reopen_on(new_frame_io)
+      # Release parked publishers/RPCs before re-registering consumers: they may
+      # hold the semaphores that basic_consume needs.
+      resume_parked!(:open)
+      re_register_consumers
+    end
+
+    # Reopen a channel the broker closed (e.g. delivery-ack timeout, unknown
+    # delivery tag) on the same connection, keeping its id. Prefetch, confirm
+    # mode and transactional mode are restored, and messages still unconfirmed
+    # at the time of the close are re-published. The old consumers are dropped
+    # unless +recover_consumers+ is true. (Bunny 3.0 parity.)
+    def reopen(recover_consumers: false)
+      unless closed?
+        raise NotOpenError, "Channel #{@channel_id} is #{@state}; only a closed channel can be reopened"
+      end
+      @consumers.clear unless recover_consumers
+      @session.reopen_channel(self)   # re-registers the id, then calls reopen_on
+      re_register_consumers if recover_consumers
+      self
+    end
+
+    # Internal: (re)open this channel on +frame_io+ and restore its settings.
+    # Uses direct sends: nothing else can be on the wire for this channel yet,
+    # and a fiber parked inside #rpc may be holding @rpc_sem.
+    def reopen_on(frame_io)
+      @frame_io = frame_io
       @queue    = @frame_io.register_channel(@channel_id)
       start_dispatch_task
-      # Direct sends: nothing else can be on the wire for this channel yet, and
-      # a fiber parked inside #rpc may be holding @rpc_sem.
       send_and_wait(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk)
       @state = :open
 
+      if (p = @prefetch)
+        send_and_wait(AMQ::Protocol::Basic::Qos.encode(@channel_id, p[:size], p[:count], p[:global]), AMQ::Protocol::Basic::QosOk)
+      end
       if @confirms_enabled
         send_and_wait(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
         republish_unconfirmed
       end
       send_and_wait(AMQ::Protocol::Tx::Select.encode(@channel_id), AMQ::Protocol::Tx::SelectOk) if @tx_mode
-
-      # Release parked publishers/RPCs before re-registering consumers: they may
-      # hold the semaphores that basic_consume needs.
-      resume_parked!(:open)
-      re_register_consumers
     end
 
     private

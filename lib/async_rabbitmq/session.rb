@@ -375,6 +375,20 @@ module AsyncRabbitMQ
       @frame_io&.unregister_channel(channel_id)
     end
 
+    # Put a channel the broker closed back into the channel table and reopen
+    # it on the current connection under its original id (Channel#reopen).
+    def reopen_channel(channel)
+      raise NotOpenError, "Session is not open" unless open?
+      @channel_mutex.acquire do
+        existing = @channels[channel.channel_id]
+        if existing && !existing.equal?(channel)
+          raise Error, "Channel id #{channel.channel_id} is in use by another channel"
+        end
+        @channels[channel.channel_id] = channel
+      end
+      channel.reopen_on(@frame_io)
+    end
+
     # --- Async::Pool resource interface ---
 
     # Can this session be returned to the pool?
