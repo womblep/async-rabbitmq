@@ -613,10 +613,15 @@ module AsyncRabbitMQ
       [@channel_max, broker_cmax].min
     end
 
+    # The negotiated value T is the heartbeat *timeout*. RabbitMQ and the
+    # reference clients send a heartbeat every T/2 and treat the peer as dead
+    # after roughly two missed heartbeats, so we send at T/2 as well and
+    # declare the broker dead when nothing has arrived for 2×T.
     def start_heartbeat_task
-      interval = @negotiated_hb || 60
-      return if interval == 0
-      timeout  = interval * 2
+      timeout = @negotiated_hb || 60
+      return if timeout == 0
+      interval   = timeout / 2.0
+      dead_after = timeout * 2
       # Seed the timestamp now; the on_frame callback will keep it fresh.
       @last_frame_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
@@ -628,8 +633,8 @@ module AsyncRabbitMQ
           last = @last_frame_at
           next unless last   # not yet seeded — skip this tick
           elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - last
-          if elapsed > timeout
-            trigger_recovery(HeartbeatTimeoutError.new("No frame received in #{elapsed.round(1)}s (timeout #{timeout}s)"))
+          if elapsed > dead_after
+            trigger_recovery(HeartbeatTimeoutError.new("No frame received in #{elapsed.round(1)}s (timeout #{dead_after}s)"))
             break
           end
         end

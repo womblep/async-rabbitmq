@@ -15,6 +15,36 @@ RSpec.describe "Heartbeat", :integration do
     session.close
   end
 
+  it "sends heartbeats every T/2, not every T (RabbitMQ and reference-client cadence)" do
+    session = AsyncRabbitMQ::Session.new(
+      host:      RABBITMQ_HOST,
+      port:      RABBITMQ_PORT,
+      heartbeat: 2
+    )
+    session.connect
+    frame_io = session.instance_variable_get(:@frame_io)
+    sent = 0
+    allow(frame_io).to receive(:write_heartbeat).and_wrap_original { |m| sent += 1; m.call }
+
+    # In 3.3 s at T/2 = 1 s we expect 3 heartbeats; the old T cadence sent 1.
+    sleep 3.3
+    expect(sent).to be >= 3
+    expect(session.open?).to be true
+    session.close
+  end
+
+  it "keeps an idle connection open for well over the heartbeat timeout" do
+    session = AsyncRabbitMQ::Session.new(
+      host:      RABBITMQ_HOST,
+      port:      RABBITMQ_PORT,
+      heartbeat: 2
+    )
+    session.connect
+    sleep 6.5   # > 3x T with no traffic besides heartbeats
+    expect(session.open?).to be true
+    session.close
+  end
+
   it "detects heartbeat timeout and triggers recovery (socket close)" do
     # Fallback: forcibly close the underlying socket to simulate abrupt network loss.
     # Use a very short heartbeat so we can force a timeout quickly.
