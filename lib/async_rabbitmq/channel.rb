@@ -33,6 +33,10 @@ module AsyncRabbitMQ
       @nacked_tags       = []        # tags the broker rejected since confirm_select (Bunny: nacked_set)
       @only_acks         = true      # false once a nack arrives; read and reset by wait_for_confirms
       @confirms_enabled  = false
+      @tracking          = false     # confirm_select(tracking: true): backpressure + MessageNacked
+      @outstanding_limit = nil       # max unconfirmed messages before basic_publish parks
+      @slot_condition    = nil       # publishers waiting for an outstanding slot
+      @nacked_this_cycle = []        # nacks since the last wait_for_confirms, for MessageNacked
       @tx_mode           = false
       @prefetch          = nil       # last basic_qos settings, restored on reopen
       @confirm_condition = nil
@@ -226,6 +230,7 @@ module AsyncRabbitMQ
       # connection.blocked gate).
       @publish_sem.acquire do
         assert_open!
+        wait_for_outstanding_slot(1)
         @frame_io.write_frame(bytes, publish: true)
         reserve_confirm_tag(bytes) if @confirms_enabled
       end
@@ -246,6 +251,7 @@ module AsyncRabbitMQ
       encoded = payloads.map { |p| encode_publish(p, exchange: exchange, routing_key: routing_key, **opts) }
       @publish_sem.acquire do
         assert_open!
+        wait_for_outstanding_slot(encoded.size)
         @frame_io.write_frame(encoded.join, publish: true)
         encoded.map { |bytes| reserve_confirm_tag(bytes) } if @confirms_enabled
       end
@@ -327,15 +333,36 @@ module AsyncRabbitMQ
     # Publisher confirms
     # -------------------------------------------------------------------------
 
-    def confirm_select
+    DEFAULT_OUTSTANDING_LIMIT = 1000
+
+    # Enable publisher confirms. With +tracking: true+ (Bunny 3.0 parity):
+    # basic_publish parks while +outstanding_limit+ messages are unconfirmed
+    # (default 1000, the sweet spot in Bunny's benchmarks), giving natural
+    # backpressure, and wait_for_confirms raises MessageNacked instead of
+    # returning false when the broker rejected a message.
+    def confirm_select(tracking: false, outstanding_limit: nil)
+      raise ArgumentError, "outstanding_limit requires tracking: true" if outstanding_limit && !tracking
+      if outstanding_limit && !(outstanding_limit.is_a?(Integer) && outstanding_limit.positive?)
+        raise ArgumentError, "outstanding_limit must be a positive Integer (got #{outstanding_limit.inspect})"
+      end
+
       rpc(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
       @confirms_enabled  = true
+      @tracking          = tracking
+      @outstanding_limit = tracking ? (outstanding_limit || DEFAULT_OUTSTANDING_LIMIT) : nil
       @delivery_tag      = 0
       @pending_confirms  = {}
       @nacked_tags       = []
+      @nacked_this_cycle = []
       @only_acks         = true
       @confirm_condition = Async::Condition.new
     end
+
+    def tracking_confirms?
+      @tracking
+    end
+
+    attr_reader :outstanding_limit
 
     # Block the current fiber until every published message has been acked or
     # nacked by the broker. Returns true if all of them were acked since the
@@ -349,8 +376,11 @@ module AsyncRabbitMQ
         @confirm_condition.wait
         raise ConnectionError, "Session disconnected while waiting for confirms" unless open?
       end
-      result     = @only_acks
-      @only_acks = true
+      result       = @only_acks
+      @only_acks   = true
+      cycle_nacked = @nacked_this_cycle
+      @nacked_this_cycle = []
+      raise MessageNacked.new(nacked_tags: cycle_nacked, channel_id: @channel_id) if @tracking && !result
       result
     end
 
@@ -477,6 +507,7 @@ module AsyncRabbitMQ
       @content_condition = nil
       @confirm_condition&.signal(error)
       @confirm_condition = nil
+      release_outstanding_slots(error)
       @queue&.push(nil) rescue nil
     rescue => e
       # ignore — best-effort unblock
@@ -645,6 +676,7 @@ module AsyncRabbitMQ
           @pending_confirms.delete(method.delivery_tag)
         end
         @confirm_condition&.signal
+        release_outstanding_slots
       end
     end
 
@@ -659,8 +691,10 @@ module AsyncRabbitMQ
         end
         rejected.each { |tag| @pending_confirms.delete(tag) }
         @nacked_tags.concat(rejected)
+        @nacked_this_cycle.concat(rejected)
         @only_acks = false
         @confirm_condition&.signal
+        release_outstanding_slots
       end
     end
 
@@ -752,6 +786,32 @@ module AsyncRabbitMQ
       @delivery_tag += 1
       @pending_confirms[@delivery_tag] = bytes
       @delivery_tag
+    end
+
+    # Confirm tracking backpressure: park until there is room for +needed+ more
+    # unconfirmed messages under outstanding_limit (a batch larger than the
+    # limit waits for the channel to be fully confirmed). Acks and nacks wake
+    # the waiters; a connection loss or close fails them.
+    def wait_for_outstanding_slot(needed)
+      return unless @outstanding_limit
+
+      target = [@outstanding_limit - needed, 0].max
+      while @pending_confirms.size > target
+        @slot_condition ||= Async::Condition.new
+        outcome = wait_with_timeout(@slot_condition) do
+          @slot_condition = nil
+          "No publisher confirm freed a slot within #{@rpc_timeout}s " \
+          "(#{@pending_confirms.size} outstanding, limit #{@outstanding_limit}) on channel #{@channel_id}"
+        end
+        raise outcome if outcome.is_a?(Exception)
+        assert_open!
+      end
+    end
+
+    def release_outstanding_slots(outcome = nil)
+      cond = @slot_condition
+      @slot_condition = nil
+      cond&.signal(outcome)
     end
 
     # Messages published under confirms whose ack never arrived are sent again

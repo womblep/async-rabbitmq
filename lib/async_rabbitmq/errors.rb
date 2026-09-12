@@ -58,6 +58,18 @@ module AsyncRabbitMQ
   # Raised when an operation is attempted on a closed channel or session.
   class NotOpenError < Error; end
 
+  # Raised by wait_for_confirms on a channel in confirm-tracking mode when the
+  # broker nacked at least one message in the cycle (see Channel#confirm_select).
+  class MessageNacked < Error
+    attr_reader :nacked_tags, :channel_id
+
+    def initialize(msg = nil, nacked_tags: [], channel_id: nil)
+      @nacked_tags = nacked_tags
+      @channel_id  = channel_id
+      super(msg || "Broker nacked #{nacked_tags.size} message(s) on channel #{channel_id}: tags #{nacked_tags.inspect}")
+    end
+  end
+
   # Raised when the broker does not answer a synchronous channel operation
   # (queue.declare, basic.consume, ...) within the session's rpc_timeout.
   # Bunny calls this a continuation timeout.
