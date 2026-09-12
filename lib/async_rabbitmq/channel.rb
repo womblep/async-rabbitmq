@@ -25,6 +25,7 @@ module AsyncRabbitMQ
       @state             = :closed
       @queue             = nil
       @consumers         = {}        # consumer_tag => {queue_name:, block:, manual_ack:}
+      @each_waiters      = {}        # consumer_tag => Async::Condition, fibers blocked in #each
       @return_handler    = nil
       @delivery_tag      = 0
       @pending_confirms  = {}        # delivery_tag => delivery_tag, awaiting basic.ack/nack
@@ -77,6 +78,7 @@ module AsyncRabbitMQ
       @state = :closed
       @session.channel_closed(@channel_id)
       @queue&.push(nil)  # wake dispatch_loop so it can detect :closed and exit
+      wake_each_waiters
     end
 
     # -------------------------------------------------------------------------
@@ -320,6 +322,7 @@ module AsyncRabbitMQ
       )
       wait_for(:basic_cancel_ok, AMQ::Protocol::Basic::CancelOk)
       @consumers.delete(consumer_tag)
+      wake_each_waiters(consumer_tag)
     end
 
     # Ask the broker to redeliver all unacknowledged messages on this channel.
@@ -411,13 +414,23 @@ module AsyncRabbitMQ
     # Duck-typed stream: #each yields deliveries
     # -------------------------------------------------------------------------
 
+    # Consume from +queue_name+, running +block+ for every delivery, and block
+    # the calling fiber until the consumer goes away: the channel is closed,
+    # the broker cancels the consumer (e.g. the queue is deleted) or closes the
+    # channel. A connection loss with automatic recovery is transparent: the
+    # consumer is re-registered and #each keeps waiting.
     def each(queue_name, manual_ack: false, &block)
       assert_open!
-      tag = basic_consume(queue_name, manual_ack: manual_ack, &block)
-      # Block until the channel or consumer is closed
-      Async::Condition.new.wait
+      tag  = basic_consume(queue_name, manual_ack: manual_ack, &block)
+      cond = @each_waiters[tag] = Async::Condition.new
+      cond.wait
+      nil
     ensure
-      basic_cancel(tag) rescue nil
+      if tag
+        @each_waiters.delete(tag)
+        # Cancelled early (e.g. the calling task was stopped): tidy the consumer.
+        basic_cancel(tag) rescue nil if open? && @consumers.key?(tag)
+      end
     end
 
     # -------------------------------------------------------------------------
@@ -540,6 +553,7 @@ module AsyncRabbitMQ
           @logger.warn("Channel #{@channel_id}: broker cancelled consumer #{method.consumer_tag}")
           @on_cancel&.call(method.consumer_tag)
         end
+        wake_each_waiters(method.consumer_tag)
         # No CancelOk to send for server-initiated cancel (no-wait is implicit).
 
       when AMQ::Protocol::Channel::Flow
@@ -611,6 +625,13 @@ module AsyncRabbitMQ
       @reply_condition = nil
       # Stop dispatch_loop
       @queue&.push(nil)
+      wake_each_waiters
+    end
+
+    # Release fibers blocked in #each for one consumer, or for all of them.
+    def wake_each_waiters(tag = nil)
+      waiters = tag ? [@each_waiters.delete(tag)].compact : @each_waiters.values.tap { @each_waiters.clear }
+      waiters.each { |cond| cond.signal rescue nil }
     end
 
     # -------------------------------------------------------------------------
