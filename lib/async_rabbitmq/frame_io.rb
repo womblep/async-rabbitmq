@@ -142,8 +142,13 @@ module AsyncRabbitMQ
         dispatch(frame)
       end
     rescue EOFError, Errno::ECONNRESET, Errno::EPIPE, IOError, Errno::EBADF => e
-      @logger.warn("FrameIO reader closed: #{e.class}")
-      trigger_recovery(e)
+      if @running
+        @logger.warn("FrameIO reader closed: #{e.class}")
+        trigger_recovery(e)
+      else
+        # #stop closed the socket under us: an orderly shutdown, not a failure.
+        @logger.debug("FrameIO reader stopped (#{e.class})")
+      end
     rescue AMQ::Protocol::Error => e
       @logger.error("FrameIO AMQP error: #{e.class}: #{e.message}")
       trigger_recovery(e)

@@ -26,7 +26,11 @@ RSpec.describe "basic.return handling", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
 
-      expect(session.instance_variable_get(:@logger)).to receive(:warn).with(/Unhandled basic\.return/).at_least(:once)
+      logger = session.instance_variable_get(:@logger)
+      # Only the unhandled-return warning is asserted; any other warning the
+      # session logs must not fail the example.
+      allow(logger).to receive(:warn).and_call_original
+      expect(logger).to receive(:warn).with(/Unhandled basic\.return/).at_least(:once)
 
       ch.basic_publish("unroutable", exchange: "", routing_key: "no.such.#{SecureRandom.hex(8)}", mandatory: true)
       sleep 0.3
