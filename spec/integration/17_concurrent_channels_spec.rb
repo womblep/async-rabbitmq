@@ -9,7 +9,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
       channel_count = 100
       channels      = channel_count.times.map { session.open_channel }
       queues        = channels.each_with_index.map do |ch, i|
-        ch.queue("test.stress.#{i}", durable: false)
+        ch.queue("test.stress.#{i}", durable: true)
       end
 
       # Publish from all channels concurrently
@@ -31,7 +31,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
   it "10 channels each publishing 100 messages — no corruption" do
     isolated_session do |session, _|
       channels = 10.times.map { session.open_channel }
-      queues   = channels.each_with_index.map { |ch, i| ch.queue("test.stress10.#{i}") }
+      queues   = channels.each_with_index.map { |ch, i| ch.queue("test.stress10.#{i}", durable: true) }
 
       tasks = channels.each_with_index.map do |ch, i|
         Async do

@@ -18,7 +18,7 @@ RSpec.describe "Exchange operations", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
       ex = ch.exchange("test.routing", type: :direct, durable: false)
-      q  = ch.queue("test.routing.q", durable: false)
+      q  = ch.queue("test.routing.q", durable: true)
       q.bind(exchange: ex.name, routing_key: "rk")
 
       ex.publish("payload", routing_key: "rk")
@@ -33,7 +33,7 @@ RSpec.describe "Exchange operations", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
       ex = ch.exchange("test.topic", type: :topic, durable: false)
-      q  = ch.queue("test.topic.q", durable: false)
+      q  = ch.queue("test.topic.q", durable: true)
       q.bind(exchange: ex.name, routing_key: "orders.#")
 
       ex.publish("order", routing_key: "orders.new")
@@ -48,8 +48,8 @@ RSpec.describe "Exchange operations", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
       ex = ch.exchange("test.fanout", type: :fanout, durable: false)
-      q1 = ch.queue("test.fanout.q1", durable: false)
-      q2 = ch.queue("test.fanout.q2", durable: false)
+      q1 = ch.queue("test.fanout.q1", durable: true)
+      q2 = ch.queue("test.fanout.q2", durable: true)
       q1.bind(exchange: ex.name)
       q2.bind(exchange: ex.name)
 

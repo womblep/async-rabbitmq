@@ -14,7 +14,7 @@ RSpec.describe "Publisher confirms", :integration do
   it "wait_for_confirms returns true for a single published message" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.confirm.single", durable: false)
+      q  = ch.queue("test.confirm.single", durable: true)
       ch.confirm_select
 
       ch.basic_publish("confirmed!", routing_key: q.name)
@@ -28,7 +28,7 @@ RSpec.describe "Publisher confirms", :integration do
   it "wait_for_confirms handles a batch of messages" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.confirm.batch", durable: false)
+      q  = ch.queue("test.confirm.batch", durable: true)
       ch.confirm_select
 
       20.times { |i| ch.basic_publish("msg-#{i}", routing_key: q.name) }

@@ -13,7 +13,7 @@ RSpec.describe AsyncRabbitMQ::Pool, :integration do
     pool.acquire do |session|
       expect(session).to be_a(AsyncRabbitMQ::Session)
       expect(session.open?).to be true
-      session.with_channel { |ch| ch.queue("test.pool.#{SecureRandom.hex(4)}") }
+      session.with_channel { |ch| ch.queue("test.pool.#{SecureRandom.hex(4)}", durable: true) }
       first = session
     end
 

@@ -26,7 +26,7 @@ RSpec.describe "Coverage completion", :integration do
     it "Queue#publish delivers a message via the queue object" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.queue-publish.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.queue-publish.#{SecureRandom.hex(4)}", durable: true)
         q.publish("hello from queue api")
         _di, _hdr, body = ch.basic_get(q.name)
         expect(body).to eq("hello from queue api".b)
@@ -37,7 +37,7 @@ RSpec.describe "Coverage completion", :integration do
     it "Queue#purge empties the queue" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.queue-purge.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.queue-purge.#{SecureRandom.hex(4)}", durable: true)
         ch.basic_publish("msg1", routing_key: q.name)
         ch.basic_publish("msg2", routing_key: q.name)
         q.purge
@@ -98,7 +98,7 @@ RSpec.describe "Coverage completion", :integration do
     it "yields deliveries and cancels cleanly when the channel is closed" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.each.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.each.#{SecureRandom.hex(4)}", durable: true)
         q.publish("hello from each")
 
         received = []
@@ -130,7 +130,7 @@ RSpec.describe "Coverage completion", :integration do
     it "channels are automatically reopened after connection recovery" do
       isolated_session do |session, _|
         ch = session.open_channel
-        ch.queue("test.recovery-reopen.#{SecureRandom.hex(4)}", durable: false)
+        ch.queue("test.recovery-reopen.#{SecureRandom.hex(4)}", durable: true)
 
         # Force the underlying TCP connection closed
         session.instance_variable_get(:@frame_io)
@@ -150,7 +150,7 @@ RSpec.describe "Coverage completion", :integration do
     it "channels with publisher confirms re-activate confirms after recovery" do
       isolated_session do |session, _|
         ch = session.open_channel
-        ch.queue("test.recovery-confirms.#{SecureRandom.hex(4)}", durable: false)
+        ch.queue("test.recovery-confirms.#{SecureRandom.hex(4)}", durable: true)
         ch.confirm_select   # enables confirms — reopen_after_recovery must re-select
 
         session.instance_variable_get(:@frame_io)
@@ -179,7 +179,7 @@ RSpec.describe "Coverage completion", :integration do
         # confirmed publish because the queue can hold 0 messages.
         q = ch.queue(
           "test.nack-overflow.#{SecureRandom.hex(4)}",
-          durable:   false,
+          durable:   true,
           arguments: { "x-max-length" => 0, "x-overflow" => "reject-publish" }
         )
         ch.basic_publish("will be nacked", routing_key: q.name)

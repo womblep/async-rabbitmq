@@ -23,7 +23,7 @@ RSpec.describe "URI parsing and recovery options", :integration do
       expect(session.username).to eq("guest")
 
       ch = session.open_channel
-      q = ch.queue("test.uri.#{SecureRandom.hex(4)}", durable: false)
+      q = ch.queue("test.uri.#{SecureRandom.hex(4)}", durable: true)
       expect(q.name).not_to be_empty
       ch.close
       session.close

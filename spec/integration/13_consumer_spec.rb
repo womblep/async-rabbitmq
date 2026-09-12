@@ -6,7 +6,7 @@ RSpec.describe "Consumer (basic.consume)", :integration do
   it "receives a delivery via subscribe" do
     isolated_session do |session, _|
       ch       = session.open_channel
-      q        = ch.queue("test.consume", durable: false)
+      q        = ch.queue("test.consume", durable: true)
       received = []
 
       consumer_tag = q.subscribe(manual_ack: true) do |di, _headers, body|
@@ -27,7 +27,7 @@ RSpec.describe "Consumer (basic.consume)", :integration do
   it "cancels a consumer successfully" do
     isolated_session do |session, _|
       ch  = session.open_channel
-      q   = ch.queue("test.cancel", durable: false)
+      q   = ch.queue("test.cancel", durable: true)
       tag = q.subscribe { |*| }
 
       expect { ch.basic_cancel(tag) }.not_to raise_error
@@ -38,7 +38,7 @@ RSpec.describe "Consumer (basic.consume)", :integration do
   it "receives deliveries in separate async tasks (concurrent)" do
     isolated_session do |session, _|
       ch          = session.open_channel
-      q           = ch.queue("test.concurrent", durable: false)
+      q           = ch.queue("test.concurrent", durable: true)
       received    = []
       deliveries  = 5
 
@@ -59,7 +59,7 @@ RSpec.describe "Consumer (basic.consume)", :integration do
   it "subscriber block runs in a new Async::Task per delivery" do
     isolated_session do |session, _|
       ch     = session.open_channel
-      q      = ch.queue("test.async.task", durable: false)
+      q      = ch.queue("test.async.task", durable: true)
       tasks  = []
 
       tag = q.subscribe(manual_ack: false) do |*|

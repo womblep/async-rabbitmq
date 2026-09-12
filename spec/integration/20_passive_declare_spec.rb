@@ -6,7 +6,7 @@ RSpec.describe "Passive declare", :integration do
   it "passive queue declare succeeds when the queue exists" do
     isolated_session do |session, _|
       ch = session.open_channel
-      ch.queue("test.passive.q", durable: false)
+      ch.queue("test.passive.q", durable: true)
 
       q = ch.queue("test.passive.q", passive: true)
       expect(q.name).to eq("test.passive.q")

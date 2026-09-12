@@ -7,7 +7,7 @@ RSpec.describe "Frame demultiplexer — publish/get round-trip", :integration do
   it "publishes a message and retrieves it via basic.get" do
     isolated_session do |session, _vhost|
       ch      = session.open_channel
-      q       = ch.queue("test.demux", durable: false)
+      q       = ch.queue("test.demux", durable: true)
       payload = "hello from demux #{SecureRandom.hex(4)}"
 
       ch.basic_publish(payload, routing_key: q.name)
@@ -25,8 +25,8 @@ RSpec.describe "Frame demultiplexer — publish/get round-trip", :integration do
       ch1 = session.open_channel
       ch2 = session.open_channel
 
-      q1 = ch1.queue("test.ch1", durable: false)
-      q2 = ch2.queue("test.ch2", durable: false)
+      q1 = ch1.queue("test.ch1", durable: true)
+      q2 = ch2.queue("test.ch2", durable: true)
 
       ch1.basic_publish("msg-ch1", routing_key: q1.name)
       ch2.basic_publish("msg-ch2", routing_key: q2.name)

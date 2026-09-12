@@ -14,7 +14,7 @@ RSpec.describe "basic.qos (prefetch)", :integration do
   it "respects prefetch_count=1 — delivers one message at a time" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.prefetch", durable: false)
+      q  = ch.queue("test.prefetch", durable: true)
 
       # Publish 3 messages
       3.times { |i| ch.basic_publish("msg-#{i}", routing_key: q.name) }
@@ -45,7 +45,7 @@ RSpec.describe "basic.qos (prefetch)", :integration do
   it "bounds concurrent handler fibers to pool_size (default 1)" do
     isolated_session do |session, _|
       ch = session.open_channel  # default pool_size: 1
-      q  = ch.queue("test.pool.default", durable: false)
+      q  = ch.queue("test.pool.default", durable: true)
 
       5.times { |i| ch.basic_publish("msg-#{i}", routing_key: q.name) }
       ch.basic_qos(prefetch_count: 10)  # broker would send all 5 at once
@@ -76,7 +76,7 @@ RSpec.describe "basic.qos (prefetch)", :integration do
   it "runs pool_size handlers concurrently when raised" do
     isolated_session do |session, _|
       ch = session.open_channel(pool_size: 3)
-      q  = ch.queue("test.pool.three", durable: false)
+      q  = ch.queue("test.pool.three", durable: true)
 
       6.times { |i| ch.basic_publish("msg-#{i}", routing_key: q.name) }
       ch.basic_qos(prefetch_count: 10)

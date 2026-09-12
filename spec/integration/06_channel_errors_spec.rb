@@ -11,7 +11,7 @@ RSpec.describe "Channel error handling", :integration do
       ch2 = session.open_channel
       expect {
         # Redeclare with different durable setting — PRECONDITION_FAILED (406)
-        ch2.queue("test.conflict", durable: false)
+        ch2.queue("test.conflict", durable: true)
       }.to raise_error(AsyncRabbitMQ::ChannelError) do |err|
         expect([406, 404]).to include(err.code)
       end
@@ -25,7 +25,7 @@ RSpec.describe "Channel error handling", :integration do
       begin
         ch.queue("test.softfail", durable: true)
         # Re-declare with wrong durability to trigger PRECONDITION_FAILED
-        ch.queue("test.softfail", durable: false)
+        ch.queue("test.softfail", durable: true)
       rescue AsyncRabbitMQ::ChannelError
         # expected
       end
@@ -41,7 +41,7 @@ RSpec.describe "Channel error handling", :integration do
       ch.queue("test.recover", durable: true)
 
       begin
-        ch.queue("test.recover", durable: false)
+        ch.queue("test.recover", durable: true)
       rescue AsyncRabbitMQ::ChannelError
         # expected
       end
