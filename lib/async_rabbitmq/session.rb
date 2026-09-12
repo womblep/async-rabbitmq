@@ -2,6 +2,7 @@ require "async"
 require "async/condition"
 require "async/semaphore"
 require "socket"
+require "openssl"
 require "uri"
 require "logger"
 require "amq/uri"
@@ -178,7 +179,8 @@ module AsyncRabbitMQ
     # Raises NotOpenError if already connected.
     def connect
       raise NotOpenError, "Session is already connected" if open?
-      @connecting = true
+      @connecting        = true
+      @closed_by_user    = false   # a previous failed connect must not disable recovery
       @session_root_task = Async::Task.current
 
       last_error = nil
@@ -201,7 +203,9 @@ module AsyncRabbitMQ
           @frame_io&.stop rescue nil
           @frame_io = nil
           last_error = e
-        rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, SocketError => e
+        rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Errno::EHOSTUNREACH, Errno::ECONNRESET,
+               Errno::EPIPE, EOFError, IOError, SocketError => e
+          # TCP connect failed, or the peer dropped the connection mid-handshake.
           @frame_io&.stop rescue nil
           @frame_io = nil
           last_error = e
@@ -210,8 +214,16 @@ module AsyncRabbitMQ
           @frame_io = nil
           last_error = e
         rescue AuthenticationError
+          # Credentials or vhost access refused: other nodes will say the same.
           cleanup_after_failed_connect
           raise
+        rescue ConnectionError, ChannelError => e
+          # The broker refused the handshake (e.g. 530 NOT_ALLOWED for a missing
+          # vhost, 320 CONNECTION_FORCED from a node in maintenance). Stop the
+          # reader/writer tasks on this socket and try the next address.
+          @frame_io&.stop rescue nil
+          @frame_io = nil
+          last_error = e
         end
       end
 
@@ -223,6 +235,8 @@ module AsyncRabbitMQ
         raise ConnectionTimeoutError, "AMQP handshake did not complete within #{@connect_timeout}s (tried #{tried})"
       when OpenSSL::SSL::SSLError
         raise ConnectionTimeoutError, "TLS handshake failed (tried #{tried}) — #{last_error.message}"
+      when ConnectionError, ChannelError
+        raise last_error
       else
         raise ConnectionTimeoutError, "Could not connect to any host (tried #{tried}) — #{last_error&.message}"
       end
@@ -356,7 +370,15 @@ module AsyncRabbitMQ
     # Called by FrameIO when a connection-level error triggers recovery.
     def trigger_recovery(error)
       return if @closed_by_user
-      return if @connecting
+
+      if @connecting
+        # The handshake is in flight in another fiber; hand it the IO error so
+        # it fails now (as a connect failure) rather than sitting in
+        # wait_channel0_method until the connect timeout expires.
+        q0 = @frame_io&.channel_queue(0)
+        q0&.push([:method, error]) rescue nil
+        return
+      end
 
       unless @auto_recover
         @state = :closed
@@ -449,6 +471,7 @@ module AsyncRabbitMQ
     # Stop any in-flight frame_io / recovery tasks spawned during a failed connect.
     def cleanup_after_failed_connect
       @closed_by_user = true
+      @connecting     = false
       @recovery_task&.cancel rescue nil
       @recovery_task = nil
       @heartbeat_task&.cancel rescue nil
@@ -533,15 +556,18 @@ module AsyncRabbitMQ
         raise ConnectionError, "Connection closed while waiting for #{expected_classes.join(', ')}" if msg.nil?
         next unless msg[0] == :method
         method = msg[1]
-        # ConnectionError pushed directly by trigger_recovery to unblock this wait
-        raise method if method.is_a?(ConnectionError) || method.is_a?(ChannelError)
+        # An exception pushed directly by trigger_recovery to unblock this wait
+        # (ConnectionError during recovery, or the raw IO error during connect).
+        raise method if method.is_a?(Exception)
         if expected_classes.any? { |c| method.is_a?(c) }
           return method
         elsif method.is_a?(AMQ::Protocol::Connection::Close)
           code = method.reply_code
           text = method.reply_text
-          if FrameIO::SOFT_ERROR_CODES.include?(code)
-            raise ChannelError.new(code: code, text: text)
+          # connection.close is always connection-level. 403 ACCESS_REFUSED here
+          # means the credentials or the vhost access were rejected.
+          if code == 403
+            raise AuthenticationError.new(code: code, text: text)
           else
             raise ConnectionError.new(code: code, text: text)
           end
@@ -551,10 +577,21 @@ module AsyncRabbitMQ
 
     def send_connection_start_ok(sasl)
       props = {
-        "product"     => "async-rabbitmq",
-        "version"     => AsyncRabbitMQ::VERSION,
-        "platform"    => "Ruby #{RUBY_VERSION}",
-        "information" => "https://github.com/womblep/async-rabbitmq",
+        "product"      => "async-rabbitmq",
+        "version"      => AsyncRabbitMQ::VERSION,
+        "platform"     => "Ruby #{RUBY_VERSION}",
+        "information"  => "https://github.com/womblep/async-rabbitmq",
+        # Extensions this client understands. authentication_failure_close makes
+        # RabbitMQ answer bad credentials with connection.close 403 instead of
+        # silently dropping the TCP connection (https://www.rabbitmq.com/docs/auth-notification).
+        "capabilities" => {
+          "publisher_confirms"           => true,
+          "consumer_cancel_notify"       => true,
+          "exchange_exchange_bindings"   => true,
+          "basic.nack"                   => true,
+          "connection.blocked"           => true,
+          "authentication_failure_close" => true,
+        },
       }
       props["connection_name"] = @connection_name if @connection_name
       @frame_io.write_frame(
@@ -697,6 +734,17 @@ module AsyncRabbitMQ
             @port = target_port
             connected = true
             break
+          rescue AuthenticationError => e
+            # The credentials no longer work; retrying cannot help.
+            @frame_io&.stop rescue nil
+            @frame_io = nil
+            @logger.error("Recovery abandoned: #{e.message}")
+            @state = :closed
+            @recovery_in_progress = false
+            @channels.each_value { |ch| ch.interrupt_wait!(e) rescue nil }
+            @on_recovery_exhausted&.call(self)
+            @recovery_task = nil
+            return
           rescue => e
             @frame_io&.stop rescue nil
             @logger.debug("Recovery: #{target_host}:#{target_port} failed — #{e.class}: #{e.message}")

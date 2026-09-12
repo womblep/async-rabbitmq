@@ -58,6 +58,16 @@ module AsyncRabbitMQ
   # Raised when an operation is attempted on a closed channel or session.
   class NotOpenError < Error; end
 
-  # Raised when SASL negotiation fails (no common mechanism, bad credentials).
-  class AuthenticationError < Error; end
+  # Raised when authentication fails: no SASL mechanism in common with the
+  # broker, or the broker refused the credentials / vhost access with a
+  # connection.close 403 ACCESS_REFUSED (then +code+ and +text+ are set).
+  class AuthenticationError < Error
+    attr_reader :code, :text
+
+    def initialize(msg = nil, code: nil, text: nil)
+      @code = code
+      @text = text
+      super(msg || "Authentication failed (#{code}): #{text}")
+    end
+  end
 end
