@@ -621,11 +621,12 @@ module AsyncRabbitMQ
     end
 
     def send_connection_close
-      @frame_io.write_frame(
-        AMQ::Protocol::Connection::Close.encode(200, "Goodbye", 0, 0).encode
-      )
-      # Wait at most 5s for CloseOk — skip if socket already dead.
+      # Bound the whole handshake, write included: the broker may never answer,
+      # and the write queue may be full behind a stalled socket.
       Async::Task.current.with_timeout(5) do
+        @frame_io.write_frame(
+          AMQ::Protocol::Connection::Close.encode(200, "Goodbye", 0, 0).encode
+        )
         wait_channel0_method(AMQ::Protocol::Connection::CloseOk)
       end
     rescue Async::TimeoutError, ConnectionError, ChannelError, IOError

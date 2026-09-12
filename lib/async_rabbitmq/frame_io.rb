@@ -77,6 +77,9 @@ module AsyncRabbitMQ
     def stop
       @running = false
       @socket.close rescue nil
+      # Publishers parked on the connection.blocked gate can never proceed now.
+      @blocked = false
+      release_blocked_writers(ConnectionError.new(code: 0, text: "Connection closed while blocked by the broker"))
       # Push nil sentinel to every channel queue FIRST so blocked poppers
       # (e.g. wait_channel0_method) are unblocked before we cancel tasks.
       # Cancelling the CURRENT task raises Async::Cancel (< Exception, not
@@ -87,12 +90,19 @@ module AsyncRabbitMQ
       @reader_task&.cancel rescue nil
     end
 
-    # Enqueue raw frame bytes for writing. Yields the fiber when queue is full,
-    # or while the connection is broker-blocked (connection.blocked received).
-    def write_frame(data)
-      while @blocked
-        @unblocked_condition ||= Async::Condition.new
-        @unblocked_condition.wait
+    # Enqueue raw frame bytes for writing. Yields the fiber when the queue is
+    # full. Content publishes (+publish: true+) additionally wait while the
+    # broker has the connection blocked (connection.blocked). Control frames
+    # (close, close-ok, acks, ...) are never gated, so shutdown cannot hang on
+    # a resource alarm. Raises ConnectionError if the connection is closed
+    # while a publish is parked.
+    def write_frame(data, publish: false)
+      if publish
+        while @blocked
+          @unblocked_condition ||= Async::Condition.new
+          outcome = @unblocked_condition.wait
+          raise outcome if outcome.is_a?(Exception)
+        end
       end
       @write_queue.push(data)
     end
@@ -106,10 +116,12 @@ module AsyncRabbitMQ
     # Called by the Session channel-0 monitor when connection.unblocked is received.
     def set_unblocked
       @blocked = false
-      cond = @unblocked_condition
-      @unblocked_condition = nil
-      cond&.signal
+      release_blocked_writers
       @logger.info("Connection unblocked")
+    end
+
+    def blocked?
+      @blocked
     end
 
     # Write heartbeat directly to socket, bypassing the write queue so
@@ -123,6 +135,14 @@ module AsyncRabbitMQ
     end
 
     private
+
+    # Wake every publisher waiting on the blocked gate. With +outcome+ nil they
+    # re-check the gate; with an exception they raise it.
+    def release_blocked_writers(outcome = nil)
+      cond = @unblocked_condition
+      @unblocked_condition = nil
+      cond&.signal(outcome)
+    end
 
     def writer_loop
       while @running

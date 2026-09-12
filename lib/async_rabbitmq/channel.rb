@@ -234,7 +234,7 @@ module AsyncRabbitMQ
       frames = AMQ::Protocol::Basic::Publish.encode(
         @channel_id, payload_bytes, props, exchange, routing_key, mandatory, false, @frame_max
       )
-      frames.each { |f| @frame_io.write_frame(f.encode) }
+      frames.each { |f| @frame_io.write_frame(f.encode, publish: true) }
 
       if @confirms_enabled
         @mutex.acquire do

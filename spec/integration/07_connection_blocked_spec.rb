@@ -24,9 +24,7 @@ RSpec.describe "connection.blocked / connection.unblocked", :integration do
       sleep 0.1
       expect(session.open?).to be true
 
-      # Unblock before closing so ch.close's write_frame doesn't hang
-      queue0.push([:method, AMQ::Protocol::Connection::Unblocked.new]) if queue0
-      sleep 0.05
+      # Close while still blocked: control frames bypass the publish gate.
       ch.close
     end
   end
