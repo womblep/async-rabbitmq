@@ -580,7 +580,7 @@ module AsyncRabbitMQ
       @on_error&.call(self, method)
 
       error = if FrameIO::SOFT_ERROR_CODES.include?(code)
-        ChannelError.new(code: code, text: text, channel_id: @channel_id)
+        ChannelError.new(code: code, text: text, channel_id: @channel_id, close_method: method)
       else
         ConnectionError.new(code: code, text: text)
       end

@@ -15,8 +15,9 @@ module AsyncRabbitMQ
   #   Writer Task — drains a bounded Async::LimitedQueue, serializes all writes.
   #   Heartbeat   — writes directly via Async::Semaphore (bypasses write queue).
   #
-  # AMQ::Protocol::Frame.decode raises NotImplementedError (abstract stub).
-  # Frame reading uses manual 3-step IO instead.
+  # AMQ::Protocol::Frame.decode raises NotImplementedError (abstract stub), so
+  # frames are read in three steps: 7-byte header (decoded by
+  # AMQ::Protocol::Frame.decode_header), payload, 0xCE terminator.
   class FrameIO
     FRAME_HEADER_SIZE = 7
     FRAME_TERMINATOR  = "\xCE".b.freeze
@@ -154,21 +155,19 @@ module AsyncRabbitMQ
     # Read one AMQP frame via manual 3-step IO.
     # Returns an AMQ::Protocol::MethodFrame / HeaderFrame / BodyFrame / HeartbeatFrame.
     def read_frame
-      header_bytes             = read_exactly(FRAME_HEADER_SIZE)
-      type_int, channel_id,
-        payload_size           = decode_header(header_bytes)
-      payload                  = read_exactly(payload_size)
-      terminator               = read_exactly(1)
+      header_bytes = read_exactly(FRAME_HEADER_SIZE)
+      # Raises AMQ::Protocol::FrameTypeError (an AMQ::Protocol::Error) on an
+      # unknown frame type, which reader_loop turns into recovery.
+      type, channel_id, payload_size = AMQ::Protocol::Frame.decode_header(header_bytes)
+      payload    = read_exactly(payload_size)
+      terminator = read_exactly(1)
 
       unless terminator == FRAME_TERMINATOR
         raise AMQ::Protocol::Error,
               "Invalid frame terminator: #{terminator.inspect} (expected 0xCE)"
       end
 
-      frame_class = AMQ::Protocol::Frame::CLASSES[type_int]
-      raise AMQ::Protocol::Error, "Unknown frame type: #{type_int}" unless frame_class
-
-      frame_class.new(payload, channel_id)
+      AMQ::Protocol::Frame::CLASSES[AMQ::Protocol::Frame::TYPES[type]].new(payload, channel_id)
     end
 
     # Read exactly n bytes, yielding the fiber at each blocking read.
@@ -181,16 +180,6 @@ module AsyncRabbitMQ
         buf << chunk
       end
       buf
-    end
-
-    # Decode the 7-byte AMQP frame header.
-    # Layout: type(1) + channel(2) + payload_size(4)
-    def decode_header(bytes)
-      frame_type   = bytes.getbyte(0)
-      channel_id   = (bytes.getbyte(1) << 8) | bytes.getbyte(2)
-      payload_size = (bytes.getbyte(3) << 24) | (bytes.getbyte(4) << 16) |
-                     (bytes.getbyte(5) << 8)  |  bytes.getbyte(6)
-      [frame_type, channel_id, payload_size]
     end
 
     def dispatch(frame_obj)

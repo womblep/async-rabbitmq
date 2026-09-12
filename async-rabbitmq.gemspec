@@ -15,7 +15,7 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "async",        "~> 2.0"
-  spec.add_dependency "amq-protocol", "~> 2.3"
+  spec.add_dependency "amq-protocol", "~> 2.9"
 
   spec.add_development_dependency "rspec",      "~> 3.13"
   spec.add_development_dependency "simplecov",  "~> 0.22"
