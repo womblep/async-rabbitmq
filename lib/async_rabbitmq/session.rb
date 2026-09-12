@@ -20,6 +20,7 @@ module AsyncRabbitMQ
   # Pool interface: implements reusable?, viable?, concurrency, close for Async::Pool.
   class Session
     CONNECT_TIMEOUT     = 30     # seconds for AMQP handshake
+    RPC_TIMEOUT         = 15     # seconds to wait for a synchronous channel reply (nil = forever)
     RECOVERY_INITIAL    = 1.0    # seconds
     RECOVERY_MAX        = 30.0   # seconds
     RECOVERY_JITTER     = 0.25   # ±25%
@@ -119,6 +120,7 @@ module AsyncRabbitMQ
       frame_max: 131_072,
       channel_max: 2047,
       connect_timeout: CONNECT_TIMEOUT,
+      rpc_timeout: RPC_TIMEOUT,
       auth_mechanism: nil,
       connection_name: nil,
       auto_recover: true,
@@ -140,6 +142,7 @@ module AsyncRabbitMQ
       @frame_max            = frame_max
       @channel_max          = channel_max
       @connect_timeout      = connect_timeout
+      @rpc_timeout          = rpc_timeout
       @auth_mechanism       = auth_mechanism
       @connection_name      = connection_name
       @auto_recover         = auto_recover
@@ -278,7 +281,8 @@ module AsyncRabbitMQ
     def open_channel(pool_size: 1)
       raise NotOpenError, "Session is not open" unless open?
       channel_id = next_channel_id
-      channel    = Channel.new(channel_id, self, @frame_io, frame_max: @negotiated_fm || @frame_max, logger: @logger, pool_size: pool_size)
+      channel    = Channel.new(channel_id, self, @frame_io, frame_max: @negotiated_fm || @frame_max, logger: @logger,
+                               pool_size: pool_size, rpc_timeout: @rpc_timeout)
       @channel_mutex.acquire { @channels[channel_id] = channel }
       channel.open
       channel

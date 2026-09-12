@@ -15,12 +15,13 @@ module AsyncRabbitMQ
     # concurrently on this channel (Bunny-parity: default 1 = serialized).
     # Resizable at runtime via #pool_size=; basic_qos adjusts it automatically
     # when prefetch_count > 0 so the two stay coupled.
-    def initialize(channel_id, session, frame_io, frame_max:, logger:, pool_size: 1)
+    def initialize(channel_id, session, frame_io, frame_max:, logger:, pool_size: 1, rpc_timeout: nil)
       @channel_id   = channel_id
       @session      = session
       @frame_io     = frame_io
       @frame_max    = frame_max
       @logger       = logger
+      @rpc_timeout  = rpc_timeout   # seconds a synchronous operation waits for its reply; nil = forever
 
       @state             = :closed
       @queue             = nil
@@ -687,7 +688,11 @@ module AsyncRabbitMQ
 
     def wait_for_any(*expected_classes)
       condition = @reply_condition = Async::Condition.new
-      result    = condition.wait
+      result    = wait_with_timeout(condition) do
+        @reply_condition = nil if @reply_condition.equal?(condition)
+        # amq-protocol method classes report their AMQP name, e.g. "queue.declare-ok".
+        "No reply to #{expected_classes.map(&:name).join('/')} within #{@rpc_timeout}s on channel #{@channel_id}"
+      end
 
       raise result if result.is_a?(Exception)
 
@@ -706,7 +711,20 @@ module AsyncRabbitMQ
       end
 
       condition = @content_condition = Async::Condition.new
-      condition.wait
+      wait_with_timeout(condition) do
+        @content_condition = nil if @content_condition.equal?(condition)
+        "No message content received within #{@rpc_timeout}s on channel #{@channel_id}"
+      end
+    end
+
+    # Wait on +condition+, bounded by the channel's rpc_timeout. On expiry the
+    # block tidies the waiter slot and returns the message for RpcTimeoutError.
+    def wait_with_timeout(condition)
+      return condition.wait unless @rpc_timeout
+
+      Async::Task.current.with_timeout(@rpc_timeout) { condition.wait }
+    rescue Async::TimeoutError
+      raise RpcTimeoutError, yield
     end
 
     def re_register_consumers

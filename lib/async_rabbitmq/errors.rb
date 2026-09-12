@@ -58,6 +58,11 @@ module AsyncRabbitMQ
   # Raised when an operation is attempted on a closed channel or session.
   class NotOpenError < Error; end
 
+  # Raised when the broker does not answer a synchronous channel operation
+  # (queue.declare, basic.consume, ...) within the session's rpc_timeout.
+  # Bunny calls this a continuation timeout.
+  class RpcTimeoutError < Error; end
+
   # Raised when authentication fails: no SASL mechanism in common with the
   # broker, or the broker refused the credentials / vhost access with a
   # connection.close 403 ACCESS_REFUSED (then +code+ and +text+ are set).
