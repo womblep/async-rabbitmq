@@ -212,56 +212,44 @@ module AsyncRabbitMQ
     # Basic operations
     # -------------------------------------------------------------------------
 
-    def basic_publish(payload, exchange: "", routing_key: "", mandatory: false, persistent: false,
-                      content_type: nil, content_encoding: nil, headers: nil, priority: nil,
-                      correlation_id: nil, reply_to: nil, expiration: nil, message_id: nil,
-                      timestamp: nil, type: nil, user_id: nil, app_id: nil, properties: {})
-      assert_open!
-      payload_bytes = payload.is_a?(String) ? payload.b : payload
-      delivery_mode = persistent ? 2 : 1
-      props         = { delivery_mode: delivery_mode }
-      props[:content_type]     = content_type     if content_type
-      props[:content_encoding] = content_encoding if content_encoding
-      props[:headers]          = headers          if headers
-      props[:priority]         = priority         if priority
-      props[:correlation_id]   = correlation_id   if correlation_id
-      props[:reply_to]         = reply_to         if reply_to
-      props[:expiration]       = expiration        if expiration
-      props[:message_id]       = message_id       if message_id
-      props[:timestamp]        = timestamp        if timestamp
-      props[:type]             = type             if type
-      props[:user_id]          = user_id          if user_id
-      props[:app_id]           = app_id           if app_id
-      props.merge!(properties)
-
-      # Basic::Publish.encode returns [MethodFrame, HeaderFrame, BodyFrame, ...],
-      # splitting payload across multiple body frames when needed.
-      frames = AMQ::Protocol::Basic::Publish.encode(
-        @channel_id, payload_bytes, props, exchange, routing_key, mandatory, false, @frame_max
-      )
-      # One publish's frames must reach the wire contiguously: write_frame can
-      # yield (full queue, connection.blocked) and a second publisher on this
-      # channel slipping in between the method, header and body frames is a
-      # protocol error (505 UNEXPECTED_FRAME). Holding the semaphore across the
-      # writes and the tag assignment also keeps confirm tags in wire order.
+    # Publish one message. Options: exchange:, routing_key:, mandatory:,
+    # persistent: (delivery_mode 2) and the standard AMQP properties
+    # (content_type:, content_encoding:, headers:, priority:, correlation_id:,
+    # reply_to:, expiration:, message_id:, timestamp:, type:, user_id:, app_id:)
+    # plus a raw properties: hash. Returns the confirm delivery tag when the
+    # channel is in confirm mode, nil otherwise.
+    def basic_publish(payload, exchange: "", routing_key: "", **opts)
+      bytes = encode_publish(payload, exchange: exchange, routing_key: routing_key, **opts)
+      # One publish's frames must reach the wire contiguously and confirm tags
+      # must follow wire order, so the write and the tag assignment happen
+      # under one semaphore (write_frame can yield on a full queue or the
+      # connection.blocked gate).
       @publish_sem.acquire do
         assert_open!
-        encoded = frames.map(&:encode)
-        encoded.each { |bytes| @frame_io.write_frame(bytes, publish: true) }
-
-        if @confirms_enabled
-          @delivery_tag += 1
-          tag = @delivery_tag
-          # The encoded frames are kept until the broker confirms the tag so the
-          # message can be re-published if the connection drops first.
-          @pending_confirms[tag] = encoded.join
-          tag
-        end
+        @frame_io.write_frame(bytes, publish: true)
+        reserve_confirm_tag(bytes) if @confirms_enabled
       end
     end
 
     # Duck-typed #write for stream composability.
     alias write basic_publish
+
+    # Publish many messages with one write. All payloads share +opts+ (see
+    # basic_publish). The frames are encoded into a single buffer and handed
+    # to the writer once; under confirms the tag range is reserved as a block
+    # and the tags are returned (nil otherwise). Batches of a few hundred to a
+    # few thousand messages give the best throughput (Bunny 3.0 parity).
+    def basic_publish_batch(payloads, exchange: "", routing_key: "", **opts)
+      raise ArgumentError, "payloads must be an Array of message bodies" unless payloads.is_a?(Array)
+      return nil if payloads.empty?
+
+      encoded = payloads.map { |p| encode_publish(p, exchange: exchange, routing_key: routing_key, **opts) }
+      @publish_sem.acquire do
+        assert_open!
+        @frame_io.write_frame(encoded.join, publish: true)
+        encoded.map { |bytes| reserve_confirm_tag(bytes) } if @confirms_enabled
+      end
+    end
 
     # Synchronously fetch one message: [delivery_info, header, body], or nil if
     # the queue is empty. Defaults to manual acknowledgement (as Bunny does):
@@ -728,6 +716,42 @@ module AsyncRabbitMQ
     def send_and_wait(frame, *expected_classes)
       @frame_io.write_frame(frame.encode)
       wait_for_any(*expected_classes)
+    end
+
+    # Encode one basic.publish (method + header + body frames) into a single
+    # byte string, so a message always hits the write queue in one piece.
+    def encode_publish(payload, exchange:, routing_key:, mandatory: false, persistent: false,
+                       content_type: nil, content_encoding: nil, headers: nil, priority: nil,
+                       correlation_id: nil, reply_to: nil, expiration: nil, message_id: nil,
+                       timestamp: nil, type: nil, user_id: nil, app_id: nil, properties: {})
+      payload_bytes = payload.is_a?(String) ? payload.b : payload
+      props = { delivery_mode: persistent ? 2 : 1 }
+      props[:content_type]     = content_type     if content_type
+      props[:content_encoding] = content_encoding if content_encoding
+      props[:headers]          = headers          if headers
+      props[:priority]         = priority         if priority
+      props[:correlation_id]   = correlation_id   if correlation_id
+      props[:reply_to]         = reply_to         if reply_to
+      props[:expiration]       = expiration       if expiration
+      props[:message_id]       = message_id       if message_id
+      props[:timestamp]        = timestamp        if timestamp
+      props[:type]             = type             if type
+      props[:user_id]          = user_id          if user_id
+      props[:app_id]           = app_id           if app_id
+      props.merge!(properties)
+
+      # Basic::Publish.encode splits the body across frames of at most frame_max.
+      AMQ::Protocol::Basic::Publish.encode(
+        @channel_id, payload_bytes, props, exchange, routing_key, mandatory, false, @frame_max
+      ).map(&:encode).join
+    end
+
+    # Under confirms: take the next delivery tag and keep the encoded message
+    # until the broker acks it, so it can be re-published after a reconnect.
+    def reserve_confirm_tag(bytes)
+      @delivery_tag += 1
+      @pending_confirms[@delivery_tag] = bytes
+      @delivery_tag
     end
 
     # Messages published under confirms whose ack never arrived are sent again
