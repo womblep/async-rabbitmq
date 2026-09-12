@@ -33,6 +33,12 @@ module AsyncRabbitMQ
       @auto_delete
     end
 
+    # Internal: topology recovery re-declared this server-named queue under a
+    # new broker-generated name.
+    def update_name_to(new_name)
+      @name = new_name
+    end
+
     def server_named?
       @name.start_with?("amq.gen-")
     end

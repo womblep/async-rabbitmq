@@ -109,8 +109,13 @@ module AsyncRabbitMQ
         AMQ::Protocol::Queue::Declare.encode(@channel_id, name, passive, durable, exclusive, auto_delete, false, arguments),
         AMQ::Protocol::Queue::DeclareOk
       )
-      Queue.new(resp.queue, resp.message_count, resp.consumer_count, self,
-                durable: durable, exclusive: exclusive, auto_delete: auto_delete)
+      q = Queue.new(resp.queue, resp.message_count, resp.consumer_count, self,
+                    durable: durable, exclusive: exclusive, auto_delete: auto_delete)
+      unless passive
+        topology&.record_queue(@channel_id, resp.queue, durable: durable, exclusive: exclusive, auto_delete: auto_delete,
+                                            arguments: arguments, server_named: name.to_s.empty?, object: q)
+      end
+      q
     end
 
     # Server-named queue that lives for this connection only (exclusive, auto-delete).
@@ -142,6 +147,7 @@ module AsyncRabbitMQ
 
     def queue_delete(name, if_unused: false, if_empty: false)
       rpc(AMQ::Protocol::Queue::Delete.encode(@channel_id, name, if_unused, if_empty, false), AMQ::Protocol::Queue::DeleteOk)
+        .tap { topology&.delete_queue(name) }
     end
 
     def queue_purge(name)
@@ -152,14 +158,19 @@ module AsyncRabbitMQ
       rpc(
         AMQ::Protocol::Queue::Bind.encode(@channel_id, queue_name, exchange, routing_key, false, arguments),
         AMQ::Protocol::Queue::BindOk
-      )
+      ).tap do
+        topology&.record_queue_binding(@channel_id, queue: queue_name, exchange: exchange,
+                                                    routing_key: routing_key, arguments: arguments)
+      end
     end
 
     def queue_unbind(queue_name, exchange:, routing_key: "", arguments: {})
       rpc(
         AMQ::Protocol::Queue::Unbind.encode(@channel_id, queue_name, exchange, routing_key, arguments),
         AMQ::Protocol::Queue::UnbindOk
-      )
+      ).tap do
+        topology&.delete_queue_binding(queue: queue_name, exchange: exchange, routing_key: routing_key, arguments: arguments)
+      end
     end
 
     # -------------------------------------------------------------------------
@@ -171,6 +182,10 @@ module AsyncRabbitMQ
         AMQ::Protocol::Exchange::Declare.encode(@channel_id, name, type.to_s, passive, durable, auto_delete, internal, false, arguments),
         AMQ::Protocol::Exchange::DeclareOk
       )
+      unless passive
+        topology&.record_exchange(@channel_id, name, type, durable: durable, auto_delete: auto_delete,
+                                                     internal: internal, arguments: arguments)
+      end
       Exchange.new(name, type, self, durable: durable, auto_delete: auto_delete, internal: internal)
     end
 
@@ -196,20 +211,26 @@ module AsyncRabbitMQ
 
     def exchange_delete(name, if_unused: false)
       rpc(AMQ::Protocol::Exchange::Delete.encode(@channel_id, name, if_unused, false), AMQ::Protocol::Exchange::DeleteOk)
+        .tap { topology&.delete_exchange(name) }
     end
 
     def exchange_bind(destination:, source:, routing_key: "", arguments: {})
       rpc(
         AMQ::Protocol::Exchange::Bind.encode(@channel_id, destination, source, routing_key, false, arguments),
         AMQ::Protocol::Exchange::BindOk
-      )
+      ).tap do
+        topology&.record_exchange_binding(@channel_id, source: source, destination: destination,
+                                                       routing_key: routing_key, arguments: arguments)
+      end
     end
 
     def exchange_unbind(destination:, source:, routing_key: "", arguments: {})
       rpc(
         AMQ::Protocol::Exchange::Unbind.encode(@channel_id, destination, source, routing_key, false, arguments),
         AMQ::Protocol::Exchange::UnbindOk
-      )
+      ).tap do
+        topology&.delete_exchange_binding(source: source, destination: destination, routing_key: routing_key, arguments: arguments)
+      end
     end
 
     # -------------------------------------------------------------------------
@@ -517,12 +538,53 @@ module AsyncRabbitMQ
     # Internal: called by Session after reconnect
     # -------------------------------------------------------------------------
 
-    def reopen_after_recovery(new_frame_io)
-      reopen_on(new_frame_io)
-      # Release parked publishers/RPCs before re-registering consumers: they may
-      # hold the semaphores that basic_consume needs.
+    # Internal, after Session has reopened every channel and replayed the
+    # topology: release parked publishers/RPCs first (they may hold the
+    # semaphores basic_consume needs), then re-register the consumers.
+    def finish_recovery!
+      @state = :open
       resume_parked!(:open)
       re_register_consumers
+    end
+
+    # Internal, topology recovery. A re-declare the broker rejects closes the
+    # channel; the failure is logged and the channel reopened so the remaining
+    # entities can still be recovered (Bunny 3.2 behaviour).
+    def recover_exchange(x)
+      recover_entity("exchange #{x.name}") do
+        send_and_wait(AMQ::Protocol::Exchange::Declare.encode(@channel_id, x.name, x.type, false, x.durable,
+                                                              x.auto_delete, x.internal, false, x.arguments),
+                      AMQ::Protocol::Exchange::DeclareOk)
+      end
+    end
+
+    def recover_queue(q)
+      recover_entity("queue #{q.name}") do
+        ok = send_and_wait(AMQ::Protocol::Queue::Declare.encode(@channel_id, q.server_named ? "" : q.name, false,
+                                                                q.durable, q.exclusive, q.auto_delete, false, q.arguments),
+                           AMQ::Protocol::Queue::DeclareOk)
+        @session.queue_renamed(q.name, ok.queue) if ok.queue != q.name
+      end
+    end
+
+    def recover_queue_binding(b)
+      recover_entity("binding #{b.exchange} -> #{b.queue}") do
+        send_and_wait(AMQ::Protocol::Queue::Bind.encode(@channel_id, b.queue, b.exchange, b.routing_key, false, b.arguments),
+                      AMQ::Protocol::Queue::BindOk)
+      end
+    end
+
+    def recover_exchange_binding(b)
+      recover_entity("exchange binding #{b.source} -> #{b.destination}") do
+        send_and_wait(AMQ::Protocol::Exchange::Bind.encode(@channel_id, b.destination, b.source, b.routing_key, false, b.arguments),
+                      AMQ::Protocol::Exchange::BindOk)
+      end
+    end
+
+    # Internal: a server-named queue this channel consumes from came back under
+    # a new name after topology recovery.
+    def rename_consumer_queue(old_name, new_name)
+      @consumers.each_value { |c| c[:queue_name] = new_name if c[:queue_name] == old_name }
     end
 
     # Reopen a channel the broker closed (e.g. delivery-ack timeout, unknown
@@ -542,13 +604,15 @@ module AsyncRabbitMQ
 
     # Internal: (re)open this channel on +frame_io+ and restore its settings.
     # Uses direct sends: nothing else can be on the wire for this channel yet,
-    # and a fiber parked inside #rpc may be holding @rpc_sem.
-    def reopen_on(frame_io)
+    # and a fiber parked inside #rpc may be holding @rpc_sem. During connection
+    # recovery the session passes state: :recovering so callers stay parked
+    # until the topology has been replayed (see #finish_recovery!).
+    def reopen_on(frame_io, state: :open)
       @frame_io = frame_io
       @queue    = @frame_io.register_channel(@channel_id)
       start_dispatch_task
       send_and_wait(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk)
-      @state = :open
+      @state = state
 
       if (p = @prefetch)
         send_and_wait(AMQ::Protocol::Basic::Qos.encode(@channel_id, p[:size], p[:count], p[:global]), AMQ::Protocol::Basic::QosOk)
@@ -752,6 +816,18 @@ module AsyncRabbitMQ
       wait_for_any(*expected_classes)
     end
 
+    def topology
+      @session.respond_to?(:topology) ? @session.topology : nil
+    end
+
+    def recover_entity(what)
+      yield
+    rescue ChannelError => e
+      @logger.error("Channel #{@channel_id}: could not recover #{what}: #{e.message}")
+      # The broker closed this channel; put it back so the rest can continue.
+      @session.reopen_channel(self)
+    end
+
     # Encode one basic.publish (method + header + body frames) into a single
     # byte string, so a message always hits the write queue in one piece.
     def encode_publish(payload, exchange:, routing_key:, mandatory: false, persistent: false,
@@ -886,12 +962,13 @@ module AsyncRabbitMQ
 
     def re_register_consumers
       @consumers.each do |tag, entry|
-        basic_consume(
-          entry[:queue_name],
-          consumer_tag: tag,
-          manual_ack:   entry[:manual_ack],
-          &entry[:block]
-        ) rescue nil
+        begin
+          basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack], &entry[:block])
+        rescue => e
+          # Typically 404: the queue is gone and was not recovered. The broker
+          # closes the channel on that, so say so instead of failing silently.
+          @logger.error("Channel #{@channel_id}: could not re-register consumer #{tag} on #{entry[:queue_name]}: #{e.class}: #{e.message}")
+        end
       end
     end
 

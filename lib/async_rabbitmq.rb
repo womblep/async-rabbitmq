@@ -1,5 +1,6 @@
 require_relative "async_rabbitmq/version"
 require_relative "async_rabbitmq/errors"
+require_relative "async_rabbitmq/topology_registry"
 require_relative "async_rabbitmq/frame_io"
 require_relative "async_rabbitmq/queue"
 require_relative "async_rabbitmq/exchange"

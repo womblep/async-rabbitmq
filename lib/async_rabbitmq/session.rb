@@ -28,6 +28,10 @@ module AsyncRabbitMQ
 
     attr_reader :host, :port, :vhost, :username, :addresses
 
+    # The TopologyRegistry of exchanges, queues and bindings declared through
+    # this session, replayed after a reconnect (see recover_topology:).
+    attr_reader :topology
+
     # Build a Session from one or more AMQP URI strings.
     #
     #   Session.from_uri("amqp://user:pass@rabbit:5672/myvhost")
@@ -127,6 +131,8 @@ module AsyncRabbitMQ
       recovery_attempts: nil,
       recovery_interval: RECOVERY_INITIAL,
       recovery_max_interval: RECOVERY_MAX,
+      recover_topology: true,
+      topology_recovery_filter: nil,
       logger: Logger.new($stdout)
     )
       @addresses = build_address_list(host, port, hosts, addresses)
@@ -149,6 +155,8 @@ module AsyncRabbitMQ
       @recovery_attempts    = recovery_attempts    # nil = unlimited
       @recovery_interval    = recovery_interval
       @recovery_max_interval = recovery_max_interval
+      @recover_topology     = recover_topology
+      @topology             = TopologyRegistry.new(filter: topology_recovery_filter)
       @logger               = logger
 
       @state             = :closed
@@ -387,6 +395,14 @@ module AsyncRabbitMQ
         @channels[channel.channel_id] = channel
       end
       channel.reopen_on(@frame_io)
+    end
+
+    # Called by a channel when topology recovery re-declared a server-named
+    # queue under a new name: update the registry and every consumer of it.
+    def queue_renamed(old_name, new_name)
+      @logger.info("Server-named queue #{old_name} recovered as #{new_name}")
+      @topology.rename_queue(old_name, new_name)
+      @channels.values.each { |ch| ch.rename_consumer_queue(old_name, new_name) }
     end
 
     # --- Async::Pool resource interface ---
@@ -824,19 +840,46 @@ module AsyncRabbitMQ
       @recovery_in_progress = false if @closed_by_user
     end
 
+    # After reconnect: reopen every channel, replay the recorded topology
+    # (session-wide, in dependency order), then release parked callers and
+    # re-register consumers.
     def reopen_channels
-      @channels.values.each do |channel|
+      reopened = @channels.values.select do |channel|
         begin
-          channel.reopen_after_recovery(@frame_io)
+          channel.reopen_on(@frame_io, state: :recovering)
+          true
         rescue => e
           # Fail the channel loudly rather than leave its parked callers hanging.
           @logger.error("Channel #{channel.channel_id} could not be reopened after recovery: #{e.class}: #{e.message}")
           channel.mark_closed!(ChannelError.new("Channel could not be reopened after recovery: #{e.message}",
                                                 channel_id: channel.channel_id))
           channel_closed(channel.channel_id)
+          false
         end
       end
+
+      recover_topology_on(reopened) if @recover_topology && !@topology.empty?
+      reopened.each { |channel| channel.finish_recovery! rescue nil }
     end
+
+    # Re-declare exchanges, then queues, then bindings. Each entity is replayed
+    # on the channel that declared it if that channel is still open, otherwise
+    # on a temporary channel. One entity failing does not stop the others.
+    def recover_topology_on(channels)
+      by_id = channels.to_h { |ch| [ch.channel_id, ch] }
+      temp  = nil
+      on    = ->(channel_id) { by_id[channel_id] || (temp ||= open_channel) }
+
+      @topology.exchanges.each         { |x| on.call(x.channel_id).recover_exchange(x) }
+      @topology.queues.each            { |q| on.call(q.channel_id).recover_queue(q) }
+      @topology.queue_bindings.each    { |b| on.call(b.channel_id).recover_queue_binding(b) }
+      @topology.exchange_bindings.each { |b| on.call(b.channel_id).recover_exchange_binding(b) }
+    rescue => e
+      @logger.error("Topology recovery aborted: #{e.class}: #{e.message}")
+    ensure
+      temp&.close rescue nil
+    end
+
 
     # Dedicated long-lived task that drains the channel-0 queue after the
     # AMQP handshake completes.  Handles connection.blocked / connection.unblocked
