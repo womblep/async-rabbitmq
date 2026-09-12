@@ -42,6 +42,7 @@ module AsyncRabbitMQ
       @reply_condition   = nil
       @content_condition = nil
       @pending_content   = nil
+      @recovered_condition = nil     # fibers parked while the connection recovers
       @pool_size         = validate_pool_size!(pool_size)
       @pool_sem          = Async::Semaphore.new(@pool_size)
     end
@@ -61,6 +62,11 @@ module AsyncRabbitMQ
       @state == :closed
     end
 
+    # True while the session is reconnecting; operations park until reopened.
+    def recovering?
+      @state == :recovering
+    end
+
     def open
       @queue = @frame_io.register_channel(@channel_id)
       # Start dispatch task BEFORE waiting so it can process the OpenOk reply.
@@ -71,6 +77,12 @@ module AsyncRabbitMQ
     end
 
     def close
+      if recovering?
+        # Give the channel up rather than letting recovery reopen it.
+        mark_closed!(NotOpenError.new("Channel #{@channel_id} closed during recovery"))
+        @session.channel_closed(@channel_id)
+        return
+      end
       return unless open?
       rpc(AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0), AMQ::Protocol::Channel::CloseOk)
       @state = :closed
@@ -213,12 +225,15 @@ module AsyncRabbitMQ
       # writes and the tag assignment also keeps confirm tags in wire order.
       @publish_sem.acquire do
         assert_open!
-        frames.each { |f| @frame_io.write_frame(f.encode, publish: true) }
+        encoded = frames.map(&:encode)
+        encoded.each { |bytes| @frame_io.write_frame(bytes, publish: true) }
 
         if @confirms_enabled
           @delivery_tag += 1
           tag = @delivery_tag
-          @pending_confirms[tag] = tag
+          # The encoded frames are kept until the broker confirms the tag so the
+          # message can be re-published if the connection drops first.
+          @pending_confirms[tag] = encoded.join
           tag
         end
       end
@@ -314,6 +329,9 @@ module AsyncRabbitMQ
     # Raises ConnectionError if the session disconnects while waiting.
     def wait_for_confirms
       until @pending_confirms.empty?
+        # Lazily (re)created: interrupt_wait! clears it on connection loss and a
+        # caller may arrive before reopen_after_recovery has re-selected confirms.
+        @confirm_condition ||= Async::Condition.new
         @confirm_condition.wait
         raise ConnectionError, "Session disconnected while waiting for confirms" unless open?
       end
@@ -389,10 +407,29 @@ module AsyncRabbitMQ
     end
 
     # -------------------------------------------------------------------------
-    # Internal: called by Session when connection dies during recovery
-    # to unblock any fibers waiting on reply or content conditions.
+    # Internal: connection state transitions driven by Session
     # -------------------------------------------------------------------------
 
+    # The connection was lost and recovery is starting. Waits in flight fail
+    # with +error+; new publishes and RPCs park until #reopen_after_recovery
+    # (see #assert_open!); consumers are re-registered on reopen.
+    def mark_recovering!(error)
+      @state = :recovering
+      interrupt_wait!(error)
+    end
+
+    # The connection is gone for good: recovery disabled, exhausted, refused,
+    # or the session was closed. Everything waiting or parked raises +error+
+    # and #each callers return.
+    def mark_closed!(error)
+      @state = :closed
+      interrupt_wait!(error)
+      resume_parked!(error)
+      wake_each_waiters
+    end
+
+    # Unblock any fibers waiting on reply, content or confirm conditions
+    # (used on connection loss, and again if the connection dies mid-recovery).
     def interrupt_wait!(error = nil)
       error ||= ConnectionError.new(code: 0, text: "Connection lost during recovery")
       @reply_condition&.signal(error)
@@ -414,19 +451,19 @@ module AsyncRabbitMQ
       @frame_io = new_frame_io
       @queue    = @frame_io.register_channel(@channel_id)
       start_dispatch_task
-      rpc(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk, check_open: false)
+      # Direct sends: nothing else can be on the wire for this channel yet, and
+      # a fiber parked inside #rpc may be holding @rpc_sem.
+      send_and_wait(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk)
       @state = :open
 
       if @confirms_enabled
-        rpc(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
-        # Reset confirms state for the new connection — old pending tags are gone
-        # and the old condition object is stale (any prior waiter already unblocked
-        # via interrupt_wait! with a ConnectionError).
-        @confirm_condition = Async::Condition.new
-        @pending_confirms  = {}
-        @delivery_tag      = 0
+        send_and_wait(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
+        republish_unconfirmed
       end
 
+      # Release parked publishers/RPCs before re-registering consumers: they may
+      # hold the semaphores that basic_consume needs.
+      resume_parked!(:open)
       re_register_consumers
     end
 
@@ -457,9 +494,17 @@ module AsyncRabbitMQ
       when :method
         handle_method(rest[0])
       when :content
-        @pending_content = { header: rest[0], body: rest[1] }
-        @content_condition&.signal(@pending_content)
-        @content_condition = nil
+        # Content for a basic.get: hand it straight to the waiting fiber, or
+        # park it if the getter has not reached wait_content yet. It must never
+        # be left behind once consumed, or the next basic_get would receive
+        # the previous message's body.
+        content = { header: rest[0], body: rest[1] }
+        if (cond = @content_condition)
+          @content_condition = nil
+          cond.signal(content)
+        else
+          @pending_content = content
+        end
       when :heartbeat
         # connection-level, ignore at channel layer
       end
@@ -595,11 +640,49 @@ module AsyncRabbitMQ
     # AMQP 0-9-1 replies carry no correlation id, so a second request in flight
     # on the same channel would be handed the first one's answer.
     def rpc(frame, *expected_classes, check_open: true)
+      return send_and_wait(frame, *expected_classes) unless check_open
+
+      # Park before taking the semaphore so that reopen_after_recovery (which
+      # bypasses it) is never blocked by a waiter holding it.
+      wait_for_recovery! if recovering?
       @rpc_sem.acquire do
-        assert_open! if check_open
-        @frame_io.write_frame(frame.encode)
-        wait_for_any(*expected_classes)
+        assert_open!
+        send_and_wait(frame, *expected_classes)
       end
+    end
+
+    def send_and_wait(frame, *expected_classes)
+      @frame_io.write_frame(frame.encode)
+      wait_for_any(*expected_classes)
+    end
+
+    # Messages published under confirms whose ack never arrived are sent again
+    # on the reopened channel with fresh delivery tags (numbering restarts at 1).
+    # A message the broker had in fact accepted before the drop is delivered
+    # twice: the usual at-least-once trade-off of confirms across a reconnect.
+    def republish_unconfirmed
+      pending            = @pending_confirms.values
+      @pending_confirms  = {}
+      @delivery_tag      = 0
+      @confirm_condition ||= Async::Condition.new   # keep one an early waiter created
+      pending.each do |bytes|
+        @frame_io.write_frame(bytes, publish: true)
+        @delivery_tag += 1
+        @pending_confirms[@delivery_tag] = bytes
+      end
+      @logger.info("Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
+    end
+
+    def wait_for_recovery!
+      @recovered_condition ||= Async::Condition.new
+      outcome = @recovered_condition.wait
+      raise outcome if outcome.is_a?(Exception)
+    end
+
+    def resume_parked!(outcome)
+      cond = @recovered_condition
+      @recovered_condition = nil
+      cond&.signal(outcome)
     end
 
     def wait_for_any(*expected_classes)
@@ -637,7 +720,12 @@ module AsyncRabbitMQ
       end
     end
 
+    # Raise unless the channel is open. While the connection is being recovered
+    # the caller is parked instead and resumes once the channel is reopened, so
+    # publishes and RPCs issued during an outage neither fail nor vanish; if
+    # recovery is abandoned they raise the final error.
     def assert_open!
+      wait_for_recovery! if recovering?
       raise NotOpenError, "Channel #{@channel_id} is not open" unless open?
     end
 

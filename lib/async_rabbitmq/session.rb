@@ -259,7 +259,7 @@ module AsyncRabbitMQ
       # reopen_after_recovery) so that @recovery_task.cancel below can actually
       # terminate the task rather than leaving it stuck on an Async::Condition.
       conn_error = ConnectionError.new(code: 0, text: "Session closed by user")
-      @channels.each_value { |ch| ch.interrupt_wait!(conn_error) rescue nil }
+      @channels.values.each { |ch| ch.mark_closed!(conn_error) rescue nil }
       if open?
         @state = :closing
         @channel0_task&.cancel rescue nil
@@ -383,7 +383,7 @@ module AsyncRabbitMQ
       unless @auto_recover
         @state = :closed
         conn_error = ConnectionError.new(code: 0, text: "Connection lost: #{error.message}")
-        @channels.each_value { |ch| ch.interrupt_wait!(conn_error) rescue nil }
+        @channels.values.each { |ch| ch.mark_closed!(conn_error) rescue nil }
         @frame_io&.stop rescue nil
         return
       end
@@ -410,10 +410,10 @@ module AsyncRabbitMQ
       @channel0_task = nil
       @frame_io&.set_unblocked rescue nil
 
-      # Interrupt all channel fibers so they raise ConnectionError instead of
-      # hanging forever waiting for a reply that will never come.
+      # Waits in flight raise ConnectionError instead of hanging; new operations
+      # on the channels park until they are reopened after reconnect.
       conn_error = ConnectionError.new(code: 0, text: "Connection lost: #{error.message}")
-      @channels.each_value { |ch| ch.interrupt_wait!(conn_error) rescue nil }
+      @channels.values.each { |ch| ch.mark_recovering!(conn_error) rescue nil }
 
       # Schedule recover_loop BEFORE stopping old frame_io. old_io.stop
       # cancels reader/writer tasks; if we ARE the reader task, cancel raises
@@ -701,6 +701,8 @@ module AsyncRabbitMQ
           @logger.warn("Recovery exhausted after #{@recovery_attempts} attempt(s)")
           @state = :closed
           @recovery_in_progress = false
+          exhausted = ConnectionError.new(code: 0, text: "Recovery exhausted after #{@recovery_attempts} attempt(s)")
+          @channels.values.each { |ch| ch.mark_closed!(exhausted) rescue nil }
           @on_recovery_exhausted&.call(self)
           return
         end
@@ -742,7 +744,7 @@ module AsyncRabbitMQ
             @logger.error("Recovery abandoned: #{e.message}")
             @state = :closed
             @recovery_in_progress = false
-            @channels.each_value { |ch| ch.interrupt_wait!(e) rescue nil }
+            @channels.values.each { |ch| ch.mark_closed!(e) rescue nil }
             @on_recovery_exhausted&.call(self)
             @recovery_task = nil
             return
@@ -781,8 +783,16 @@ module AsyncRabbitMQ
     end
 
     def reopen_channels
-      @channels.each_value do |channel|
-        channel.reopen_after_recovery(@frame_io) rescue nil
+      @channels.values.each do |channel|
+        begin
+          channel.reopen_after_recovery(@frame_io)
+        rescue => e
+          # Fail the channel loudly rather than leave its parked callers hanging.
+          @logger.error("Channel #{channel.channel_id} could not be reopened after recovery: #{e.class}: #{e.message}")
+          channel.mark_closed!(ChannelError.new("Channel could not be reopened after recovery: #{e.message}",
+                                                channel_id: channel.channel_id))
+          channel_closed(channel.channel_id)
+        end
       end
     end
 
