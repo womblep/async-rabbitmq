@@ -33,6 +33,10 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
   `unconfirmed_tags` expose the details (#29).
 - The reader loop no longer logs a warning and re-enters recovery when the socket was closed
   locally.
+- Closing a session whose write queue has not drained within the 5 s close handshake now logs
+  how many queued writes are being discarded, instead of dropping them silently. Publishing
+  without confirms is still fire-and-forget; the warning just makes the loss visible
+  (`FrameIO#pending_writes` exposes the count).
 - Prefetch is restored after connection recovery.
 - Test suite: RabbitMQ 4.2+ rejects transient non-exclusive queues; specs declare durable or
   exclusive queues (#41).

@@ -127,6 +127,32 @@ the connection drops first they are re-published on the recovered channel
 (the usual at-least-once trade-off: a message the broker had already
 accepted may be delivered twice).
 
+### What a returned publish means here
+
+Two differences from Bunny on the sending side, both deliberate.
+
+**`basic_publish` returns when the frames are queued for the writer fiber,
+not when they are on the socket.** Bunny writes inline on the calling thread,
+so there a returned publish means the bytes reached the kernel. Neither is a
+delivery guarantee: RabbitMQ's own guidance is that a client which has written
+frames to its socket still cannot assume the broker received or processed
+them. Publisher confirms are the only thing that tells you. What the queue
+does change is the size of the window. Closing a session with a backlog
+discards whatever the writer has not reached yet, because the close handshake
+is bounded at five seconds; the client logs a warning naming the number of
+queued writes it dropped, since a publisher without confirms has no other way
+to find out. If it matters, `confirm_select` and `wait_for_confirms` before
+`close`.
+
+**A channel may be published to from many fibers at once.** RabbitMQ's
+documentation says concurrent publishing on a shared channel is not supported
+by client libraries, and for most clients that is true. Here publishes and
+request/reply calls are serialised per channel, so a message's frames always
+reach the wire contiguously and confirm tags follow wire order. Sharing a
+channel is still a throughput bottleneck, and synchronous calls queue behind a
+publish backlog, so give a busy publisher its own channel when latency on
+declares matters.
+
 ## Transactions
 
 `ch.tx_select`, `ch.tx_commit`, `ch.tx_rollback`, `ch.using_tx?`. A channel
@@ -184,6 +210,47 @@ pool.close
 
 Backed by `Async::Pool`; a session is shared by up to `channel_max` fibers
 before another connection is opened.
+
+## Performance and integrity harness
+
+`examples/` holds a sender and a receiver that load the broker and check what
+comes out the other end. They are meant for the failure modes a throughput
+number hides: a message lost, doubled or delivered out of sequence, a body
+handed over with another message's header, a delivery on the wrong queue, a
+reply given to the wrong caller.
+
+```bash
+ruby -Ilib examples/perf_consumer.rb  --streams 4                     # start first
+ruby -Ilib examples/perf_publisher.rb --streams 4 --messages 50000
+```
+
+Every message is deterministic in `(run, stream, seq, size)` and states its
+identity twice, in the AMQP properties and inside the body, so the receiver can
+rebuild the bytes it should have been given and compare. One queue per
+publisher stream, one consumer, one handler: that is where AMQP promises order,
+so out-of-sequence delivery there is a real fault, and the report says so.
+`--consumers` or `--handlers` above 1 makes deliveries concurrent and the
+report downgrades ordering to an observation.
+
+The sender publishes from several fibers over **one shared channel** by default
+(`--channels per-stream` for one each), which is the case worth stressing: it
+checks that confirm delivery tags are unique and cover every publish, that
+nothing came back unroutable, and, with `--rpc-probe N`, that passive declares
+issued from other fibers while the channel is saturated each get their own
+reply. Useful switches: `--batch`, `--confirms none|simple|tracking`,
+`--persistent`, `--rate`, `--size`. The receiver takes `--mode get` to exercise
+the `basic_get` path instead of a consumer, plus `--prefetch` and
+`--[no-]manual-ack`. Both exit non-zero when anything failed, so they can gate
+a build.
+
+`examples/perf_fault_inject.rb` publishes one of each fault on purpose; run it
+against a receiver to see the checks fire rather than trusting them.
+
+Two things the numbers do not say. Latency is measured from a monotonic clock,
+so both programs must run on the same host, and it only means anything while
+the receiver keeps up (pace the sender with `--rate`). And with `--confirms
+none`, nothing proves the broker received anything: see *What a returned
+publish means here* above.
 
 ## Development
 
