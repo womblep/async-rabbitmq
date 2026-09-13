@@ -365,6 +365,22 @@ bundle exec rspec
 configured port, and generates the TLS certificates with
 `spec/docker/gen-certs.sh`. Ports and hosts come from `.env`.
 
+## Releasing
+
+The version lives in `lib/async_rabbitmq/version.rb` and nowhere else. To cut a
+release: bump it, date the section in `CHANGELOG.md`, run the suite against a
+real broker, then
+
+```bash
+gem build async-rabbitmq.gemspec        # writes async-rabbitmq-<version>.gem
+gem install ./async-rabbitmq-<version>.gem   # optional: check it installs and the command runs
+gem push async-rabbitmq-<version>.gem   # asks for your RubyGems OTP
+git tag -a v<version> -m "v<version>" && git push origin v<version>
+```
+
+The gemspec sets `rubygems_mfa_required`, so publishing and yanking need
+multi-factor authentication on the RubyGems account.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
