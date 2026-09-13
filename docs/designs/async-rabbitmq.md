@@ -110,15 +110,24 @@ outage is not lost. The recovery task reconnects with exponential backoff
 (1 s doubling to 30 s, ±25% jitter, unlimited attempts by default), walking the
 address list. On success the session:
 
-1. reopens every channel, restoring prefetch, confirm mode and transaction
-   state, and re-publishes anything left unconfirmed,
+1. reopens every channel, restoring prefetch, confirm mode and transaction state,
 2. replays the recorded topology: exchanges, then queues, then bindings,
-3. re-registers consumers, releases the parked callers, and fires `on_recovery`.
+3. re-publishes whatever was still unconfirmed, then re-registers consumers,
+   releases the parked callers, and fires `on_recovery`.
 
-The re-publish in step 1 happens before the replay in step 2, so after a broker
-restart that lost non-durable topology, a re-published message can reach the
-exchange before its binding is back and be dropped as unroutable. Durable
-topology, the normal case, is unaffected.
+The re-publish deliberately follows the replay. A message addressed to an
+exchange the broker no longer has is answered with a 404 that closes the
+freshly reopened channel, and one addressed to a live exchange whose binding is
+missing is dropped while the broker still acks it, which looks like success.
+`Channel#reopen` is the exception: it recovers one broker-closed channel while
+the connection and its topology are intact, so it re-publishes immediately.
+
+Unconfirmed messages are held as encoded frames, so a re-published message
+carries the exchange and routing key it was published with. If that routing key
+named a server-named queue, the queue comes back under a new name and the
+re-published copy goes to the old one: unroutable, acked, gone. Such a queue is
+exclusive or auto-delete in practice, so it did not survive the disconnect
+either way.
 
 `TopologyRegistry` records what was declared through the session, filtered by an
 optional `topology_recovery_filter`. Passive declares are not recorded, and

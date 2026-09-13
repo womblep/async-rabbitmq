@@ -564,6 +564,10 @@ module AsyncRabbitMQ
     # semaphores basic_consume needs), then re-register the consumers.
     def finish_recovery!
       @state = :open
+      # After the session has replayed the topology, so a message addressed to a
+      # queue or exchange the broker lost is not sent into the void before it is
+      # re-declared. Before the parked callers, so the older messages go first.
+      republish_unconfirmed if @confirms_enabled
       resume_parked!(:open)
       re_register_consumers
     end
@@ -619,6 +623,9 @@ module AsyncRabbitMQ
       end
       @consumers.clear unless recover_consumers
       @session.reopen_channel(self)   # re-registers the id, then calls reopen_on
+      # Only this channel was closed, so the topology is intact and anything
+      # left unconfirmed can go straight back out.
+      republish_unconfirmed if @confirms_enabled
       re_register_consumers if recover_consumers
       self
     end
@@ -638,9 +645,11 @@ module AsyncRabbitMQ
       if (p = @prefetch)
         send_and_wait(AMQ::Protocol::Basic::Qos.encode(@channel_id, p[:size], p[:count], p[:global]), AMQ::Protocol::Basic::QosOk)
       end
+      # Confirm mode is restored here, but the unconfirmed messages are NOT sent
+      # yet: the topology they are addressed to may not be back (see
+      # #finish_recovery!, and #reopen for the single-channel case).
       if @confirms_enabled
         send_and_wait(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
-        republish_unconfirmed
       end
       send_and_wait(AMQ::Protocol::Tx::Select.encode(@channel_id), AMQ::Protocol::Tx::SelectOk) if @tx_mode
     end

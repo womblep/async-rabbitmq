@@ -572,12 +572,21 @@ module AsyncRabbitMQ
     def open_socket(target_host = @host, target_port = @port)
       if @tls
         require "openssl"
-        ctx        = @tls_context || build_tls_context
-        raw        = TCPSocket.new(target_host, target_port)
-        ssl        = OpenSSL::SSL::SSLSocket.new(raw, ctx)
-        ssl.hostname = target_host
-        ssl.connect
-        ssl
+        ctx = @tls_context || build_tls_context
+        raw = TCPSocket.new(target_host, target_port)
+        # SSLSocket does not close the socket it wraps when the handshake fails,
+        # and a failed connect has no frame_io to stop, so without this a broker
+        # with a bad certificate leaks one descriptor per recovery attempt.
+        handshaked = false
+        begin
+          ssl = OpenSSL::SSL::SSLSocket.new(raw, ctx)
+          ssl.hostname = target_host
+          ssl.connect
+          handshaked = true
+          ssl
+        ensure
+          raw.close unless handshaked
+        end
       else
         TCPSocket.new(target_host, target_port)
       end
