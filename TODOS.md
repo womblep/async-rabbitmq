@@ -271,15 +271,13 @@ wait_for_ok pattern. Add a `19_transactions_spec.rb` integration spec.
 
 ---
 
-### Metrics / Instrumentation Hooks
-**What:** Expose structured events (connection open/close, publish, consume, heartbeat,
-reconnect) via a notification system (dry-monitor or AS::Notifications style).
-**Why:** Makes the gem production-observable. Teams running in Falcon can hook into APM.
-Zero cost when unsubscribed.
-**Context:** v1 uses standard Logger only. Instrumentation hooks require a stable event
-taxonomy, which should be defined after the v1 API stabilizes.
-**Effort:** S (human: 2 days / CC+gstack: ~15 min)
-**Depends on:** v1 stable API
+### ~~Metrics / Instrumentation Hooks~~ ✅ DONE (0.2.0)
+**Resolved:** `AsyncRabbitMQ::Notifier` plus `Session#on_event(pattern) { |name, payload| }`
+and an `instrumenter:` constructor option. 18 events (connection, recovery, channel,
+consumer, message) with durations where they are useful. No dependency added: the payload is
+built inside a block that only runs when something is subscribed, so an unwatched session
+allocates nothing. Subscriber exceptions are logged, not propagated.
+**Tests:** `spec/integration/45_instrumentation_spec.rb`
 
 ---
 

@@ -199,6 +199,81 @@ connection or it was lost), `ChannelError` (`code`, `text`, `channel_id`,
 `message_too_large?`), `NotOpenError`, `RpcTimeoutError`, `MessageNacked`
 (`nacked_tags`), `HeartbeatTimeoutError`.
 
+## Events
+
+`Session#on_event` subscribes to structured events for metrics, tracing and
+debugging. Nothing is emitted until something subscribes: the payload is built
+inside a block that only runs when a subscriber is listening.
+
+```ruby
+session.on_event { |name, payload| logger.info("#{name} #{payload}") }
+session.on_event("message.")    { |name, _|  statsd.increment(name) }
+session.on_event("channel.rpc") { |_, p|     histogram.record(p[:duration]) }
+session.on_event(/^recovery\./) { |name, p|  pager.note(name, p) }
+
+# or hand the whole stream to something at construction
+AsyncRabbitMQ::Session.new(instrumenter: ->(name, payload) { ... })
+```
+
+The pattern is `nil` for everything, a String for one event name or, ending in
+a dot, a prefix, or a Regexp. `on_event` returns a handle that
+`session.notifier.unsubscribe(handle)` takes back. A subscriber that raises is
+logged and skipped; it never breaks the connection.
+
+| Event | Payload |
+|---|---|
+| `connection.open` | `host`, `port`, `vhost`, `tls`, `heartbeat`, `frame_max`, `channel_max`, `duration` |
+| `connection.closed` | `reason` (`:user`), `host`, `port` |
+| `connection.lost` | `host`, `port`, `error`, `message`, `recovering` |
+| `connection.blocked` | `reason` |
+| `connection.unblocked` | — |
+| `recovery.attempt` | `attempt`, `delay` |
+| `recovery.succeeded` | `attempts`, `host`, `port`, `channels`, `duration` |
+| `recovery.exhausted` | `attempts`, `reason` (`:attempts_exceeded`, `:authentication_failed`) |
+| `heartbeat.sent` | `interval` |
+| `channel.open` | `channel` |
+| `channel.closed` | `channel`, `reason` (`:user`, `:broker`), `code`, `text` |
+| `channel.rpc` | `channel`, `method` (`"queue.declare-ok"`), `duration` |
+| `consumer.registered` | `channel`, `queue`, `consumer_tag`, `manual_ack` |
+| `consumer.cancelled` | `channel`, `consumer_tag`, `queue`, `reason` (`:client`, `:broker`) |
+| `message.published` | `channel`, `exchange`, `routing_key`, `count`, `bytes`, `delivery_tag` |
+| `message.confirmed` | `channel`, `delivery_tag`, `multiple`, `acked` |
+| `message.returned` | `channel`, `exchange`, `routing_key`, `code`, `text`, `bytes` |
+| `message.consumed` | `channel`, `queue`, `consumer_tag`, `bytes`, `redelivered`, `duration` |
+
+Durations are seconds as a Float. `bytes` on `message.published` is the encoded
+frames, including the header and properties; elsewhere it is the body. A batch
+published with `basic_publish_batch` is one event with `count` set and the last
+delivery tag. Event names are API and do not change without a major version;
+`AsyncRabbitMQ::Notifier::EVENTS` lists them.
+
+### OpenTelemetry
+
+Tracing is a separate, optional layer. Add `opentelemetry-api` to your bundle,
+then:
+
+```ruby
+require "async_rabbitmq/telemetry/open_telemetry"
+AsyncRabbitMQ::Telemetry::OpenTelemetry.install
+```
+
+Spans and attributes match `opentelemetry-instrumentation-bunny`, so a service
+moving over from Bunny keeps the traces and dashboards it had. Publishing opens
+a PRODUCER span `"<exchange>.<routing key> publish"` and injects the W3C trace
+context into the message headers; `basic_get` opens a CONSUMER span
+`"<destination> receive"`; and a consumer handler runs inside a CONSUMER span
+`"<destination> process"` whose parent is the context extracted from the
+headers, so one trace spans both sides of the broker. Attributes are
+`messaging.system`, `messaging.destination`, `messaging.destination_kind`,
+`messaging.protocol`, `messaging.protocol_version`,
+`messaging.rabbitmq.routing_key`, `messaging.operation`, `net.peer.name` and
+`net.peer.port`, plus `messaging.batch.message_count` on a batch publish.
+
+`install` takes `tracer_provider:`, `tracer_name:` and `tracer_version:`.
+`uninstall` stops tracing. One difference from Bunny: a pushed delivery here
+goes straight to the handler, so there is one process span per delivery rather
+than a receive span with a process span under it.
+
 ## Connection pool
 
 ```ruby

@@ -37,12 +37,26 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
   how many queued writes are being discarded, instead of dropping them silently. Publishing
   without confirms is still fire-and-forget; the warning just makes the loss visible
   (`FrameIO#pending_writes` exposes the count).
+- A failed TLS handshake no longer leaks the socket it was wrapping, which cost one file
+  descriptor per connect attempt against a broker with a bad certificate.
+- Unconfirmed messages are re-published after the topology has been replayed, not during
+  channel reopen. Against a broker that lost the topology, a message re-published first hit a
+  missing exchange (404, closing the channel again) or a missing binding (dropped while the
+  broker acked it).
 - Prefetch is restored after connection recovery.
 - Test suite: RabbitMQ 4.2+ rejects transient non-exclusive queues; specs declare durable or
   exclusive queues (#41).
 
 ### Added
 
+- Optional OpenTelemetry tracing in `async_rabbitmq/telemetry/open_telemetry`, with the span
+  names, attributes and W3C context propagation of `opentelemetry-instrumentation-bunny`.
+  Not required by default and not a runtime dependency.
+- Structured events for metrics and tracing: `Session#on_event(pattern) { |name, payload| }`
+  and a `instrumenter:` constructor option. 18 events covering the connection, recovery,
+  channels, consumers and messages, with durations on `channel.rpc`, `message.consumed`,
+  `connection.open` and `recovery.succeeded`. Nothing is emitted, and no payload is built,
+  until something subscribes; a subscriber that raises is logged and skipped.
 - Confirm tracking: `confirm_select(tracking: true, outstanding_limit: 1000)` gives publishers
   backpressure and raises `MessageNacked` on a nack (#32).
 - `Channel#basic_publish_batch` (#33).

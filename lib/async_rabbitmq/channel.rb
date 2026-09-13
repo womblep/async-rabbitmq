@@ -9,6 +9,8 @@ module AsyncRabbitMQ
   # Duck-typed stream interface: #each (yields deliveries) and #write (publishes).
   # Does NOT inherit Async::IO::Stream — a channel is logical, not physical IO.
   class Channel
+    include Instrumented
+
     attr_reader :channel_id, :pool_size
 
     # +pool_size+ bounds the number of consumer-handler fibers that can run
@@ -18,6 +20,7 @@ module AsyncRabbitMQ
     def initialize(channel_id, session, frame_io, frame_max:, logger:, pool_size: 1, rpc_timeout: nil)
       @channel_id   = channel_id
       @session      = session
+      @notifier     = session.respond_to?(:notifier) ? session.notifier : nil
       @frame_io     = frame_io
       @frame_max    = frame_max
       @logger       = logger
@@ -80,6 +83,7 @@ module AsyncRabbitMQ
       start_dispatch_task
       rpc(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk, check_open: false)
       @state = :open
+      instrument("channel.open") { { channel: @channel_id } }
       self
     end
 
@@ -93,6 +97,7 @@ module AsyncRabbitMQ
       return unless open?
       rpc(AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0), AMQ::Protocol::Channel::CloseOk)
       @state = :closed
+      instrument("channel.closed") { { channel: @channel_id, reason: :user } }
       @session.channel_closed(@channel_id)
       @queue&.push(nil)  # wake dispatch_loop so it can detect :closed and exit
       wake_each_waiters
@@ -249,12 +254,17 @@ module AsyncRabbitMQ
       # must follow wire order, so the write and the tag assignment happen
       # under one semaphore (write_frame can yield on a full queue or the
       # connection.blocked gate).
-      @publish_sem.acquire do
+      tag = @publish_sem.acquire do
         assert_open!
         wait_for_outstanding_slot(1)
         @frame_io.write_frame(bytes, publish: true)
         reserve_confirm_tag(bytes) if @confirms_enabled
       end
+      instrument("message.published") do
+        { channel: @channel_id, exchange: exchange, routing_key: routing_key, count: 1,
+          bytes: bytes.bytesize, delivery_tag: tag }
+      end
+      tag
     end
 
     # Duck-typed #write for stream composability.
@@ -270,12 +280,17 @@ module AsyncRabbitMQ
       return nil if payloads.empty?
 
       encoded = payloads.map { |p| encode_publish(p, exchange: exchange, routing_key: routing_key, **opts) }
-      @publish_sem.acquire do
+      tags = @publish_sem.acquire do
         assert_open!
         wait_for_outstanding_slot(encoded.size)
         @frame_io.write_frame(encoded.join, publish: true)
         encoded.map { |bytes| reserve_confirm_tag(bytes) } if @confirms_enabled
       end
+      instrument("message.published") do
+        { channel: @channel_id, exchange: exchange, routing_key: routing_key, count: encoded.size,
+          bytes: encoded.sum(&:bytesize), delivery_tag: tags&.last }
+      end
+      tags
     end
 
     # Synchronously fetch one message: [delivery_info, header, body], or nil if
@@ -335,12 +350,18 @@ module AsyncRabbitMQ
         AMQ::Protocol::Basic::ConsumeOk
       )
       @consumers[resp.consumer_tag] = { queue_name: queue_name, block: block, manual_ack: manual_ack }
+      instrument("consumer.registered") do
+        { channel: @channel_id, queue: queue_name, consumer_tag: resp.consumer_tag, manual_ack: manual_ack }
+      end
       resp.consumer_tag
     end
 
     def basic_cancel(consumer_tag)
       rpc(AMQ::Protocol::Basic::Cancel.encode(@channel_id, consumer_tag, false), AMQ::Protocol::Basic::CancelOk)
-      @consumers.delete(consumer_tag)
+      cancelled = @consumers.delete(consumer_tag)
+      instrument("consumer.cancelled") do
+        { channel: @channel_id, consumer_tag: consumer_tag, queue: cancelled&.dig(:queue_name), reason: :client }
+      end
       wake_each_waiters(consumer_tag)
     end
 
@@ -543,6 +564,10 @@ module AsyncRabbitMQ
     # semaphores basic_consume needs), then re-register the consumers.
     def finish_recovery!
       @state = :open
+      # After the session has replayed the topology, so a message addressed to a
+      # queue or exchange the broker lost is not sent into the void before it is
+      # re-declared. Before the parked callers, so the older messages go first.
+      republish_unconfirmed if @confirms_enabled
       resume_parked!(:open)
       re_register_consumers
     end
@@ -598,6 +623,9 @@ module AsyncRabbitMQ
       end
       @consumers.clear unless recover_consumers
       @session.reopen_channel(self)   # re-registers the id, then calls reopen_on
+      # Only this channel was closed, so the topology is intact and anything
+      # left unconfirmed can go straight back out.
+      republish_unconfirmed if @confirms_enabled
       re_register_consumers if recover_consumers
       self
     end
@@ -617,9 +645,11 @@ module AsyncRabbitMQ
       if (p = @prefetch)
         send_and_wait(AMQ::Protocol::Basic::Qos.encode(@channel_id, p[:size], p[:count], p[:global]), AMQ::Protocol::Basic::QosOk)
       end
+      # Confirm mode is restored here, but the unconfirmed messages are NOT sent
+      # yet: the topology they are addressed to may not be back (see
+      # #finish_recovery!, and #reopen for the single-channel case).
       if @confirms_enabled
         send_and_wait(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
-        republish_unconfirmed
       end
       send_and_wait(AMQ::Protocol::Tx::Select.encode(@channel_id), AMQ::Protocol::Tx::SelectOk) if @tx_mode
     end
@@ -676,7 +706,22 @@ module AsyncRabbitMQ
         _, header, body = content_msg
         entry = @consumers[method.consumer_tag]
         if entry
-          Async { @pool_sem.acquire { entry[:block].call(method, header, body) } }
+          Async do
+            @pool_sem.acquire do
+              started = instrument_clock
+              begin
+                entry[:block].call(method, header, body)
+              ensure
+                if started
+                  instrument("message.consumed") do
+                    { channel: @channel_id, queue: entry[:queue_name], consumer_tag: method.consumer_tag,
+                      bytes: body.to_s.bytesize, redelivered: method.redelivered,
+                      duration: instrument_elapsed(started) }
+                  end
+                end
+              end
+            end
+          end
         else
           @logger.warn("Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
         end
@@ -685,6 +730,10 @@ module AsyncRabbitMQ
         # Same pattern: pop content directly.
         content_msg = @queue.pop
         _, header, body = content_msg
+        instrument("message.returned") do
+          { channel: @channel_id, exchange: method.exchange, routing_key: method.routing_key,
+            code: method.reply_code, text: method.reply_text, bytes: body.to_s.bytesize }
+        end
         if @return_handler
           Async { @return_handler.call(method, header, body) }
         else
@@ -706,6 +755,9 @@ module AsyncRabbitMQ
         entry = @consumers.delete(method.consumer_tag)
         if entry
           @logger.warn("Channel #{@channel_id}: broker cancelled consumer #{method.consumer_tag}")
+          instrument("consumer.cancelled") do
+            { channel: @channel_id, consumer_tag: method.consumer_tag, queue: entry[:queue_name], reason: :broker }
+          end
           @on_cancel&.call(method.consumer_tag)
         end
         wake_each_waiters(method.consumer_tag)
@@ -742,6 +794,9 @@ module AsyncRabbitMQ
         @confirm_condition&.signal
         release_outstanding_slots
       end
+      instrument("message.confirmed") do
+        { channel: @channel_id, delivery_tag: method.delivery_tag, multiple: method.multiple, acked: true }
+      end
     end
 
     # A nack resolves the tag(s) like an ack does, but the rejection is recorded
@@ -760,6 +815,9 @@ module AsyncRabbitMQ
         @confirm_condition&.signal
         release_outstanding_slots
       end
+      instrument("message.confirmed") do
+        { channel: @channel_id, delivery_tag: method.delivery_tag, multiple: method.multiple, acked: false }
+      end
     end
 
     def handle_channel_close(method)
@@ -770,6 +828,7 @@ module AsyncRabbitMQ
       )
       @state = :closed
       @session.channel_closed(@channel_id)
+      instrument("channel.closed") { { channel: @channel_id, reason: :broker, code: code, text: text } }
       @on_error&.call(self, method)
 
       error = if FrameIO::SOFT_ERROR_CODES.include?(code)
@@ -800,6 +859,18 @@ module AsyncRabbitMQ
     # AMQP 0-9-1 replies carry no correlation id, so a second request in flight
     # on the same channel would be handed the first one's answer.
     def rpc(frame, *expected_classes, check_open: true)
+      started = instrument_clock
+      reply   = rpc_without_instrumentation(frame, *expected_classes, check_open: check_open)
+      if started
+        instrument("channel.rpc") do
+          # amq-protocol method classes report their AMQP name, e.g. "queue.declare-ok".
+          { channel: @channel_id, method: reply.class.name, duration: instrument_elapsed(started) }
+        end
+      end
+      reply
+    end
+
+    def rpc_without_instrumentation(frame, *expected_classes, check_open: true)
       return send_and_wait(frame, *expected_classes) unless check_open
 
       # Park before taking the semaphore so that reopen_after_recovery (which

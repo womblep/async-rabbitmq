@@ -101,4 +101,25 @@ RSpec.describe "Session#connect broker-refused handshake", :integration do
     expect(session.closed?).to be true
     expect(session.instance_variable_get(:@connecting)).to be false
   end
+
+  # OpenSSL::SSL::SSLSocket does not close the socket it wraps when the
+  # handshake fails, and a failed connect has no frame_io to stop, so a broker
+  # with an expired or mismatched certificate would leak one descriptor per
+  # attempt — once every recovery interval, forever.
+  it "closes the underlying socket when the TLS handshake fails" do
+    raw_sockets = []
+    allow(TCPSocket).to receive(:new).and_wrap_original do |original, *args|
+      original.call(*args).tap { |socket| raw_sockets << socket }
+    end
+
+    3.times do
+      # The plaintext AMQP port never completes a TLS handshake.
+      session = AsyncRabbitMQ::Session.new(host: RABBITMQ_HOST, port: RABBITMQ_PORT, tls: true,
+                                           connect_timeout: 5, logger: Logger.new(nil))
+      expect { session.connect }.to raise_error(AsyncRabbitMQ::Error)
+    end
+
+    expect(raw_sockets.size).to eq(3)
+    expect(raw_sockets).to all(be_closed)
+  end
 end

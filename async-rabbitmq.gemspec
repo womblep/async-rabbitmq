@@ -25,4 +25,6 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "simplecov",  "~> 0.22"
   spec.add_development_dependency "async-pool", "~> 0.11"
   spec.add_development_dependency "toxiproxy",  "~> 2.0"
+  spec.add_development_dependency "opentelemetry-api", "~> 1.1"
+  spec.add_development_dependency "opentelemetry-sdk", "~> 1.1"
 end

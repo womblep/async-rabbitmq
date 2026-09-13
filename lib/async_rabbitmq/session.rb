@@ -19,6 +19,8 @@ module AsyncRabbitMQ
   #
   # Pool interface: implements reusable?, viable?, concurrency, close for Async::Pool.
   class Session
+    include Instrumented
+
     CONNECT_TIMEOUT     = 30     # seconds for AMQP handshake
     RPC_TIMEOUT         = 15     # seconds to wait for a synchronous channel reply (nil = forever)
     RECOVERY_INITIAL    = 1.0    # seconds
@@ -31,6 +33,9 @@ module AsyncRabbitMQ
     # The TopologyRegistry of exchanges, queues and bindings declared through
     # this session, replayed after a reconnect (see recover_topology:).
     attr_reader :topology
+
+    # Structured events for metrics and tracing; see Notifier::EVENTS.
+    attr_reader :notifier
 
     # Build a Session from one or more AMQP URI strings.
     #
@@ -133,6 +138,7 @@ module AsyncRabbitMQ
       recovery_max_interval: RECOVERY_MAX,
       recover_topology: true,
       topology_recovery_filter: nil,
+      instrumenter: nil,
       logger: Logger.new($stdout)
     )
       @addresses = build_address_list(host, port, hosts, addresses)
@@ -158,6 +164,8 @@ module AsyncRabbitMQ
       @recover_topology     = recover_topology
       @topology             = TopologyRegistry.new(filter: topology_recovery_filter)
       @logger               = logger
+      @notifier             = Notifier.new(logger: logger)
+      @notifier.subscribe { |name, payload| instrumenter.call(name, payload) } if instrumenter
 
       @state             = :closed
       @frame_io          = nil
@@ -196,6 +204,7 @@ module AsyncRabbitMQ
       @session_root_task = Async::Task.current
 
       last_error = nil
+      started_at = instrument_clock
       shuffled_addresses.each do |target_host, target_port|
         begin
           Async::Task.current.with_timeout(@connect_timeout) do
@@ -210,6 +219,11 @@ module AsyncRabbitMQ
             @state = :open
           end
           @connecting = false
+          instrument("connection.open") do
+            { host: @host, port: @port, vhost: @vhost, tls: @tls, heartbeat: @negotiated_hb,
+              frame_max: @negotiated_fm, channel_max: @negotiated_cmax,
+              duration: started_at ? instrument_elapsed(started_at) : nil }
+          end
           return
         rescue Async::TimeoutError => e
           @frame_io&.stop rescue nil
@@ -282,6 +296,7 @@ module AsyncRabbitMQ
       @recovery_task&.cancel rescue nil
       @frame_io&.stop rescue nil
       @state = :closed
+      instrument("connection.closed") { { reason: :user, host: @host, port: @port } }
     end
 
     # Open a new channel. Returns an AsyncRabbitMQ::Channel.
@@ -370,6 +385,16 @@ module AsyncRabbitMQ
       @on_recovery = block
     end
 
+    # Subscribe to structured events from this session and its channels. The
+    # block receives (name, payload). +pattern+ is nil for every event, a
+    # String for one name or a prefix ending in a dot, or a Regexp. Returns a
+    # handle for notifier.unsubscribe. See Notifier::EVENTS for the taxonomy.
+    #
+    #   session.on_event("message.") { |name, payload| statsd.increment(name) }
+    def on_event(pattern = nil, &block)
+      @notifier.subscribe(pattern, &block)
+    end
+
     # Register a callback invoked when recovery attempts are exhausted.
     # Only fires when recovery_attempts is set to a finite number.
     # The block receives the session.
@@ -435,6 +460,11 @@ module AsyncRabbitMQ
         q0 = @frame_io&.channel_queue(0)
         q0&.push([:method, error]) rescue nil
         return
+      end
+
+      instrument("connection.lost") do
+        { host: @host, port: @port, error: error.class.name, message: error.message,
+          recovering: @auto_recover }
       end
 
       unless @auto_recover
@@ -542,12 +572,21 @@ module AsyncRabbitMQ
     def open_socket(target_host = @host, target_port = @port)
       if @tls
         require "openssl"
-        ctx        = @tls_context || build_tls_context
-        raw        = TCPSocket.new(target_host, target_port)
-        ssl        = OpenSSL::SSL::SSLSocket.new(raw, ctx)
-        ssl.hostname = target_host
-        ssl.connect
-        ssl
+        ctx = @tls_context || build_tls_context
+        raw = TCPSocket.new(target_host, target_port)
+        # SSLSocket does not close the socket it wraps when the handshake fails,
+        # and a failed connect has no frame_io to stop, so without this a broker
+        # with a bad certificate leaks one descriptor per recovery attempt.
+        handshaked = false
+        begin
+          ssl = OpenSSL::SSL::SSLSocket.new(raw, ctx)
+          ssl.hostname = target_host
+          ssl.connect
+          handshaked = true
+          ssl
+        ensure
+          raw.close unless handshaked
+        end
       else
         TCPSocket.new(target_host, target_port)
       end
@@ -732,6 +771,7 @@ module AsyncRabbitMQ
           sleep interval
           break unless open?
           @frame_io.write_heartbeat
+          instrument("heartbeat.sent") { { interval: interval } }
           last = @last_frame_at
           next unless last   # not yet seeded — skip this tick
           elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - last
@@ -754,6 +794,7 @@ module AsyncRabbitMQ
     def recover_loop
       delay = @recovery_interval
       attempts = 0
+      recovery_started_at = instrument_clock
 
       loop do
         break if @closed_by_user
@@ -767,6 +808,7 @@ module AsyncRabbitMQ
           @recovery_in_progress = false
           exhausted = ConnectionError.new(code: 0, text: "Recovery exhausted after #{@recovery_attempts} attempt(s)")
           @channels.values.each { |ch| ch.mark_closed!(exhausted) rescue nil }
+          instrument("recovery.exhausted") { { attempts: @recovery_attempts, reason: :attempts_exceeded } }
           @on_recovery_exhausted&.call(self)
           return
         end
@@ -784,6 +826,7 @@ module AsyncRabbitMQ
         break if @closed_by_user
 
         @logger.info("Recovery attempt #{attempts} (delay was #{delay.round(1)}s)...")
+        instrument("recovery.attempt") { { attempt: attempts, delay: wait_secs } }
         @on_recovery_attempt&.call(attempts)
 
         connected = false
@@ -809,6 +852,7 @@ module AsyncRabbitMQ
             @state = :closed
             @recovery_in_progress = false
             @channels.values.each { |ch| ch.mark_closed!(e) rescue nil }
+            instrument("recovery.exhausted") { { attempts: attempts, reason: :authentication_failed } }
             @on_recovery_exhausted&.call(self)
             @recovery_task = nil
             return
@@ -832,6 +876,10 @@ module AsyncRabbitMQ
 
           # Re-open channels and re-register consumers
           reopen_channels
+          instrument("recovery.succeeded") do
+            { attempts: attempts, host: @host, port: @port, channels: @channels.size,
+              duration: recovery_started_at ? instrument_elapsed(recovery_started_at) : nil }
+          end
           @on_recovery&.call(self)
           @recovery_task = nil
           return
@@ -905,9 +953,11 @@ module AsyncRabbitMQ
         case method
         when AMQ::Protocol::Connection::Blocked
           @frame_io&.set_blocked(method.reason)
+          instrument("connection.blocked") { { reason: method.reason } }
           @on_blocked&.call(method.reason)
         when AMQ::Protocol::Connection::Unblocked
           @frame_io&.set_unblocked
+          instrument("connection.unblocked") { {} }
           @on_unblocked&.call
         when AMQ::Protocol::Connection::UpdateSecretOk
           @update_secret_condition&.signal(method)
