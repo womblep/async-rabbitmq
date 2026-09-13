@@ -1,6 +1,8 @@
 require "spec_helper"
 
-# Step 21: Fill P1 test coverage gaps documented in TODOS.md.
+# Behaviour that the code had but nothing exercised: server-initiated cancels,
+# the on_cancel callback, publishing while the connection is blocked, confirms
+# across a disconnect, channel.flow, soft error codes and server-named queues.
 RSpec.describe "P1 test gap coverage", :integration do
 
   # -------------------------------------------------------------------------

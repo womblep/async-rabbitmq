@@ -286,6 +286,31 @@ pool.close
 Backed by `Async::Pool`; a session is shared by up to `channel_max` fibers
 before another connection is opened.
 
+## Command line
+
+Installing the gem puts an `async-rabbitmq` command on your path, written on
+this API, for the things you would otherwise open a console for.
+
+```bash
+export RABBITMQ_URL=amqp://guest:guest@localhost:5672   # or pass --url
+
+async-rabbitmq publish orders '{"id":1}' --count 10 --persistent
+async-rabbitmq publish orders --file payload.json
+echo '{"id":2}' | async-rabbitmq publish orders
+async-rabbitmq publish events.audit --exchange events   # queue name becomes the routing key
+
+async-rabbitmq inspect orders          # orders: 12 messages, 2 consumers
+async-rabbitmq consume orders --count 5
+async-rabbitmq consume orders --peek   # print without acknowledging: nothing is removed
+async-rabbitmq purge orders
+```
+
+`publish` uses confirms and mandatory routing, so it exits non-zero and says so
+when the broker nacks a message or sends it back unroutable. `consume`
+acknowledges what it prints, stops after `--count` or `--timeout` seconds of
+quiet, and leaves anything beyond the count on the queue. `--quiet` prints the
+messages and nothing else, for piping. Options go after the command.
+
 ## Performance and integrity harness
 
 `examples/` holds a sender and a receiver that load the broker and check what

@@ -49,6 +49,9 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
 ### Added
 
+- An `async-rabbitmq` command: `publish`, `consume`, `inspect` and `purge`, built on the gem's
+  own API. Publishing uses confirms and the mandatory flag and reports a nack or an unroutable
+  message with a non-zero exit; `consume --peek` prints without acknowledging.
 - Optional OpenTelemetry tracing in `async_rabbitmq/telemetry/open_telemetry`, with the span
   names, attributes and W3C context propagation of `opentelemetry-instrumentation-bunny`.
   Not required by default and not a runtime dependency.
