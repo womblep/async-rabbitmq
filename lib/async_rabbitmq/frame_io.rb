@@ -15,8 +15,9 @@ module AsyncRabbitMQ
   #   Writer Task — drains a bounded Async::LimitedQueue, serializes all writes.
   #   Heartbeat   — writes directly via Async::Semaphore (bypasses write queue).
   #
-  # AMQ::Protocol::Frame.decode raises NotImplementedError (abstract stub).
-  # Frame reading uses manual 3-step IO instead.
+  # AMQ::Protocol::Frame.decode raises NotImplementedError (abstract stub), so
+  # frames are read in three steps: 7-byte header (decoded by
+  # AMQ::Protocol::Frame.decode_header), payload, 0xCE terminator.
   class FrameIO
     FRAME_HEADER_SIZE = 7
     FRAME_TERMINATOR  = "\xCE".b.freeze
@@ -76,6 +77,9 @@ module AsyncRabbitMQ
     def stop
       @running = false
       @socket.close rescue nil
+      # Publishers parked on the connection.blocked gate can never proceed now.
+      @blocked = false
+      release_blocked_writers(ConnectionError.new(code: 0, text: "Connection closed while blocked by the broker"))
       # Push nil sentinel to every channel queue FIRST so blocked poppers
       # (e.g. wait_channel0_method) are unblocked before we cancel tasks.
       # Cancelling the CURRENT task raises Async::Cancel (< Exception, not
@@ -86,12 +90,19 @@ module AsyncRabbitMQ
       @reader_task&.cancel rescue nil
     end
 
-    # Enqueue raw frame bytes for writing. Yields the fiber when queue is full,
-    # or while the connection is broker-blocked (connection.blocked received).
-    def write_frame(data)
-      while @blocked
-        @unblocked_condition ||= Async::Condition.new
-        @unblocked_condition.wait
+    # Enqueue raw frame bytes for writing. Yields the fiber when the queue is
+    # full. Content publishes (+publish: true+) additionally wait while the
+    # broker has the connection blocked (connection.blocked). Control frames
+    # (close, close-ok, acks, ...) are never gated, so shutdown cannot hang on
+    # a resource alarm. Raises ConnectionError if the connection is closed
+    # while a publish is parked.
+    def write_frame(data, publish: false)
+      if publish
+        while @blocked
+          @unblocked_condition ||= Async::Condition.new
+          outcome = @unblocked_condition.wait
+          raise outcome if outcome.is_a?(Exception)
+        end
       end
       @write_queue.push(data)
     end
@@ -105,10 +116,12 @@ module AsyncRabbitMQ
     # Called by the Session channel-0 monitor when connection.unblocked is received.
     def set_unblocked
       @blocked = false
-      cond = @unblocked_condition
-      @unblocked_condition = nil
-      cond&.signal
+      release_blocked_writers
       @logger.info("Connection unblocked")
+    end
+
+    def blocked?
+      @blocked
     end
 
     # Write heartbeat directly to socket, bypassing the write queue so
@@ -122,6 +135,14 @@ module AsyncRabbitMQ
     end
 
     private
+
+    # Wake every publisher waiting on the blocked gate. With +outcome+ nil they
+    # re-check the gate; with an exception they raise it.
+    def release_blocked_writers(outcome = nil)
+      cond = @unblocked_condition
+      @unblocked_condition = nil
+      cond&.signal(outcome)
+    end
 
     def writer_loop
       while @running
@@ -141,8 +162,13 @@ module AsyncRabbitMQ
         dispatch(frame)
       end
     rescue EOFError, Errno::ECONNRESET, Errno::EPIPE, IOError, Errno::EBADF => e
-      @logger.warn("FrameIO reader closed: #{e.class}")
-      trigger_recovery(e)
+      if @running
+        @logger.warn("FrameIO reader closed: #{e.class}")
+        trigger_recovery(e)
+      else
+        # #stop closed the socket under us: an orderly shutdown, not a failure.
+        @logger.debug("FrameIO reader stopped (#{e.class})")
+      end
     rescue AMQ::Protocol::Error => e
       @logger.error("FrameIO AMQP error: #{e.class}: #{e.message}")
       trigger_recovery(e)
@@ -154,21 +180,19 @@ module AsyncRabbitMQ
     # Read one AMQP frame via manual 3-step IO.
     # Returns an AMQ::Protocol::MethodFrame / HeaderFrame / BodyFrame / HeartbeatFrame.
     def read_frame
-      header_bytes             = read_exactly(FRAME_HEADER_SIZE)
-      type_int, channel_id,
-        payload_size           = decode_header(header_bytes)
-      payload                  = read_exactly(payload_size)
-      terminator               = read_exactly(1)
+      header_bytes = read_exactly(FRAME_HEADER_SIZE)
+      # Raises AMQ::Protocol::FrameTypeError (an AMQ::Protocol::Error) on an
+      # unknown frame type, which reader_loop turns into recovery.
+      type, channel_id, payload_size = AMQ::Protocol::Frame.decode_header(header_bytes)
+      payload    = read_exactly(payload_size)
+      terminator = read_exactly(1)
 
       unless terminator == FRAME_TERMINATOR
         raise AMQ::Protocol::Error,
               "Invalid frame terminator: #{terminator.inspect} (expected 0xCE)"
       end
 
-      frame_class = AMQ::Protocol::Frame::CLASSES[type_int]
-      raise AMQ::Protocol::Error, "Unknown frame type: #{type_int}" unless frame_class
-
-      frame_class.new(payload, channel_id)
+      AMQ::Protocol::Frame::CLASSES[AMQ::Protocol::Frame::TYPES[type]].new(payload, channel_id)
     end
 
     # Read exactly n bytes, yielding the fiber at each blocking read.
@@ -181,16 +205,6 @@ module AsyncRabbitMQ
         buf << chunk
       end
       buf
-    end
-
-    # Decode the 7-byte AMQP frame header.
-    # Layout: type(1) + channel(2) + payload_size(4)
-    def decode_header(bytes)
-      frame_type   = bytes.getbyte(0)
-      channel_id   = (bytes.getbyte(1) << 8) | bytes.getbyte(2)
-      payload_size = (bytes.getbyte(3) << 24) | (bytes.getbyte(4) << 16) |
-                     (bytes.getbyte(5) << 8)  |  bytes.getbyte(6)
-      [frame_type, channel_id, payload_size]
     end
 
     def dispatch(frame_obj)

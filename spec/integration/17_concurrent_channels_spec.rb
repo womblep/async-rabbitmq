@@ -9,7 +9,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
       channel_count = 100
       channels      = channel_count.times.map { session.open_channel }
       queues        = channels.each_with_index.map do |ch, i|
-        ch.queue("test.stress.#{i}", durable: false)
+        ch.queue("test.stress.#{i}", durable: true)
       end
 
       # Publish from all channels concurrently
@@ -20,7 +20,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
 
       # Verify each queue has exactly its message
       channels.each_with_index do |ch, i|
-        _di, _h, body = ch.basic_get(queues[i].name)
+        _di, _h, body = ch.basic_get(queues[i].name, manual_ack: false)
         expect(body).to eq("msg-#{i}".b), "Queue #{i} got wrong message: #{body.inspect}"
       end
 
@@ -31,7 +31,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
   it "10 channels each publishing 100 messages — no corruption" do
     isolated_session do |session, _|
       channels = 10.times.map { session.open_channel }
-      queues   = channels.each_with_index.map { |ch, i| ch.queue("test.stress10.#{i}") }
+      queues   = channels.each_with_index.map { |ch, i| ch.queue("test.stress10.#{i}", durable: true) }
 
       tasks = channels.each_with_index.map do |ch, i|
         Async do
@@ -42,7 +42,7 @@ RSpec.describe "Concurrent channel stress test", :integration do
 
       channels.each_with_index do |ch, i|
         received = []
-        while (msg = ch.basic_get(queues[i].name))
+        while (msg = ch.basic_get(queues[i].name, manual_ack: false))
           received << msg[2].to_s
         end
         expect(received.size).to eq(100)

@@ -26,9 +26,9 @@ RSpec.describe "Coverage completion", :integration do
     it "Queue#publish delivers a message via the queue object" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.queue-publish.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.queue-publish.#{SecureRandom.hex(4)}", durable: true)
         q.publish("hello from queue api")
-        _di, _hdr, body = ch.basic_get(q.name)
+        _di, _hdr, body = ch.basic_get(q.name, manual_ack: false)
         expect(body).to eq("hello from queue api".b)
         ch.close
       end
@@ -37,11 +37,11 @@ RSpec.describe "Coverage completion", :integration do
     it "Queue#purge empties the queue" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.queue-purge.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.queue-purge.#{SecureRandom.hex(4)}", durable: true)
         ch.basic_publish("msg1", routing_key: q.name)
         ch.basic_publish("msg2", routing_key: q.name)
         q.purge
-        expect(ch.basic_get(q.name)).to be_nil
+        expect(ch.basic_get(q.name, manual_ack: false)).to be_nil
         ch.close
       end
     end
@@ -98,7 +98,7 @@ RSpec.describe "Coverage completion", :integration do
     it "yields deliveries and cancels cleanly when the channel is closed" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.each.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.each.#{SecureRandom.hex(4)}", durable: true)
         q.publish("hello from each")
 
         received = []
@@ -130,15 +130,10 @@ RSpec.describe "Coverage completion", :integration do
     it "channels are automatically reopened after connection recovery" do
       isolated_session do |session, _|
         ch = session.open_channel
-        ch.queue("test.recovery-reopen.#{SecureRandom.hex(4)}", durable: false)
+        ch.queue("test.recovery-reopen.#{SecureRandom.hex(4)}", durable: true)
 
         # Force the underlying TCP connection closed
-        session.instance_variable_get(:@frame_io)
-               .instance_variable_get(:@socket)
-               .close rescue nil
-
-        # Recovery: ~1s initial sleep + reconnect + channel reopen
-        sleep 4
+        recover_connection!(session)
 
         expect(session.open?).to be true
         # Channel should be usable after reopen_after_recovery
@@ -150,14 +145,10 @@ RSpec.describe "Coverage completion", :integration do
     it "channels with publisher confirms re-activate confirms after recovery" do
       isolated_session do |session, _|
         ch = session.open_channel
-        ch.queue("test.recovery-confirms.#{SecureRandom.hex(4)}", durable: false)
+        ch.queue("test.recovery-confirms.#{SecureRandom.hex(4)}", durable: true)
         ch.confirm_select   # enables confirms — reopen_after_recovery must re-select
 
-        session.instance_variable_get(:@frame_io)
-               .instance_variable_get(:@socket)
-               .close rescue nil
-
-        sleep 4
+        recover_connection!(session)
 
         expect(session.open?).to be true
         session.close rescue nil
@@ -170,7 +161,7 @@ RSpec.describe "Coverage completion", :integration do
   # -------------------------------------------------------------------------
 
   describe "Publisher confirms: basic.nack" do
-    it "handles Basic::Nack from broker gracefully (queue max-length overflow)" do
+    it "reports a Basic::Nack from the broker as a failed confirm cycle (queue max-length overflow)" do
       isolated_session do |session, _|
         ch = session.open_channel
         ch.confirm_select
@@ -179,15 +170,18 @@ RSpec.describe "Coverage completion", :integration do
         # confirmed publish because the queue can hold 0 messages.
         q = ch.queue(
           "test.nack-overflow.#{SecureRandom.hex(4)}",
-          durable:   false,
+          durable:   true,
           arguments: { "x-max-length" => 0, "x-overflow" => "reject-publish" }
         )
         ch.basic_publish("will be nacked", routing_key: q.name)
 
-        # wait_for_confirms returns true once all delivery tags are resolved
-        # (nack removes the tag just like ack does).
+        # The nack resolves the tag but the cycle is reported as failed and the
+        # rejected tag is exposed; the next clean cycle is reported as acked.
         result = ch.wait_for_confirms
-        expect(result).to be true
+        expect(result).to be false
+        expect(ch.nacked_tags).to eq([1])
+        expect(ch.unconfirmed_tags).to be_empty
+        expect(ch.wait_for_confirms).to be true
         ch.close
       end
     end

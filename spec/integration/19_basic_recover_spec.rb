@@ -6,7 +6,7 @@ RSpec.describe "basic.recover", :integration do
   it "redelivers unacknowledged messages with requeue: true" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.recover", durable: false)
+      q  = ch.queue("test.recover", durable: true)
 
       ch.basic_publish("recover-me", routing_key: q.name)
 

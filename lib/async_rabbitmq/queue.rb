@@ -2,6 +2,13 @@ module AsyncRabbitMQ
   # Represents an AMQP queue bound to a channel.
   # Created via channel.queue("name", durable: true).
   class Queue
+    # Queue types RabbitMQ knows, for Channel#durable_queue(name, type).
+    module Types
+      CLASSIC = "classic"
+      QUORUM  = "quorum"
+      STREAM  = "stream"
+    end
+
     attr_reader :name, :message_count, :consumer_count
 
     def initialize(name, message_count, consumer_count, channel, durable: false, exclusive: false, auto_delete: false)
@@ -26,6 +33,12 @@ module AsyncRabbitMQ
       @auto_delete
     end
 
+    # Internal: topology recovery re-declared this server-named queue under a
+    # new broker-generated name.
+    def update_name_to(new_name)
+      @name = new_name
+    end
+
     def server_named?
       @name.start_with?("amq.gen-")
     end
@@ -37,6 +50,14 @@ module AsyncRabbitMQ
       @consumer_count = q.consumer_count
       { message_count: @message_count, consumer_count: @consumer_count }
     end
+
+    # Synchronously fetch one message: [delivery_info, header, body], or nil if
+    # the queue is empty. Defaults to manual acknowledgement like Bunny: a
+    # message fetched and then dropped by the caller is requeued, not lost.
+    def pop(manual_ack: true)
+      @channel.basic_get(@name, manual_ack: manual_ack)
+    end
+    alias get pop
 
     def subscribe(manual_ack: false, **opts, &block)
       @channel.basic_consume(@name, manual_ack: manual_ack, **opts, &block)

@@ -15,7 +15,7 @@ RSpec.describe "P1 test gap coverage", :integration do
     it "removes the consumer and fires on_cancel when the broker cancels it" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.server-cancel.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.server-cancel.#{SecureRandom.hex(4)}", durable: true)
 
         cancelled_tags = []
         ch.on_cancel { |t| cancelled_tags << t }
@@ -51,7 +51,7 @@ RSpec.describe "P1 test gap coverage", :integration do
     it "suspends write_frame while blocked and resumes after unblocked" do
       isolated_session do |session, _|
         ch = session.open_channel
-        ch.queue("test.write-blocked.#{SecureRandom.hex(4)}", durable: false)
+        ch.queue("test.write-blocked.#{SecureRandom.hex(4)}", durable: true)
 
         frame_io = session.instance_variable_get(:@frame_io)
         frame_io.set_blocked("test-backpressure")
@@ -86,7 +86,7 @@ RSpec.describe "P1 test gap coverage", :integration do
     it "raises ConnectionError when the socket dies during wait_for_confirms" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.confirms-disconnect.#{SecureRandom.hex(4)}", durable: false)
+        q  = ch.queue("test.confirms-disconnect.#{SecureRandom.hex(4)}", durable: true)
         ch.confirm_select
 
         # Publish but don't wait yet
@@ -103,9 +103,7 @@ RSpec.describe "P1 test gap coverage", :integration do
         sleep 0.2
 
         # Kill the socket to trigger recovery/interrupt
-        session.instance_variable_get(:@frame_io)
-               .instance_variable_get(:@socket)
-               .close rescue nil
+        sever_connection!(session)
 
         # Wait for recovery + the waiter to be interrupted
         sleep 4
@@ -182,7 +180,7 @@ RSpec.describe "P1 test gap coverage", :integration do
     it "updates @flow_active when Channel::Flow is received from the broker" do
       isolated_session do |session, _|
         ch = session.open_channel
-        ch.queue("test.server-flow.#{SecureRandom.hex(4)}", durable: false)
+        ch.queue("test.server-flow.#{SecureRandom.hex(4)}", durable: true)
 
         # Capture FlowOk writes instead of sending to the broker
         frame_io = session.instance_variable_get(:@frame_io)
@@ -229,7 +227,7 @@ RSpec.describe "P1 test gap coverage", :integration do
     it "returns a non-empty broker-generated name when declaring queue with empty string" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("")
+        q  = ch.queue("", exclusive: true)
         expect(q.name).not_to be_empty
         expect(q.name).to start_with("amq.gen-")
         ch.close
@@ -249,7 +247,7 @@ RSpec.describe "P1 test gap coverage", :integration do
     it "classifies code 312 (no-route) as ChannelError, keeping the connection alive" do
       isolated_session do |session, _|
         ch = session.open_channel
-        ch.queue("test.soft-error.#{SecureRandom.hex(4)}", durable: false)
+        ch.queue("test.soft-error.#{SecureRandom.hex(4)}", durable: true)
 
         # Intercept CloseOk writes so they don't confuse the broker
         frame_io = session.instance_variable_get(:@frame_io)

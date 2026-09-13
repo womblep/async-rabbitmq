@@ -12,11 +12,11 @@ RSpec.describe "Multi-frame body reassembly", :integration do
       payload = ("A" * frame_max) + ("B" * frame_max) + ("C" * (frame_max / 2))
 
       ch  = session.open_channel
-      q   = ch.queue("test.multiframe", durable: false)
+      q   = ch.queue("test.multiframe", durable: true)
 
       ch.basic_publish(payload, routing_key: q.name)
 
-      _di, _headers, received = ch.basic_get(q.name)
+      _di, _headers, received = ch.basic_get(q.name, manual_ack: false)
 
       expect(received.bytesize).to eq(payload.bytesize)
       expect(received).to eq(payload.b)
@@ -31,10 +31,10 @@ RSpec.describe "Multi-frame body reassembly", :integration do
       payload = "X" * 200_000
 
       ch = session.open_channel
-      q  = ch.queue("test.smallframe", durable: false)
+      q  = ch.queue("test.smallframe", durable: true)
 
       ch.basic_publish(payload, routing_key: q.name)
-      _di, _headers, received = ch.basic_get(q.name)
+      _di, _headers, received = ch.basic_get(q.name, manual_ack: false)
 
       expect(received.bytesize).to eq(payload.bytesize)
       ch.close

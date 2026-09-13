@@ -154,7 +154,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "exposes auto_delete?" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q = ch.queue("test.pred.ad.#{SecureRandom.hex(4)}", auto_delete: true)
+        q = ch.queue("test.pred.ad.#{SecureRandom.hex(4)}", durable: true, auto_delete: true)
         expect(q.auto_delete?).to be true
         q.delete
         ch.close
@@ -164,7 +164,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "server_named? is true for broker-generated names" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q = ch.queue("")
+        q = ch.queue("", exclusive: true)
         expect(q.server_named?).to be true
         ch.close
       end
@@ -173,7 +173,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "server_named? is false for user-named queues" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q = ch.queue("test.pred.named.#{SecureRandom.hex(4)}")
+        q = ch.queue("test.pred.named.#{SecureRandom.hex(4)}", durable: true)
         expect(q.server_named?).to be false
         ch.close
       end
@@ -189,7 +189,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
       isolated_session do |session, _|
         ch = session.open_channel
         q_name = "test.status.#{SecureRandom.hex(4)}"
-        q = ch.queue(q_name, durable: false)
+        q = ch.queue(q_name, durable: true)
 
         3.times { ch.basic_publish("msg", routing_key: q_name) }
         sleep 0.1
@@ -297,7 +297,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           captured_ch = ch
           expect(ch.open?).to be true
 
-          q = ch.queue("test.with_channel.#{SecureRandom.hex(4)}")
+          q = ch.queue("test.with_channel.#{SecureRandom.hex(4)}", durable: true)
           expect(q.name).to include("test.with_channel.")
         end
         expect(captured_ch.closed?).to be true
@@ -329,7 +329,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
       isolated_session do |session, _|
         ch = session.open_channel
         q_name = "test.exists.q.#{SecureRandom.hex(4)}"
-        ch.queue(q_name, durable: false)
+        ch.queue(q_name, durable: true)
         ch.close
 
         expect(session.queue_exists?(q_name)).to be true
@@ -379,7 +379,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "forwards content_type and content_encoding" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.props.ct.#{SecureRandom.hex(4)}")
+        q  = ch.queue("test.props.ct.#{SecureRandom.hex(4)}", durable: true)
 
         ch.basic_publish(
           '{"key":"value"}',
@@ -388,7 +388,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           content_encoding: "utf-8"
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         expect(props[:content_type]).to eq("application/json")
         expect(props[:content_encoding]).to eq("utf-8")
@@ -399,7 +399,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "forwards correlation_id and reply_to" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.props.rpc.#{SecureRandom.hex(4)}")
+        q  = ch.queue("test.props.rpc.#{SecureRandom.hex(4)}", durable: true)
 
         ch.basic_publish(
           "rpc-request",
@@ -408,7 +408,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           reply_to: "reply.queue"
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         expect(props[:correlation_id]).to eq("abc-123")
         expect(props[:reply_to]).to eq("reply.queue")
@@ -419,7 +419,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "forwards message_id, timestamp, type, and app_id" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.props.meta.#{SecureRandom.hex(4)}")
+        q  = ch.queue("test.props.meta.#{SecureRandom.hex(4)}", durable: true)
         ts = Time.now.to_i
 
         ch.basic_publish(
@@ -431,7 +431,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           app_id: "test-suite"
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         expect(props[:message_id]).to eq("msg-456")
         expect(props[:timestamp].to_i).to eq(ts)
@@ -444,11 +444,11 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "forwards priority" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.props.pri.#{SecureRandom.hex(4)}", arguments: { "x-max-priority" => 10 })
+        q  = ch.queue("test.props.pri.#{SecureRandom.hex(4)}", durable: true, arguments: { "x-max-priority" => 10 })
 
         ch.basic_publish("high-pri", routing_key: q.name, priority: 5)
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         expect(header.properties[:priority]).to eq(5)
         ch.close
       end
@@ -457,11 +457,11 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "forwards expiration" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.props.exp.#{SecureRandom.hex(4)}")
+        q  = ch.queue("test.props.exp.#{SecureRandom.hex(4)}", durable: true)
 
         ch.basic_publish("ttl-msg", routing_key: q.name, expiration: "60000")
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         expect(header.properties[:expiration]).to eq("60000")
         ch.close
       end
@@ -470,7 +470,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "forwards headers" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.props.hdr.#{SecureRandom.hex(4)}")
+        q  = ch.queue("test.props.hdr.#{SecureRandom.hex(4)}", durable: true)
 
         ch.basic_publish(
           "with-headers",
@@ -478,7 +478,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           headers: { "x-retry-count" => 3, "x-source" => "test" }
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         expect(header.properties[:headers]).to include("x-retry-count" => 3, "x-source" => "test")
         ch.close
       end
@@ -487,7 +487,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
     it "named kwargs merge with properties: hash (properties: hash wins on overlap)" do
       isolated_session do |session, _|
         ch = session.open_channel
-        q  = ch.queue("test.props.merge.#{SecureRandom.hex(4)}")
+        q  = ch.queue("test.props.merge.#{SecureRandom.hex(4)}", durable: true)
 
         ch.basic_publish(
           "merge",
@@ -496,7 +496,7 @@ RSpec.describe "Bunny API parity (P2)", :integration do
           properties: { content_type: "application/octet-stream", app_id: "from-hash" }
         )
 
-        _di, header, _body = ch.basic_get(q.name)
+        _di, header, _body = ch.basic_get(q.name, manual_ack: false)
         props = header.properties
         # properties: hash merges on top of named kwargs
         expect(props[:content_type]).to eq("application/octet-stream")

@@ -85,7 +85,7 @@ RSpec.describe "callbacks and client properties", :integration do
 
         # Verify we can operate normally (open channel, declare queue)
         ch = session.open_channel
-        q = ch.queue("test.props.#{SecureRandom.hex(4)}", durable: false)
+        q = ch.queue("test.props.#{SecureRandom.hex(4)}", durable: true)
         expect(q.name).not_to be_empty
         ch.close
       end

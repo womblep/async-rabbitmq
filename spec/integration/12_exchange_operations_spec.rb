@@ -18,12 +18,12 @@ RSpec.describe "Exchange operations", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
       ex = ch.exchange("test.routing", type: :direct, durable: false)
-      q  = ch.queue("test.routing.q", durable: false)
+      q  = ch.queue("test.routing.q", durable: true)
       q.bind(exchange: ex.name, routing_key: "rk")
 
       ex.publish("payload", routing_key: "rk")
 
-      _di, _h, body = ch.basic_get(q.name)
+      _di, _h, body = ch.basic_get(q.name, manual_ack: false)
       expect(body).to eq("payload".b)
       ch.close
     end
@@ -33,12 +33,12 @@ RSpec.describe "Exchange operations", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
       ex = ch.exchange("test.topic", type: :topic, durable: false)
-      q  = ch.queue("test.topic.q", durable: false)
+      q  = ch.queue("test.topic.q", durable: true)
       q.bind(exchange: ex.name, routing_key: "orders.#")
 
       ex.publish("order", routing_key: "orders.new")
 
-      _di, _h, body = ch.basic_get(q.name)
+      _di, _h, body = ch.basic_get(q.name, manual_ack: false)
       expect(body).to eq("order".b)
       ch.close
     end
@@ -48,15 +48,15 @@ RSpec.describe "Exchange operations", :integration do
     isolated_session do |session, _|
       ch = session.open_channel
       ex = ch.exchange("test.fanout", type: :fanout, durable: false)
-      q1 = ch.queue("test.fanout.q1", durable: false)
-      q2 = ch.queue("test.fanout.q2", durable: false)
+      q1 = ch.queue("test.fanout.q1", durable: true)
+      q2 = ch.queue("test.fanout.q2", durable: true)
       q1.bind(exchange: ex.name)
       q2.bind(exchange: ex.name)
 
       ex.publish("broadcast")
 
-      _di1, _h, b1 = ch.basic_get(q1.name)
-      _di2, _h, b2 = ch.basic_get(q2.name)
+      _di1, _h, b1 = ch.basic_get(q1.name, manual_ack: false)
+      _di2, _h, b2 = ch.basic_get(q2.name, manual_ack: false)
       expect(b1).to eq("broadcast".b)
       expect(b2).to eq("broadcast".b)
       ch.close

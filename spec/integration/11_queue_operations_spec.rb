@@ -12,10 +12,10 @@ RSpec.describe "Queue operations", :integration do
     end
   end
 
-  it "declares a transient queue" do
+  it "declares a transient exclusive queue (RabbitMQ 4.2+ rejects transient non-exclusive ones)" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.transient", durable: false)
+      q  = ch.queue("test.transient", exclusive: true)
       expect(q.name).to eq("test.transient")
       ch.close
     end
@@ -24,7 +24,7 @@ RSpec.describe "Queue operations", :integration do
   it "binds and unbinds a queue to an exchange" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.bind", durable: false)
+      q  = ch.queue("test.bind", durable: true)
       ex = ch.exchange("test.ex.bind", type: :direct, durable: false)
 
       expect { q.bind(exchange: ex.name, routing_key: "my.key") }.not_to raise_error
@@ -36,7 +36,7 @@ RSpec.describe "Queue operations", :integration do
   it "purges a queue and reports zero messages" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.purge", durable: false)
+      q  = ch.queue("test.purge", durable: true)
 
       5.times { ch.basic_publish("x", routing_key: q.name) }
       sleep 0.1
@@ -51,7 +51,7 @@ RSpec.describe "Queue operations", :integration do
   it "generates a unique name when declared with an empty string" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("")
+      q  = ch.queue("", exclusive: true)
       expect(q.name).not_to be_empty
       expect(q.name).to match(/\Aamq\.gen-/), "expected server-generated name starting with amq.gen-"
       ch.close
@@ -61,7 +61,7 @@ RSpec.describe "Queue operations", :integration do
   it "deletes a queue" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.delete.me", durable: false)
+      q  = ch.queue("test.delete.me", durable: true)
       expect { q.delete }.not_to raise_error
       ch.close
     end

@@ -10,7 +10,7 @@ RSpec.describe "connection.blocked / connection.unblocked", :integration do
   it "session logs a warning and stays open when connection.blocked is received" do
     isolated_session do |session, _|
       ch = session.open_channel
-      q  = ch.queue("test.blocked", durable: false)
+      q  = ch.queue("test.blocked", durable: true)
       ch.basic_publish("payload", routing_key: q.name)
 
       # Simulate receiving a connection.blocked method frame on channel 0
@@ -24,9 +24,7 @@ RSpec.describe "connection.blocked / connection.unblocked", :integration do
       sleep 0.1
       expect(session.open?).to be true
 
-      # Unblock before closing so ch.close's write_frame doesn't hang
-      queue0.push([:method, AMQ::Protocol::Connection::Unblocked.new]) if queue0
-      sleep 0.05
+      # Close while still blocked: control frames bypass the publish gate.
       ch.close
     end
   end
@@ -34,7 +32,7 @@ RSpec.describe "connection.blocked / connection.unblocked", :integration do
   it "session recovers from connection.unblocked after blocked" do
     isolated_session do |session, _|
       ch = session.open_channel
-      ch.queue("test.unblocked", durable: false)
+      ch.queue("test.unblocked", durable: true)
 
       frame_io = session.instance_variable_get(:@frame_io)
       queue0   = frame_io.channel_queue(0)

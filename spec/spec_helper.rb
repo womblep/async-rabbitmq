@@ -107,6 +107,32 @@ module IntegrationHelpers
     false
   end
 
+  # Simulate the network dropping the connection. Uses shutdown(2) rather than
+  # close: on Linux a closed fd is silently removed from the scheduler's selector,
+  # so a fiber blocked in read would not wake until the heartbeat timer fires,
+  # whereas shutdown makes the pending read return EOF on every platform.
+  def sever_connection!(session)
+    sock = session.instance_variable_get(:@frame_io)&.instance_variable_get(:@socket)
+    return unless sock
+    io = sock.respond_to?(:to_io) ? sock.to_io : sock
+    io.shutdown(Socket::SHUT_RDWR)
+  rescue IOError, SystemCallError
+    # already gone
+  end
+
+  # Sever the connection and block until the session has fully recovered:
+  # on_recovery fires after channels are reopened, topology replayed and
+  # consumers re-registered. Polling open? right after severing is racy because
+  # the reader only notices the drop on the next scheduler tick.
+  def recover_connection!(session, timeout: 10)
+    recovered = false
+    session.on_recovery { |_s| recovered = true }
+    sever_connection!(session)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    sleep 0.1 until recovered || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+    expect(recovered).to be(true), "session did not recover within #{timeout}s"
+  end
+
   # Returns true when the toxiproxy daemon is reachable.
   # Creates the rabbitmq and rabbitmq_tls proxies if they don't already exist.
   def toxiproxy_available?
