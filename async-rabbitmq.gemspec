@@ -11,7 +11,9 @@ Gem::Specification.new do |spec|
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 3.4"
 
-  spec.files         = Dir["lib/**/*.rb", "LICENSE", "README.md", "CHANGELOG.md"]
+  spec.files         = Dir["lib/**/*.rb", "exe/*", "LICENSE", "README.md", "CHANGELOG.md"]
+  spec.bindir        = "exe"
+  spec.executables   = ["async-rabbitmq"]
   spec.metadata      = {
     "changelog_uri"   => "https://github.com/womblep/async-rabbitmq/blob/main/CHANGELOG.md",
     "source_code_uri" => "https://github.com/womblep/async-rabbitmq",

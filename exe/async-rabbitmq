@@ -1,0 +1,12 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+$LOAD_PATH.unshift(File.expand_path("../lib", __dir__)) if File.directory?(File.expand_path("../lib", __dir__))
+
+# The frame writer uses IO::Buffer, still flagged experimental in Ruby 4.0.
+# A command-line tool should print its own output, not the interpreter's.
+Warning[:experimental] = false if Warning.respond_to?(:[]=)
+
+require "async_rabbitmq/cli"
+
+exit AsyncRabbitMQ::CLI.start(ARGV)

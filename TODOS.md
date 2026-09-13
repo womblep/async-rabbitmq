@@ -1,5 +1,9 @@
 # TODOS — async-rabbitmq
 
+**Nothing outstanding as of 2026-09-14.** Every item below is resolved, except the Bunny
+compatibility shim, which was dropped on purpose. What is left is the record of why each
+thing was done or not; new work starts by adding to it.
+
 ## P0 — Bugs (must fix before v1) — ✅ ALL RESOLVED
 
 ### ✅ BUG: re_register_consumers uses empty queue name — recovery is silently broken
@@ -281,21 +285,13 @@ allocates nothing. Subscriber exceptions are logged, not propagated.
 
 ---
 
-### Bunny Compat Shim
-**What:** `AsyncRabbitMQ::Bunny` module wrapping the native API with Bunny-compatible
-method names. Separate require: `require 'async_rabbitmq/bunny'`. Includes curated
-integration tests (one per in-scope Bunny method). Callbacks wrapped in Async::Task
-with documented execution model change (no longer serial — concurrent deliveries).
-**Why:** Migration path for existing Bunny users. Enables adoption by teams who can't
-rewrite immediately.
-**Context:** Deferred from v1 because the only v1 adopters are Async ecosystem users
-who don't need the shim. Bunny users need a tested shim, not an untested one.
-Shipping without tests was flagged as "theater" in the CEO review outside voice.
-**In-scope Bunny surface:** Session#start/close, Channel#queue/exchange/basic_publish/
-basic_get/ack/nack/reject/qos/confirm_select/wait_for_confirms, Queue#subscribe/
-publish/bind/unbind/delete/purge, Exchange#publish/delete/bind.
-**Effort:** M (human: 1 week / CC+gstack: ~45 min)
-**Depends on:** v1 stable API
+### ~~Bunny Compat Shim~~ ❌ WON'T DO (2026-09-14)
+**Dropped, not deferred.** Anyone adopting this client is moving to fibers anyway, so the
+shim would carry the cost of a second API surface, and its tests, for users who do not
+exist. The public API already mirrors Bunny's method names where that costs nothing, which
+is as far as the migration path needs to go. The execution model is the part a shim could
+never hide: handlers run concurrently in their own fibers, not serially on one consumer
+thread. That is documented in the README and the design doc instead.
 
 ---
 
@@ -317,14 +313,14 @@ application set up. A recovery callback is the clean solution.
 
 ## P3 — Future
 
-### CLI Dev Tools
-**What:** `rabbitmq-async` CLI binary. Commands: `consume <queue>`, `publish <queue>
-<payload>`, `inspect <queue>` (depth + consumer count), `purge <queue>`.
-Self-implements on top of the gem — a real dogfooding exercise.
-**Why:** Useful for development and debugging. Makes the gem tangible for new users
-who want to kick the tires without writing Ruby.
-**Effort:** S (human: 1 day / CC+gstack: ~15 min)
-**Depends on:** stable v1 API
+### ~~CLI Dev Tools~~ ✅ DONE (0.2.0)
+**Resolved:** `exe/async-rabbitmq` with `publish`, `consume`, `inspect` and `purge`, built on
+the public API in `lib/async_rabbitmq/cli.rb`. Named after the gem rather than the
+`rabbitmq-async` in the original note, so `gem install async-rabbitmq` puts a command of the
+same name on the path. Publishing uses confirms and the mandatory flag, so a nack or an
+unroutable message is reported and exits non-zero; `consume` stops at `--count` or after
+`--timeout` seconds of quiet, and `--peek` prints without acknowledging.
+**Tests:** `spec/integration/48_cli_spec.rb`
 
 ---
 

@@ -27,9 +27,15 @@ transactions, `basic.return`, `connection.blocked`, `channel.flow`,
 `connection.update-secret`, automatic connection recovery with topology replay,
 structured events for metrics and tracing, and an opt-in connection pool.
 
-Not implemented: AMQP 1.0, the RabbitMQ HTTP management API, a Bunny
-compatibility shim, and a CLI. Nothing in the architecture rules the last two
-out; they are simply absent.
+The gem also installs an `async-rabbitmq` command (`lib/async_rabbitmq/cli.rb`)
+for publishing, consuming, inspecting and purging from a terminal. It is written
+on the public API with no privileged access, which makes it a standing check
+that the API is usable.
+
+Not implemented: AMQP 1.0, the RabbitMQ HTTP management API, and a Bunny
+compatibility shim. The shim was dropped deliberately rather than deferred:
+anyone adopting this client is moving to fibers anyway, and an untested
+compatibility layer would be worse than none.
 
 ## Layers
 
