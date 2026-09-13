@@ -11,4 +11,8 @@ group :test do
   gem "async-pool",      "~> 0.11"
   gem "async-rspec",     "~> 1.17"
   gem "toxiproxy",       "~> 2.0"
+  # For spec/integration/47_open_telemetry_spec.rb; the telemetry layer itself is
+  # optional and not a runtime dependency.
+  gem "opentelemetry-api", "~> 1.1"
+  gem "opentelemetry-sdk", "~> 1.1"
 end

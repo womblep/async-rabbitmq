@@ -189,6 +189,15 @@ caught and logged, because instrumentation must not be able to take a
 connection down. Event names are treated as API and listed in `Notifier::EVENTS`;
 payload keys are documented in the README.
 
+Tracing is separate, in `lib/async_rabbitmq/telemetry/open_telemetry.rb`, and is
+neither loaded nor depended on by default. It cannot be built on the events
+above: a span has to wrap the operation, and the trace context has to be
+injected into the headers before the frames are encoded, which is too early for
+an after-the-fact notification. It is therefore a module prepended to `Channel`
+by `Telemetry::OpenTelemetry.install`, inert until a tracer is set. Span names
+and attributes copy opentelemetry-instrumentation-bunny so that a service moving
+over keeps its dashboards.
+
 ## Defaults
 
 | Setting | Value |

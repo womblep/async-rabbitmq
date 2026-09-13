@@ -49,6 +49,9 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
 ### Added
 
+- Optional OpenTelemetry tracing in `async_rabbitmq/telemetry/open_telemetry`, with the span
+  names, attributes and W3C context propagation of `opentelemetry-instrumentation-bunny`.
+  Not required by default and not a runtime dependency.
 - Structured events for metrics and tracing: `Session#on_event(pattern) { |name, payload| }`
   and a `instrumenter:` constructor option. 18 events covering the connection, recovery,
   channels, consumers and messages, with durations on `channel.rpc`, `message.consumed`,
