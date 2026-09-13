@@ -127,6 +127,32 @@ the connection drops first they are re-published on the recovered channel
 (the usual at-least-once trade-off: a message the broker had already
 accepted may be delivered twice).
 
+### What a returned publish means here
+
+Two differences from Bunny on the sending side, both deliberate.
+
+**`basic_publish` returns when the frames are queued for the writer fiber,
+not when they are on the socket.** Bunny writes inline on the calling thread,
+so there a returned publish means the bytes reached the kernel. Neither is a
+delivery guarantee: RabbitMQ's own guidance is that a client which has written
+frames to its socket still cannot assume the broker received or processed
+them. Publisher confirms are the only thing that tells you. What the queue
+does change is the size of the window. Closing a session with a backlog
+discards whatever the writer has not reached yet, because the close handshake
+is bounded at five seconds; the client logs a warning naming the number of
+queued writes it dropped, since a publisher without confirms has no other way
+to find out. If it matters, `confirm_select` and `wait_for_confirms` before
+`close`.
+
+**A channel may be published to from many fibers at once.** RabbitMQ's
+documentation says concurrent publishing on a shared channel is not supported
+by client libraries, and for most clients that is true. Here publishes and
+request/reply calls are serialised per channel, so a message's frames always
+reach the wire contiguously and confirm tags follow wire order. Sharing a
+channel is still a throughput bottleneck, and synchronous calls queue behind a
+publish backlog, so give a busy publisher its own channel when latency on
+declares matters.
+
 ## Transactions
 
 `ch.tx_select`, `ch.tx_commit`, `ch.tx_rollback`, `ch.using_tx?`. A channel

@@ -687,8 +687,14 @@ module AsyncRabbitMQ
         )
         wait_channel0_method(AMQ::Protocol::Connection::CloseOk)
       end
-    rescue Async::TimeoutError, ConnectionError, ChannelError, IOError
-      # Broker didn't respond — proceed with forced close.
+    rescue Async::TimeoutError, ConnectionError, ChannelError, IOError => e
+      # Broker didn't answer in time — proceed with the forced close below, which
+      # takes the rest of the write queue with it. basic_publish only queues
+      # frames, so without confirms this is the publisher's only hint.
+      unwritten = @frame_io&.pending_writes.to_i
+      return unless unwritten.positive?
+
+      @logger.warn("Close discarded #{unwritten} queued write(s) (#{e.class})")
     end
 
     def negotiate_heartbeat(broker_hb)

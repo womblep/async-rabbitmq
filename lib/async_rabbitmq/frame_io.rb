@@ -124,6 +124,14 @@ module AsyncRabbitMQ
       @blocked
     end
 
+    # How many writes are queued for the writer fiber but not yet on the socket.
+    # One entry is one write_frame call, so a batch published with
+    # basic_publish_batch counts once however many messages it carries. Used at
+    # close time to report what is about to be thrown away.
+    def pending_writes
+      @write_queue.size
+    end
+
     # Write heartbeat directly to socket, bypassing the write queue so
     # heartbeats are never starved by backpressure.
     # Silently swallows IO errors — the reader_loop will detect and recover.
