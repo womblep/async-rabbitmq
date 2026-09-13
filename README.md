@@ -211,6 +211,47 @@ pool.close
 Backed by `Async::Pool`; a session is shared by up to `channel_max` fibers
 before another connection is opened.
 
+## Performance and integrity harness
+
+`examples/` holds a sender and a receiver that load the broker and check what
+comes out the other end. They are meant for the failure modes a throughput
+number hides: a message lost, doubled or delivered out of sequence, a body
+handed over with another message's header, a delivery on the wrong queue, a
+reply given to the wrong caller.
+
+```bash
+ruby -Ilib examples/perf_consumer.rb  --streams 4                     # start first
+ruby -Ilib examples/perf_publisher.rb --streams 4 --messages 50000
+```
+
+Every message is deterministic in `(run, stream, seq, size)` and states its
+identity twice, in the AMQP properties and inside the body, so the receiver can
+rebuild the bytes it should have been given and compare. One queue per
+publisher stream, one consumer, one handler: that is where AMQP promises order,
+so out-of-sequence delivery there is a real fault, and the report says so.
+`--consumers` or `--handlers` above 1 makes deliveries concurrent and the
+report downgrades ordering to an observation.
+
+The sender publishes from several fibers over **one shared channel** by default
+(`--channels per-stream` for one each), which is the case worth stressing: it
+checks that confirm delivery tags are unique and cover every publish, that
+nothing came back unroutable, and, with `--rpc-probe N`, that passive declares
+issued from other fibers while the channel is saturated each get their own
+reply. Useful switches: `--batch`, `--confirms none|simple|tracking`,
+`--persistent`, `--rate`, `--size`. The receiver takes `--mode get` to exercise
+the `basic_get` path instead of a consumer, plus `--prefetch` and
+`--[no-]manual-ack`. Both exit non-zero when anything failed, so they can gate
+a build.
+
+`examples/perf_fault_inject.rb` publishes one of each fault on purpose; run it
+against a receiver to see the checks fire rather than trusting them.
+
+Two things the numbers do not say. Latency is measured from a monotonic clock,
+so both programs must run on the same host, and it only means anything while
+the receiver keeps up (pace the sender with `--rate`). And with `--confirms
+none`, nothing proves the broker received anything: see *What a returned
+publish means here* above.
+
 ## Development
 
 The suite runs against a real RabbitMQ (with Toxiproxy for network faults):
