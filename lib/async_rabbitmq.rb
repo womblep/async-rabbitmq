@@ -1,4 +1,5 @@
 require_relative "async_rabbitmq/version"
+require_relative "async_rabbitmq/log"
 require_relative "async_rabbitmq/errors"
 require_relative "async_rabbitmq/notifier"
 require_relative "async_rabbitmq/topology_registry"

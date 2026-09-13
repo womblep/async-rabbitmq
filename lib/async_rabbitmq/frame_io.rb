@@ -28,7 +28,7 @@ module AsyncRabbitMQ
     # 403 access-refused, 404 not-found, 405 resource-locked, 406 precondition-failed.
     SOFT_ERROR_CODES = [311, 312, 313, 403, 404, 405, 406].freeze
 
-    def initialize(socket, logger: Logger.new($stdout, level: Logger::WARN))
+    def initialize(socket, logger: Log.new)
       @socket        = socket
       @logger        = logger
       @channels      = {}

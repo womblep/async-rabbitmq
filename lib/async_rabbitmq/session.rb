@@ -4,7 +4,6 @@ require "async/semaphore"
 require "socket"
 require "openssl"
 require "uri"
-require "logger"
 require "amq/uri"
 require_relative "errors"
 require_relative "frame_io"
@@ -139,7 +138,7 @@ module AsyncRabbitMQ
       recover_topology: true,
       topology_recovery_filter: nil,
       instrumenter: nil,
-      logger: Logger.new($stdout)
+      logger: Log.new
     )
       @addresses = build_address_list(host, port, hosts, addresses)
       @host                 = @addresses.first[0]

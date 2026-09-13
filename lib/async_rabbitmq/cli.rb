@@ -290,10 +290,7 @@ module AsyncRabbitMQ
     end
 
     def quiet_logger
-      logger = Logger.new(@err)
-      logger.level = Logger::WARN
-      logger.formatter = ->(severity, _time, _progname, msg) { "#{severity.downcase}: #{msg}\n" }
-      logger
+      AsyncRabbitMQ::Log.new(@err)
     end
 
     def monotonic
