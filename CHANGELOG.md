@@ -43,6 +43,11 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
 ### Added
 
+- Structured events for metrics and tracing: `Session#on_event(pattern) { |name, payload| }`
+  and a `instrumenter:` constructor option. 18 events covering the connection, recovery,
+  channels, consumers and messages, with durations on `channel.rpc`, `message.consumed`,
+  `connection.open` and `recovery.succeeded`. Nothing is emitted, and no payload is built,
+  until something subscribes; a subscriber that raises is logged and skipped.
 - Confirm tracking: `confirm_select(tracking: true, outstanding_limit: 1000)` gives publishers
   backpressure and raises `MessageNacked` on a nack (#32).
 - `Channel#basic_publish_batch` (#33).
