@@ -15,8 +15,14 @@ Gem::Specification.new do |spec|
   spec.bindir        = "exe"
   spec.executables   = ["async-rabbitmq"]
   spec.metadata      = {
-    "changelog_uri"   => "https://github.com/womblep/async-rabbitmq/blob/main/CHANGELOG.md",
-    "source_code_uri" => "https://github.com/womblep/async-rabbitmq",
+    # No homepage_uri: it would duplicate spec.homepage, and RubyGems only
+    # shows the first key for a repeated URL.
+    "source_code_uri"       => "https://github.com/womblep/async-rabbitmq",
+    "changelog_uri"         => "https://github.com/womblep/async-rabbitmq/blob/main/CHANGELOG.md",
+    "bug_tracker_uri"       => "https://github.com/womblep/async-rabbitmq/issues",
+    "documentation_uri"     => "https://github.com/womblep/async-rabbitmq/blob/main/README.md",
+    # Require MFA to publish or yank a release of this gem.
+    "rubygems_mfa_required" => "true",
   }
   spec.require_paths = ["lib"]
 

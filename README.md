@@ -46,7 +46,8 @@ AsyncRabbitMQ::Session.new(
   connection_name: "orders-worker",
   auto_recover: true, recovery_attempts: nil, recovery_interval: 1.0, recovery_max_interval: 30.0,
   recover_topology: true, topology_recovery_filter: nil,
-  logger: Logger.new($stdout)
+  instrumenter: nil,                        # ->(event_name, payload) { ... }
+  logger: AsyncRabbitMQ::Log.new            # anything with debug/info/warn/error
 )
 ```
 
@@ -58,6 +59,23 @@ URI.
 
 `Session#update_secret(new_secret, reason)` rotates the credential on a live
 connection (for refreshed OAuth 2 tokens); the new value is used for reconnects.
+
+### Logging
+
+`logger:` takes anything that responds to `debug`, `info`, `warn` and `error`,
+so pass whatever your application already uses. The gem does not depend on the
+`logger` gem, which stopped being a default gem in Ruby 4.0.
+
+```ruby
+AsyncRabbitMQ::Session.new(logger: Rails.logger)
+AsyncRabbitMQ::Session.new(logger: Logger.new($stdout, level: Logger::INFO))
+AsyncRabbitMQ::Session.new(logger: AsyncRabbitMQ::Log.silent)          # say nothing
+AsyncRabbitMQ::Session.new(logger: AsyncRabbitMQ::Log.new($stdout, level: :debug))
+```
+
+The default is `AsyncRabbitMQ::Log`, which writes warnings and errors, one line
+each, to `$stderr`. Structured events (see below) are the better hook for
+metrics and tracing; the log is for the things a human should read.
 
 ## Channels
 
@@ -276,6 +294,9 @@ than a receive span with a process span under it.
 
 ## Connection pool
 
+Add `gem "async-pool"` to your Gemfile: it is not a dependency of this gem, so
+that an application that never pools does not install it.
+
 ```ruby
 require "async_rabbitmq/pool"
 pool = AsyncRabbitMQ::Pool.new(max: 5, host: "localhost")
@@ -364,6 +385,22 @@ bundle exec rspec
 `spec_helper` starts the containers itself if nothing listens on the
 configured port, and generates the TLS certificates with
 `spec/docker/gen-certs.sh`. Ports and hosts come from `.env`.
+
+## Releasing
+
+The version lives in `lib/async_rabbitmq/version.rb` and nowhere else. To cut a
+release: bump it, date the section in `CHANGELOG.md`, run the suite against a
+real broker, then
+
+```bash
+gem build async-rabbitmq.gemspec        # writes async-rabbitmq-<version>.gem
+gem install ./async-rabbitmq-<version>.gem   # optional: check it installs and the command runs
+gem push async-rabbitmq-<version>.gem   # asks for your RubyGems OTP
+git tag -a v<version> -m "v<version>" && git push origin v<version>
+```
+
+The gemspec sets `rubygems_mfa_required`, so publishing and yanking need
+multi-factor authentication on the RubyGems account.
 
 ## License
 

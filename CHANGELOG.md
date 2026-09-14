@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-09-14
 
 Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
@@ -89,6 +89,14 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
 ### Changed
 
+- No dependency on the `logger` gem, which stopped being a default gem in Ruby 4.0 and would
+  otherwise have to be installed by every application using this one. `logger:` takes any
+  object responding to `debug`, `info`, `warn` and `error`; the default is now
+  `AsyncRabbitMQ::Log`, which writes warnings and errors to `$stderr` instead of the previous
+  default of everything, including debug, to `$stdout`. `AsyncRabbitMQ::Log.silent` says
+  nothing.
+- `AsyncRabbitMQ::Pool` explains that `async-pool` has to be in your Gemfile instead of
+  failing with `cannot load such file`.
 - `basic_get` defaults to `manual_ack: true`, as in Bunny (#40).
 - `amq-protocol` requirement raised to `~> 2.9` (#30).
 - Requires Ruby 3.4 or later; CI runs Ruby 3.4 and 4.0.

@@ -1,4 +1,9 @@
-require "async/pool"
+begin
+  require "async/pool"
+rescue LoadError
+  raise LoadError, "AsyncRabbitMQ::Pool needs the async-pool gem, which this gem does not " \
+                   "depend on: add gem \"async-pool\" to your Gemfile"
+end
 require_relative "session"
 
 module AsyncRabbitMQ
