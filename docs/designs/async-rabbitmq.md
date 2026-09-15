@@ -141,6 +141,26 @@ deleted or unbound entities are removed. A server-named queue comes back under a
 new name, which is propagated to its bindings, its consumers and the `Queue`
 object the caller still holds.
 
+The registry mirrors the broker, not the channel that did the declaring. A
+channel closing does not remove what it declared: a durable queue still exists
+and an exclusive one lives as long as the connection, and both are commonly
+declared on one channel and used from another. What a channel closing does
+remove is its consumers, and the broker deletes an auto-delete queue when the
+last consumer goes. So the registry tracks consumers as well, and forgets an
+auto-delete queue with its last one, by `basic_cancel`, broker-side cancel or
+channel close, taking its bindings with it and any auto-delete exchange those
+bindings were keeping alive. Consumers on other connections are invisible to
+it; the cost of guessing wrong there is only that recovery skips a queue that
+still exists, which is harmless.
+
+Channel ids come from `ChannelIdAllocator`, a bitset (`AMQ::BitSet`, the
+structure under Bunny's allocator) over `1..channel_max`. Ids are released when
+a channel closes, so a channel per unit of work does not exhaust the 16-bit id
+space, and `open_channel` raises `ChannelLimitError` at the negotiated limit
+rather than letting the broker close the connection with a 530. `IntAllocator`
+from the same gem was not used because `Channel#reopen` needs to reserve a
+specific id, which it cannot do.
+
 Re-publishing unconfirmed messages is at-least-once: a message the broker had
 already accepted but not yet confirmed is delivered twice.
 

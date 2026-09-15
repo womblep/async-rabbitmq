@@ -204,10 +204,17 @@ module IntegrationHelpers
     mgmt_request(:delete, path)
   end
 
+  # Parsed JSON from the management API, e.g. http_get("/api/queues/#{vhost}").
+  def http_get(path)
+    JSON.parse(mgmt_request(:get, path).body)
+  end
+
   def mgmt_request(method, path, body = nil)
     require "net/http"
+    require "json"
     uri = URI("http://#{RABBITMQ_HOST}:#{RABBITMQ_MGMT}#{path}")
     req = case method
+          when :get    then Net::HTTP::Get.new(uri)
           when :put    then Net::HTTP::Put.new(uri)
           when :delete then Net::HTTP::Delete.new(uri)
           end

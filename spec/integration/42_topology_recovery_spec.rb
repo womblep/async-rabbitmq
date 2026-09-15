@@ -57,12 +57,14 @@ RSpec.describe "topology recovery", :integration do
       ch.exchange_delete(ex.name)
       q.unbind(exchange: kept.name)
 
-      expect(session.topology.exchanges.map(&:name)).to eq([kept.name])
+      # Unbinding the last queue from an auto-delete exchange makes the broker
+      # delete it, so the registry forgets it too rather than resurrecting it.
+      expect(session.topology.exchanges).to be_empty
       expect(session.topology.queue_bindings).to be_empty
 
       recover!(session, ch)
       expect(session.exchange_exists?(ex.name)).to be false
-      expect(session.exchange_exists?(kept.name)).to be true   # still declared, no binding recreated
+      expect(session.exchange_exists?(kept.name)).to be false
       ch.close
     end
   end

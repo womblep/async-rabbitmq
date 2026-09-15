@@ -91,12 +91,16 @@ module AsyncRabbitMQ
       if recovering?
         # Give the channel up rather than letting recovery reopen it.
         mark_closed!(NotOpenError.new("Channel #{@channel_id} closed during recovery"))
+        forget_consumers_in_topology
         @session.channel_closed(@channel_id)
         return
       end
       return unless open?
       rpc(AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0), AMQ::Protocol::Channel::CloseOk)
       @state = :closed
+      # Closing the channel cancelled its consumers on the broker side; an
+      # auto-delete queue that just lost its last one is gone with it.
+      forget_consumers_in_topology
       instrument("channel.closed") { { channel: @channel_id, reason: :user } }
       @session.channel_closed(@channel_id)
       @queue&.push(nil)  # wake dispatch_loop so it can detect :closed and exit
@@ -350,6 +354,7 @@ module AsyncRabbitMQ
         AMQ::Protocol::Basic::ConsumeOk
       )
       @consumers[resp.consumer_tag] = { queue_name: queue_name, block: block, manual_ack: manual_ack }
+      topology&.record_consumer(resp.consumer_tag, queue_name)
       instrument("consumer.registered") do
         { channel: @channel_id, queue: queue_name, consumer_tag: resp.consumer_tag, manual_ack: manual_ack }
       end
@@ -359,6 +364,7 @@ module AsyncRabbitMQ
     def basic_cancel(consumer_tag)
       rpc(AMQ::Protocol::Basic::Cancel.encode(@channel_id, consumer_tag, false), AMQ::Protocol::Basic::CancelOk)
       cancelled = @consumers.delete(consumer_tag)
+      topology&.delete_consumer(consumer_tag)
       instrument("consumer.cancelled") do
         { channel: @channel_id, consumer_tag: consumer_tag, queue: cancelled&.dig(:queue_name), reason: :client }
       end
@@ -612,6 +618,16 @@ module AsyncRabbitMQ
       @consumers.each_value { |c| c[:queue_name] = new_name if c[:queue_name] == old_name }
     end
 
+    # The consumers on this channel no longer exist on the broker (the channel
+    # is closed, by us or by it). @consumers itself is kept so that
+    # reopen(recover_consumers: true) can register them again, which records
+    # them again.
+    def forget_consumers_in_topology
+      return unless (registry = topology)
+
+      @consumers.each_key { |tag| registry.delete_consumer(tag) }
+    end
+
     # Reopen a channel the broker closed (e.g. delivery-ack timeout, unknown
     # delivery tag) on the same connection, keeping its id. Prefetch, confirm
     # mode and transactional mode are restored, and messages still unconfirmed
@@ -753,6 +769,7 @@ module AsyncRabbitMQ
         # Server-initiated consumer cancel (e.g. queue deleted, HA failover).
         # Remove from @consumers so deliveries are no longer dispatched to a dead block.
         entry = @consumers.delete(method.consumer_tag)
+        topology&.delete_consumer(method.consumer_tag)
         if entry
           @logger.warn("Channel #{@channel_id}: broker cancelled consumer #{method.consumer_tag}")
           instrument("consumer.cancelled") do
@@ -827,6 +844,7 @@ module AsyncRabbitMQ
         AMQ::Protocol::Channel::CloseOk.encode(@channel_id).encode
       )
       @state = :closed
+      forget_consumers_in_topology
       @session.channel_closed(@channel_id)
       instrument("channel.closed") { { channel: @channel_id, reason: :broker, code: code, text: text } }
       @on_error&.call(self, method)

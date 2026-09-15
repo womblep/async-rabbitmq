@@ -65,7 +65,9 @@ RSpec.describe "Session.from_uri parsing" do
     ctx = ivar(s, :tls_context)
     expect(ctx).to be_a(OpenSSL::SSL::SSLContext)
     expect(ctx.verify_mode).to eq(OpenSSL::SSL::VERIFY_PEER)
-    expect(ctx.ca_file).to eq(ca)
+    # The CA went into the trust store: it vouches for the test broker's certificate.
+    server = OpenSSL::X509::Certificate.new(File.read(File.expand_path("../docker/certs/server_certificate.pem", __dir__)))
+    expect(ctx.cert_store.verify(server)).to be true
   end
 
   it "disables peer verification only when verify=false is explicit" do
