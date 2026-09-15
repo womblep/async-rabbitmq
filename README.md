@@ -39,7 +39,11 @@ end
 AsyncRabbitMQ::Session.new(
   host: "localhost", port: 5672, vhost: "/", username: "guest", password: "guest",
   hosts: ["rabbit1", "rabbit2"],            # or addresses: ["rabbit1:5672", "rabbit2:5673"]
-  tls: false, tls_context: nil,             # tls_context: an OpenSSL::SSL::SSLContext you built
+  tls: false,                               # implied by any of the four below
+  tls_cert: nil, tls_key: nil,              # client certificate and key: a path or PEM text
+  tls_ca_certificates: nil,                 # CA path(s) or PEM text; default is the system store
+  verify_peer: true, tls_min_version: :TLS1_2,
+  tls_context: nil,                         # or an OpenSSL::SSL::SSLContext you built, for anything else
   heartbeat: 60, frame_max: 131_072, channel_max: 2047,
   connect_timeout: 30, rpc_timeout: 15,     # seconds; rpc_timeout: nil waits forever
   auth_mechanism: nil,                      # "PLAIN" / "EXTERNAL", negotiated by default
@@ -59,6 +63,27 @@ URI.
 
 `Session#update_secret(new_secret, reason)` rotates the credential on a live
 connection (for refreshed OAuth 2 tokens); the new value is used for reconnects.
+
+### TLS
+
+The ordinary case needs no OpenSSL: give it the CA that signed the broker's
+certificate, and a client certificate and key if the broker asks for one. Each
+value is a file path or PEM text, so material from a secrets manager works as
+is. A certificate value may carry the leaf followed by its chain, and a CA
+value may hold several certificates.
+
+```ruby
+AsyncRabbitMQ::Session.new(host: "rabbit", port: 5671,
+                           tls_ca_certificates: "/etc/ssl/rabbit-ca.pem")
+AsyncRabbitMQ::Session.new(host: "rabbit", port: 5671,
+                           tls_cert: ENV["RABBIT_CERT"], tls_key: ENV["RABBIT_KEY"],
+                           tls_ca_certificates: [ENV["RABBIT_CA"]])
+```
+
+Peers and their hostnames are verified unless `verify_peer: false`, and TLS 1.2
+is the floor unless `tls_min_version:` says otherwise. `amqps://` URIs take the
+same things as `cacertfile`, `certfile`, `keyfile` and `verify`. For anything
+this does not cover, pass `tls_context:` and it is used as given.
 
 ### Logging
 
@@ -194,7 +219,14 @@ is lost. After reconnect the session
 4. calls `on_recovery`.
 
 Passive declares are not recorded; deleted or unbound entities are not
-recovered. `topology_recovery_filter:` takes an object implementing any of
+recovered. The registry follows what the broker does rather than which channel
+declared what: a durable or exclusive queue outlives the channel that declared
+it and is still recovered, while an auto-delete queue is forgotten, with its
+bindings, the moment its last consumer goes, whether by `basic_cancel`, a
+broker-side cancel or the channel closing, and an auto-delete exchange goes
+when its last binding does. A worker that opens a channel and a temporary
+queue per unit of work therefore leaves nothing behind for the next reconnect
+to re-declare. `topology_recovery_filter:` takes an object implementing any of
 `filter_exchanges`, `filter_queues`, `filter_queue_bindings`,
 `filter_exchange_bindings`. If recovery is disabled, exhausted
 (`on_recovery_exhausted`) or the broker refuses the credentials, channels are
@@ -215,7 +247,10 @@ All errors derive from `AsyncRabbitMQ::Error`: `ConnectionTimeoutError`
 connection or it was lost), `ChannelError` (`code`, `text`, `channel_id`,
 `close_method`, plus `delivery_ack_timeout?`, `unknown_delivery_tag?`,
 `message_too_large?`), `NotOpenError`, `RpcTimeoutError`, `MessageNacked`
-(`nacked_tags`), `HeartbeatTimeoutError`.
+(`nacked_tags`), `HeartbeatTimeoutError`, `ChannelLimitError` (every id up to
+the negotiated `channel_max` is in use; the broker would otherwise have closed
+the connection). Channel ids are reused as channels close, so opening a
+channel per unit of work is fine for the life of the connection.
 
 ## Events
 

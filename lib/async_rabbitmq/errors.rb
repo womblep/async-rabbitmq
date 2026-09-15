@@ -58,6 +58,11 @@ module AsyncRabbitMQ
   # Raised when an operation is attempted on a closed channel or session.
   class NotOpenError < Error; end
 
+  # Raised by Session#open_channel when every channel id up to the negotiated
+  # channel_max is in use. Opening one more would make the broker close the
+  # whole connection (530 NOT_ALLOWED), so the client refuses first.
+  class ChannelLimitError < Error; end
+
   # Raised by wait_for_confirms on a channel in confirm-tracking mode when the
   # broker nacked at least one message in the cycle (see Channel#confirm_select).
   class MessageNacked < Error

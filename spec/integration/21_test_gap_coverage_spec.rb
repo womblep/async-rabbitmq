@@ -250,6 +250,11 @@ RSpec.describe "P1 test gap coverage", :integration do
       isolated_session do |session, _|
         ch = session.open_channel
         ch.queue("test.soft-error.#{SecureRandom.hex(4)}", durable: true)
+        # Opened now, used afterwards to prove the connection survived. The
+        # broker never sees the injected close below, so it still considers
+        # ch's id open, and a channel opened later would be handed that id
+        # again (ids are reused) and be refused as a "second channel.open".
+        witness = session.open_channel
 
         # Intercept CloseOk writes so they don't confuse the broker
         frame_io = session.instance_variable_get(:@frame_io)
@@ -275,11 +280,11 @@ RSpec.describe "P1 test gap coverage", :integration do
         # Connection should still be alive (soft error = channel-scoped)
         expect(session.open?).to be true
 
-        # Restore write_frame and open a new channel to prove the connection works
+        # Restore write_frame and use the other channel to prove the connection works
         frame_io.define_singleton_method(:write_frame, original_write)
-        ch2 = session.open_channel
-        expect(ch2.open?).to be true
-        ch2.close
+        expect(witness.open?).to be true
+        witness.queue("test.soft-error.witness.#{SecureRandom.hex(4)}", durable: true)
+        witness.close
       end
     end
   end

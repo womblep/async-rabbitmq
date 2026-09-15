@@ -8,6 +8,15 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
 ### Fixed
 
+- Channel ids are allocated from a bitset and released when a channel closes. They were a bare
+  counter: a process opening a channel per unit of work walked it to 65535, after which the id
+  wrapped to 0 and the broker dropped the connection. `Session#open_channel` also refuses to
+  exceed the negotiated `channel_max` with `ChannelLimitError`, where before the broker closed
+  the whole connection with a 530.
+- The topology registry tracks consumers and forgets an auto-delete queue, with its bindings,
+  when its last consumer goes (cancel, broker-side cancel or channel close), and an auto-delete
+  exchange when its last binding goes. Before, a worker using a temporary queue per channel
+  accumulated one dead queue per channel and re-declared them all on every reconnect.
 - Publishing while the connection is being recovered no longer silently drops the message:
   channels enter a `:recovering` state and park new publishes and requests until they are
   reopened. Messages published under confirms are kept until acked and re-published after a
@@ -49,6 +58,10 @@ Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
 
 ### Added
 
+- TLS without OpenSSL plumbing: `tls_cert:`, `tls_key:`, `tls_ca_certificates:`, `verify_peer:`
+  and `tls_min_version:` on `Session.new`, each taking a path or PEM text, with chains and CA
+  bundles split as needed (`AsyncRabbitMQ::TLS`). Certificate material implies `tls: true`.
+  `tls_context:` remains for anything the options do not cover.
 - An `async-rabbitmq` command: `publish`, `consume`, `inspect` and `purge`, built on the gem's
   own API. Publishing uses confirms and the mandatory flag and reports a nack or an unroutable
   message with a non-zero exit; `consume --peek` prints without acknowledging.

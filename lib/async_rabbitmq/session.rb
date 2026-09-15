@@ -97,18 +97,13 @@ module AsyncRabbitMQ
       opts
     end
 
-    # Build an OpenSSL context from the TLS query parameters of an amqps:// URI.
+    # Build an OpenSSL context from the TLS query parameters of an amqps:// URI,
+    # the same way the tls_cert:/tls_key:/tls_ca_certificates: options do.
     # Peer verification stays on unless the URI says verify=false explicitly.
     def self.tls_context_from_uri(parsed, params)
-      require "openssl"
       verify = params.key?("verify") ? params["verify"] != "false" : true
-      ctx = OpenSSL::SSL::SSLContext.new
-      ctx.set_params(verify_mode: verify ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE)
-      ctx.min_version = OpenSSL::SSL::TLS1_2_VERSION
-      ctx.ca_file = parsed[:cacertfile] if parsed[:cacertfile]
-      ctx.cert    = OpenSSL::X509::Certificate.new(File.read(parsed[:certfile])) if parsed[:certfile]
-      ctx.key     = OpenSSL::PKey.read(File.read(parsed[:keyfile]))              if parsed[:keyfile]
-      ctx
+      TLS.context(cert: parsed[:certfile], key: parsed[:keyfile], ca_certificates: parsed[:cacertfile],
+                  verify_peer: verify)
     end
 
     private_class_method :uri_options, :tls_context_from_uri
@@ -124,6 +119,11 @@ module AsyncRabbitMQ
       password: "guest",
       tls: false,
       tls_context: nil,
+      tls_cert: nil,
+      tls_key: nil,
+      tls_ca_certificates: nil,
+      verify_peer: true,
+      tls_min_version: :TLS1_2,
       heartbeat: 60,
       frame_max: 131_072,
       channel_max: 2047,
@@ -147,8 +147,14 @@ module AsyncRabbitMQ
       @vhost                = vhost
       @username             = username
       @password             = password
-      @tls                  = tls
+      # Certificate material or a ready context means TLS, whatever tls: says.
+      @tls                  = tls || !(tls_context || tls_cert || tls_key || tls_ca_certificates).nil?
       @tls_context          = tls_context
+      @tls_cert             = tls_cert
+      @tls_key              = tls_key
+      @tls_ca_certificates  = tls_ca_certificates
+      @verify_peer          = verify_peer
+      @tls_min_version      = tls_min_version
       @heartbeat            = heartbeat
       @frame_max            = frame_max
       @channel_max          = channel_max
@@ -168,8 +174,7 @@ module AsyncRabbitMQ
 
       @state             = :closed
       @frame_io          = nil
-      @channels          = {}       # channel_id => Channel
-      @next_channel_id   = 1
+      @channels          = {}       # channel_id => Channel; a closed channel's id is free again
       @channel_mutex     = Async::Semaphore.new(1)
       @negotiated_hb     = nil
       @negotiated_fm     = nil
@@ -216,6 +221,7 @@ module AsyncRabbitMQ
             @host  = target_host
             @port  = target_port
             @state = :open
+            @channel_ids = fresh_channel_ids
           end
           @connecting = false
           instrument("connection.open") do
@@ -303,10 +309,11 @@ module AsyncRabbitMQ
     # (Bunny-parity: default 1). basic_qos will auto-adjust it to prefetch_count.
     def open_channel(pool_size: 1)
       raise NotOpenError, "Session is not open" unless open?
-      channel_id = next_channel_id
-      channel    = Channel.new(channel_id, self, @frame_io, frame_max: @negotiated_fm || @frame_max, logger: @logger,
-                               pool_size: pool_size, rpc_timeout: @rpc_timeout)
-      @channel_mutex.acquire { @channels[channel_id] = channel }
+      channel = @channel_mutex.acquire do
+        channel_id = next_channel_id
+        Channel.new(channel_id, self, @frame_io, frame_max: @negotiated_fm || @frame_max, logger: @logger,
+                    pool_size: pool_size, rpc_timeout: @rpc_timeout).tap { |ch| @channels[channel_id] = ch }
+      end
       channel.open
       channel
     end
@@ -403,7 +410,10 @@ module AsyncRabbitMQ
 
     # Called by Channel when it closes itself.
     def channel_closed(channel_id)
-      @channel_mutex.acquire { @channels.delete(channel_id) }
+      @channel_mutex.acquire do
+        @channels.delete(channel_id)
+        @channel_ids&.release(channel_id)
+      end
       @frame_io&.unregister_channel(channel_id)
     end
 
@@ -416,6 +426,8 @@ module AsyncRabbitMQ
         if existing && !existing.equal?(channel)
           raise Error, "Channel id #{channel.channel_id} is in use by another channel"
         end
+        @channel_ids ||= fresh_channel_ids
+        @channel_ids.reserve(channel.channel_id) unless existing
         @channels[channel.channel_id] = channel
       end
       channel.reopen_on(@frame_io)
@@ -592,11 +604,8 @@ module AsyncRabbitMQ
     end
 
     def build_tls_context
-      require "openssl"
-      ctx                     = OpenSSL::SSL::SSLContext.new
-      ctx.set_params(verify_mode: OpenSSL::SSL::VERIFY_PEER)
-      ctx.min_version         = OpenSSL::SSL::TLS1_2_VERSION
-      ctx
+      TLS.context(cert: @tls_cert, key: @tls_key, ca_certificates: @tls_ca_certificates,
+                  verify_peer: @verify_peer, min_version: @tls_min_version)
     end
 
     def build_frame_io(raw_socket)
@@ -782,11 +791,31 @@ module AsyncRabbitMQ
       end
     end
 
+    # The lowest channel id not in use, so ids come back when channels close.
+    # A bare counter ran out at 65535 (the channel field is 16 bits; 65536
+    # encodes as channel 0 and the broker drops the connection) and let the
+    # process open more channels than channel_max, which the broker also
+    # answers by closing the connection. Called with @channel_mutex held.
     def next_channel_id
-      @channel_mutex.acquire do
-        id = @next_channel_id
-        @next_channel_id += 1
-        id
+      @channel_ids ||= fresh_channel_ids
+      @channel_ids.allocate or
+        raise ChannelLimitError, "channel_max #{@channel_ids.limit} reached: #{@channels.size} channels open on this connection"
+    end
+
+    # The negotiated channel_max; 0 means "no limit", which the protocol caps
+    # at 65535 through the width of the frame header's channel field.
+    def channel_limit
+      max = @negotiated_cmax || @channel_max
+      max.nil? || max.zero? ? 65_535 : max
+    end
+
+    # A new allocator sized by the current negotiation, with the ids of the
+    # channels we already have marked as taken. Built lazily and again after
+    # each handshake, since a reconnect may negotiate a different channel_max
+    # while the channels keep their ids.
+    def fresh_channel_ids
+      ChannelIdAllocator.new(channel_limit).tap do |ids|
+        @channels.each_key { |id| ids.reserve(id) }
       end
     end
 
@@ -866,6 +895,7 @@ module AsyncRabbitMQ
           start_heartbeat_task
           start_channel0_monitor_task
           @state = :open
+          @channel_ids = fresh_channel_ids
           @recovery_in_progress = false
           # NOTE: keep @recovery_task non-nil until reopen_channels completes so
           # that session.close can still cancel this task (and therefore interrupt
