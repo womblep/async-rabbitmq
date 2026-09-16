@@ -25,7 +25,8 @@ multi-host failover, heartbeats, channels, queues, exchanges, bindings, consumer
 `basic_get`, publisher confirms with optional tracking and backpressure,
 transactions, `basic.return`, `connection.blocked`, `channel.flow`,
 `connection.update-secret`, automatic connection recovery with topology replay,
-structured events for metrics and tracing, and an opt-in connection pool.
+structured events for metrics and tracing, an opt-in connection pool, and an
+optional connection per cluster node with channels spread across them.
 
 The gem also installs an `async-rabbitmq` command (`lib/async_rabbitmq/cli.rb`)
 for publishing, consuming, inspecting and purging from a terminal. It is written
@@ -40,6 +41,8 @@ compatibility layer would be worse than none.
 ## Layers
 
 ```
+Cluster ── one Session per node                     optional; the Session API over a cluster
+   │
 Session ── Channel ── Queue / Exchange              public API
    │          │
    │          ├── per-channel Async::Queue of decoded frames
@@ -200,6 +203,43 @@ controller expects: `reusable?` (open and not recovering), `viable?` (open) and
 the channel limit, the controller hands one session to many fibers and only
 opens another connection when the existing ones are saturated.
 
+## Cluster
+
+`AsyncRabbitMQ::Cluster` is one `Session` per node behind the `Session` API,
+for a process that holds a channel per client. It exists because the broker
+never moves a live connection and always places an exclusive queue on the
+connecting node, so with one connection every client's channel and queue sit on
+one node and go down with it, and a TCP load balancer only picks at connect
+time. The rules: each session is pinned to a single address, with no failover
+inside it, so the node that comes back is the one that gets reconnected to; a
+new channel goes to the connected node with the fewest; nothing is ever moved,
+so a returning node fills up by drift.
+
+`on_node_down:` decides what a lost node's channels do. `:park` leaves them in
+the session's recovering state. `:drop` gives every one of them up at the
+moment of loss through `Channel#drop!`, which is what `Channel#close` already
+did for a channel closed during recovery, and by default clears the session's
+registry: nothing client-side holds what that connection declared, and an
+exclusive queue re-declared for nobody lives until the connection closes. A
+callable sees the channels while they are parked and closes the ones to drop.
+The session tells the cluster through `on_connection_lost`, which fires after
+the channels are marked recovering and before the recovery task is spawned, so
+the drop happens while the channels are still in the table and none of them is
+reopened.
+
+The cluster connects each node from its own task, which retries a node that is
+down with the recovery backoff and ends once the node is up. `connect` waits
+for every node's first attempt to settle and returns if any of them is up, so
+the spread starts correctly rather than piling the first channels onto whichever
+node answered first; because the attempts run concurrently the wait is bounded
+by one `connect_timeout` however many nodes are down, where a plain `Session`
+walks its address list in sequence and, like Bunny's `start`, leaves retrying
+to the caller. A
+`Session` spawns its reader, writer, heartbeat and recovery tasks under the
+task that called `connect`, and Async refuses a new child only under a task
+with no live descendants, which a connected session's task never is, so the
+connecting task need not outlive the connection.
+
 ## Events
 
 `Notifier` holds the subscribers; `Session` owns one and hands the same object
@@ -254,7 +294,7 @@ over keeps its dashboards.
 
 ## Tests
 
-283 examples, almost all integration tests against a real broker
+361 examples, almost all integration tests against a real broker
 (`rabbitmq:4-management-alpine` plus Toxiproxy, started by `spec/docker-compose.yml`
 or by `spec_helper` if nothing is listening). Each test gets its own vhost, so
 tests cannot contaminate each other. CI runs Ruby 3.4 and 4.0 over
@@ -273,6 +313,10 @@ socket from another fiber does not wake a reader blocked in the scheduler, so a
 close-based test passes on Windows and hangs until the heartbeat timeout in CI.
 `spec_helper` provides `sever_connection!` and `recover_connection!`, and tests
 wait for the `on_recovery` callback rather than polling `open?`.
+
+The cluster spec reaches the one broker through three addresses, two direct and
+one through Toxiproxy, so the proxied one can stand in for a node that is down at
+startup or dies with channels on it.
 
 `examples/` holds a load-generating publisher and a verifying consumer for the
 faults a throughput number hides: loss, duplication, out-of-sequence delivery, a

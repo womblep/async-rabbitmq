@@ -51,6 +51,7 @@ AsyncRabbitMQ::Session.new(
   auto_recover: true, recovery_attempts: nil, recovery_interval: 1.0, recovery_max_interval: 30.0,
   recover_topology: true, topology_recovery_filter: nil,
   instrumenter: nil,                        # ->(event_name, payload) { ... }
+  notifier: nil,                            # or one Notifier shared between sessions
   logger: AsyncRabbitMQ::Log.new            # anything with debug/info/warn/error
 )
 ```
@@ -63,6 +64,8 @@ URI.
 
 `Session#update_secret(new_secret, reason)` rotates the credential on a live
 connection (for refreshed OAuth 2 tokens); the new value is used for reconnects.
+`Session#store_secret` records it without sending it, for a session that is
+down while the secret rotates.
 
 ### TLS
 
@@ -232,7 +235,8 @@ to re-declare. `topology_recovery_filter:` takes an object implementing any of
 (`on_recovery_exhausted`) or the broker refuses the credentials, channels are
 closed and parked callers raise.
 
-Callbacks: `on_blocked` / `on_unblocked` (connection.blocked),
+Callbacks: `on_connection_lost` (the connection dropped; fires before recovery
+starts), `on_blocked` / `on_unblocked` (connection.blocked),
 `on_recovery_attempt`, `on_recovery`, `on_recovery_exhausted`;
 `Channel#on_return` (mandatory messages the broker could not route),
 `on_cancel` (broker cancelled a consumer), `on_error` (broker closed the
@@ -285,7 +289,7 @@ logged and skipped; it never breaks the connection.
 | `recovery.exhausted` | `attempts`, `reason` (`:attempts_exceeded`, `:authentication_failed`) |
 | `heartbeat.sent` | `interval` |
 | `channel.open` | `channel` |
-| `channel.closed` | `channel`, `reason` (`:user`, `:broker`), `code`, `text` |
+| `channel.closed` | `channel`, `reason` (`:user`, `:broker`, `:dropped`), `code`, `text` |
 | `channel.rpc` | `channel`, `method` (`"queue.declare-ok"`), `duration` |
 | `consumer.registered` | `channel`, `queue`, `consumer_tag`, `manual_ack` |
 | `consumer.cancelled` | `channel`, `consumer_tag`, `queue`, `reason` (`:client`, `:broker`) |
@@ -341,6 +345,61 @@ pool.close
 
 Backed by `Async::Pool`; a session is shared by up to `channel_max` fibers
 before another connection is opened.
+
+## One connection per cluster node
+
+A `Session` is on one node. Every channel it opens is there, and so is every
+exclusive queue declared through it, because the broker always places those on
+the connecting node, whatever `queue_leader_locator` says. A process that holds
+a channel and a temporary queue per client therefore puts all of its clients on
+one node, and loses them together when that node goes.
+
+`AsyncRabbitMQ::Cluster` takes the same options as `Session` and presents the
+same methods, so it drops in where a `Session` was. It pins one connection to
+each address, opens each new channel on the node with the fewest, and retries a
+node that is down until it is back, after which new channels drift to it until
+the counts are level. Nothing is ever moved: a channel stays on its node for
+life.
+
+```ruby
+cluster = AsyncRabbitMQ::Cluster.new(
+  addresses: %w[rabbit1:5672 rabbit2:5672 rabbit3:5672],   # one connection each
+  username: "app", password: secret,
+  on_node_down: :drop,            # :park (default), :drop, or ->(session, channels, error) { ... }
+  clear_topology_on_drop: true    # with :drop, forget what the lost connection had declared
+)
+cluster.connect                   # every node, concurrently; the ones that are down are retried in the background
+channel = cluster.open_channel    # on the node with the fewest channels
+cluster.on_node_down { |session, channels, error| ... }
+cluster.on_node_up   { |session| ... }
+```
+
+`on_node_down:` decides what happens to the channels on a node whose connection
+is lost. `:park` is what a `Session` does: they wait, and resume on the same
+node when it returns. `:drop` closes them at once: calls in flight raise
+`ConnectionError`, consumer loops return, later calls raise `NotOpenError`, and
+the fibers using them can open a new channel, which lands on a node that is up.
+A callable receives the node's session, its channels and the error while the
+channels are parked, and closes the ones it wants dropped; the rest wait. With
+`:drop` the lost connection's topology registry is cleared as well
+(`clear_topology_on_drop: true`), so nothing is re-declared when the node
+returns; `false` keeps the usual registry rules. Publishing and shared durable
+topology are expected to live on a plain `Session` alongside: the cluster is
+for the mass of per-client channels.
+
+`connect` connects every node concurrently and returns once each one is either
+connected or has failed a first attempt, so the channels opened next are spread
+over every node that is reachable. The wait is bounded by one `connect_timeout`
+however many nodes are down. It raises only if none can be reached, or at once
+with `AuthenticationError` if a node refuses the credentials. Nodes that are
+down at startup, or later, are retried with the recovery backoff.
+`open?` is true while any node is; `close` closes them all. `open_channel`,
+`with_channel`, `queue_exists?` and `exchange_exists?` use the least loaded
+node; `update_secret` reaches every node, stored for the ones that are down.
+The `on_*` callbacks fire for every node with that node's `Session`, `on_event`
+sees every node's events (each carries `host` and `port`), `topology` is a
+read-only view over every node's registry, and `host` and `port` are the first
+address. `sessions`, `on_node_down` and `on_node_up` are the additions.
 
 ## Command line
 

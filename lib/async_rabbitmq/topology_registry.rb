@@ -150,6 +150,17 @@ module AsyncRabbitMQ
       @exchanges.empty? && @queues.empty? && @queue_bindings.empty? && @exchange_bindings.empty?
     end
 
+    # Forget everything. For a connection whose channels have all been
+    # dropped: nothing client-side holds what it declared, so nothing is
+    # re-declared when it reconnects.
+    def clear
+      @exchanges.clear
+      @queues.clear
+      @queue_bindings.clear
+      @exchange_bindings.clear
+      @consumers.clear
+    end
+
     private
 
     def prune_auto_delete_queue(name)

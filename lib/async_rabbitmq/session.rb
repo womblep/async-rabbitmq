@@ -53,6 +53,12 @@ module AsyncRabbitMQ
     # +verify+, +cacertfile+, +certfile+ and +keyfile+ (which build a
     # +tls_context+ unless one is passed explicitly).
     def self.from_uri(*uri_strings, **kwargs)
+      new(**options_from_uris(*uri_strings, **kwargs))
+    end
+
+    # The Session.new keyword arguments for one or more URIs; see from_uri.
+    # Cluster.from_uri builds its nodes from the same list.
+    def self.options_from_uris(*uri_strings, **kwargs)
       raise ArgumentError, "at least one URI string is required" if uri_strings.empty?
 
       first_opts = uri_options(uri_strings.first)
@@ -64,7 +70,7 @@ module AsyncRabbitMQ
       # Connection-level settings come from the first URI; addresses from all.
       opts = first_opts.except(:host, :port)
       opts[:addresses] = address_list
-      new(**opts.merge(kwargs))
+      opts.merge(kwargs)
     end
 
     # Translate an amqp:// or amqps:// URI into Session.new keyword arguments.
@@ -108,6 +114,24 @@ module AsyncRabbitMQ
 
     private_class_method :uri_options, :tls_context_from_uri
 
+    # The canonical [host, port] list from the various input forms.
+    #
+    #   addresses: ["rabbit1:5672", "rabbit2:5673"]    -> [["rabbit1",5672], ["rabbit2",5673]]
+    #   hosts: ["rabbit1", "rabbit2"], port: 5672       -> [["rabbit1",5672], ["rabbit2",5672]]
+    #   host: "rabbit1", port: 5672 (default)           -> [["rabbit1",5672]]
+    def self.address_list(host:, port:, hosts: nil, addresses: nil)
+      if addresses && !addresses.empty?
+        addresses.map do |addr|
+          h, p = addr.to_s.split(":", 2)
+          [h, p ? p.to_i : port]
+        end
+      elsif hosts && !hosts.empty?
+        hosts.map { |h| [h.to_s, port] }
+      else
+        [[host.to_s, port]]
+      end
+    end
+
     def initialize(
       host: "localhost",
       port: 5672,
@@ -138,9 +162,10 @@ module AsyncRabbitMQ
       recover_topology: true,
       topology_recovery_filter: nil,
       instrumenter: nil,
+      notifier: nil,
       logger: Log.new
     )
-      @addresses = build_address_list(host, port, hosts, addresses)
+      @addresses = self.class.address_list(host: host, port: port, hosts: hosts, addresses: addresses)
       @host                 = @addresses.first[0]
       @port                 = @addresses.first[1]
       @hosts_shuffle_strategy = hosts_shuffle_strategy
@@ -169,7 +194,7 @@ module AsyncRabbitMQ
       @recover_topology     = recover_topology
       @topology             = TopologyRegistry.new(filter: topology_recovery_filter)
       @logger               = logger
-      @notifier             = Notifier.new(logger: logger)
+      @notifier             = notifier || Notifier.new(logger: logger)
       @notifier.subscribe { |name, payload| instrumenter.call(name, payload) } if instrumenter
 
       @state             = :closed
@@ -196,6 +221,7 @@ module AsyncRabbitMQ
       @on_recovery_attempt     = nil
       @on_recovery             = nil
       @on_recovery_exhausted   = nil
+      @on_connection_lost      = nil
     end
 
     # Connect and complete AMQP handshake. Raises ConnectionTimeoutError if
@@ -408,6 +434,29 @@ module AsyncRabbitMQ
       @on_recovery_exhausted = block
     end
 
+    # Register a callback invoked when the connection is lost, before
+    # recovery starts (with auto_recover: false, after the channels have
+    # been closed). The block receives the session and the error.
+    def on_connection_lost(&block)
+      @on_connection_lost = block
+    end
+
+    # The channels open or recovering on this connection.
+    def channels
+      @channels.values
+    end
+
+    def channel_count
+      @channels.size
+    end
+
+    # Record a rotated secret for the next connect or reconnect without
+    # sending it: #update_secret does this itself on a live connection.
+    # For a session that is down while the secret rotates.
+    def store_secret(new_secret)
+      @password = new_secret
+    end
+
     # Called by Channel when it closes itself.
     def channel_closed(channel_id)
       @channel_mutex.acquire do
@@ -482,6 +531,7 @@ module AsyncRabbitMQ
         @state = :closed
         conn_error = ConnectionError.new(code: 0, text: "Connection lost: #{error.message}")
         @channels.values.each { |ch| ch.mark_closed!(conn_error) rescue nil }
+        connection_lost(error)
         @frame_io&.stop rescue nil
         return
       end
@@ -513,6 +563,9 @@ module AsyncRabbitMQ
       conn_error = ConnectionError.new(code: 0, text: "Connection lost: #{error.message}")
       @channels.values.each { |ch| ch.mark_recovering!(conn_error) rescue nil }
       @update_secret_condition&.signal(conn_error)
+      # Tell the owner now, while the channels are still in the table: a
+      # Cluster in :drop mode gives them up here, before they are reopened.
+      connection_lost(error)
 
       # Schedule recover_loop BEFORE stopping old frame_io. old_io.stop
       # cancels reader/writer tasks; if we ARE the reader task, cancel raises
@@ -538,22 +591,12 @@ module AsyncRabbitMQ
 
     private
 
-    # Build the canonical [host, port] list from the various input forms.
-    #
-    #   addresses: ["rabbit1:5672", "rabbit2:5673"]    -> [["rabbit1",5672], ["rabbit2",5673]]
-    #   hosts: ["rabbit1", "rabbit2"], port: 5672       -> [["rabbit1",5672], ["rabbit2",5672]]
-    #   host: "rabbit1", port: 5672 (default)           -> [["rabbit1",5672]]
-    def build_address_list(host, port, hosts, addresses)
-      if addresses && !addresses.empty?
-        addresses.map do |addr|
-          h, p = addr.to_s.split(":", 2)
-          [h, p ? p.to_i : port]
-        end
-      elsif hosts && !hosts.empty?
-        hosts.map { |h| [h.to_s, port] }
-      else
-        [[host.to_s, port]]
-      end
+    # Hand the connection-lost callback its error without letting a failure
+    # in it stop recovery.
+    def connection_lost(error)
+      @on_connection_lost&.call(self, error)
+    rescue => e
+      @logger.error("on_connection_lost callback failed: #{e.class}: #{e.message}")
     end
 
     # Return the address list in the order they should be tried for this
