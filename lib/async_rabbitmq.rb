@@ -10,6 +10,7 @@ require_relative "async_rabbitmq/queue"
 require_relative "async_rabbitmq/exchange"
 require_relative "async_rabbitmq/channel"
 require_relative "async_rabbitmq/session"
+require_relative "async_rabbitmq/cluster"
 
 module AsyncRabbitMQ
   # Optional: require "async_rabbitmq/pool" for connection pooling.

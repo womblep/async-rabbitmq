@@ -90,9 +90,7 @@ module AsyncRabbitMQ
     def close
       if recovering?
         # Give the channel up rather than letting recovery reopen it.
-        mark_closed!(NotOpenError.new("Channel #{@channel_id} closed during recovery"))
-        forget_consumers_in_topology
-        @session.channel_closed(@channel_id)
+        drop!(NotOpenError.new("Channel #{@channel_id} closed during recovery"), reason: :user)
         return
       end
       return unless open?
@@ -533,6 +531,16 @@ module AsyncRabbitMQ
     def mark_recovering!(error)
       @state = :recovering
       interrupt_wait!(error)
+    end
+
+    # Give the channel up while the session is recovering, instead of letting
+    # recovery reopen it: everything waiting or parked raises +error+, #each
+    # callers return, the consumers are forgotten and the id goes back.
+    def drop!(error, reason: :dropped)
+      mark_closed!(error)
+      forget_consumers_in_topology
+      @session.channel_closed(@channel_id)
+      instrument("channel.closed") { { channel: @channel_id, reason: reason } }
     end
 
     # The connection is gone for good: recovery disabled, exhausted, refused,

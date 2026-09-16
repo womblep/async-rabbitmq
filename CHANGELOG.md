@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `AsyncRabbitMQ::Cluster`: one connection to every node of a cluster behind the Session API,
+  for a process with a channel per client. Each new channel opens on the node with the fewest;
+  a node that is down is retried until it is back and then takes new channels until the counts
+  are level. `on_node_down:` decides what a lost node's channels do: `:park` (wait, as a Session
+  does), `:drop` (close them at once so their fibers move to another node) or a callable that
+  closes the ones to drop. With `:drop` the lost connection's topology is forgotten
+  (`clear_topology_on_drop: true`). `on_node_down` / `on_node_up` callbacks.
+- `Session#on_connection_lost`, `Session#channels`, `Session#channel_count`,
+  `Session#store_secret`, and a `notifier:` option to share one `Notifier` between sessions.
+- `channel.closed` events for a channel given up during recovery: `reason: :dropped`, or `:user`
+  when the application closed it.
+
 ## [0.2.0] - 2026-09-14
 
 Review against Bunny 3.3 / amq-protocol 2.9 and RabbitMQ 4.3 (issues #21–#42).
