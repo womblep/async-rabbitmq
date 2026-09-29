@@ -119,9 +119,12 @@ module AsyncRabbitMQ
 
           tracer.in_span("#{Helpers.destination(exchange, routing_key)} publish",
                          attributes: otel_attributes(exchange, routing_key), kind: :producer) do
-            headers = (opts[:headers] ||= {})
+            # Copy: inject writes traceparent into this hash, and opts[:headers]
+            # is the caller's own object — a frozen constant would raise, and a
+            # hash shared between fibers would race.
+            headers = (opts[:headers] || {}).dup
             ::OpenTelemetry.propagation.inject(headers)
-            super(payload, exchange: exchange, routing_key: routing_key, **opts)
+            super(payload, exchange: exchange, routing_key: routing_key, **opts.merge(headers: headers))
           end
         end
 
@@ -133,9 +136,9 @@ module AsyncRabbitMQ
           attributes["messaging.batch.message_count"] = payloads.is_a?(Array) ? payloads.size : 0
           tracer.in_span("#{Helpers.destination(exchange, routing_key)} publish",
                          attributes: attributes, kind: :producer) do
-            headers = (opts[:headers] ||= {})
+            headers = (opts[:headers] || {}).dup
             ::OpenTelemetry.propagation.inject(headers)
-            super(payloads, exchange: exchange, routing_key: routing_key, **opts)
+            super(payloads, exchange: exchange, routing_key: routing_key, **opts.merge(headers: headers))
           end
         end
 

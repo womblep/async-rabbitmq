@@ -69,7 +69,7 @@ RSpec.describe AsyncRabbitMQ::Cluster do
   end
 
   it "presents every public Session method" do
-    internal = %i[channel_closed reopen_channel queue_renamed trigger_recovery]
+    internal = %i[channel_closed reopen_channel queue_renamed trigger_recovery spawn_background]
     expected = AsyncRabbitMQ::Session.public_instance_methods(false) - internal
     missing  = expected.reject { |m| described_class.method_defined?(m) }
     expect(missing).to eq([])

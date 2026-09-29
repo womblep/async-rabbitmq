@@ -161,6 +161,30 @@ module AsyncRabbitMQ
       @consumers.clear
     end
 
+    # Forget only what was tied to the connection that just went: exclusive
+    # and auto-delete queues, server-named queues (whose names are gone with
+    # the connection), auto-delete exchanges, and any binding that referred to
+    # them. Durable topology is kept, so a broker that also lost it — a node
+    # restarted from an empty data directory — still has it re-declared.
+    def clear_transient
+      dropped_queues = @queues.each_value
+                              .select { |q| q.exclusive || q.auto_delete || q.server_named }
+                              .map(&:name)
+      dropped_exchanges = @exchanges.each_value.select(&:auto_delete).map(&:name)
+
+      dropped_queues.each    { |name| @queues.delete(name) }
+      dropped_exchanges.each { |name| @exchanges.delete(name) }
+
+      @queue_bindings.reject! do |b|
+        dropped_queues.include?(b.queue) || dropped_exchanges.include?(b.exchange)
+      end
+      @exchange_bindings.reject! do |b|
+        dropped_exchanges.include?(b.source) || dropped_exchanges.include?(b.destination)
+      end
+      # Consumers belong to the channels that were dropped with the connection.
+      @consumers.clear
+    end
+
     private
 
     def prune_auto_delete_queue(name)

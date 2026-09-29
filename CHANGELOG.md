@@ -2,6 +2,87 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+Reliability review against a payments workload. The two delivery-correctness items
+(stale acks, empty bodies) are the reason to take this.
+
+### Fixed
+
+- **Acks are no longer applied to the wrong message after a reconnect.** Delivery tags are
+  scoped to a channel on a connection: the broker restarts numbering at 1 when a channel is
+  reopened. A handler still running when the connection dropped would ack that number against
+  the new channel, acknowledging a message it never processed (a whole range of them with
+  `multiple: true`), or draw a 406 that closed the channel and took its consumers with it.
+  Deliveries now carry a `VersionedDeliveryTag`, and `basic_ack` / `basic_nack` / `basic_reject`
+  drop a tag from an earlier generation and return `false`.
+- **A message with an empty body no longer hangs the channel.** Neither RabbitMQ nor
+  amq-protocol sends a body frame when the body is zero bytes, so the delivery never completed
+  and the next method frame on that channel was taken as its content — a handler called with
+  garbage and a lost delivery. Zero-length content is now routed on its header.
+- **A half-dead connection is detected in heartbeat time rather than in TCP retransmit time.**
+  The heartbeat task wrote before it checked liveness, and that write needs the socket lock, so
+  a writer parked in `@socket.write` after a partition blocked the heartbeat too and nothing
+  noticed for around 15 minutes. Liveness is checked first, the write is bounded, and
+  `TCP_USER_TIMEOUT` is set where the platform has it.
+- **TLS connections no longer strand a TCP socket per reconnect.** `sync_close` was never set,
+  so closing the SSL socket left its transport open until the GC ran.
+- **A second connection drop during recovery no longer closes channels permanently.**
+  `@recovery_in_progress` was cleared before channels were reopened, so a drop in that window
+  started a competing recovery while the first was still failing channels through `mark_closed!`.
+  Channels are now left `:recovering` and reopened by the next attempt. A `frame_io` that a later
+  attempt has replaced no longer reports its dying socket as the live connection's.
+- **A consumer block that raises no longer stalls the consumer.** The delivery stayed unacked
+  for the life of the connection, and once `prefetch` messages were stuck that way nothing more
+  arrived. Handlers are wrapped: the delivery is nacked (`requeue: false`, so a poison message
+  dead-letters instead of looping) and `Channel#on_handler_error` is called.
+- **An RPC timeout no longer leaves the channel out of step.** AMQP replies carry nothing to
+  match them to a request, so a reply that arrived after the caller gave up went to whoever
+  asked next. The channel is closed and reopened, the late reply discarded, and its consumers
+  re-registered.
+- **Background loops survive the task that started them.** Channel dispatch, the heartbeat and
+  the channel-0 monitor were children of whichever task opened the channel; a short-lived caller
+  took its dispatch loop down with it while the channel still reported itself open. The same
+  applied to every node's supervisor in a `Cluster`.
+- **The frame writer starts recovery on a non-IO error** instead of exiting quietly and leaving
+  publishers blocked once the write queue filled.
+- **`Cluster#update_secret` cannot leave nodes on different secrets.** One node raising skipped
+  every node after it. The secret is stored everywhere first, each node is then attempted, and
+  the failures are raised together as `ClusterError`.
+- **OpenTelemetry no longer writes into the caller's headers hash** — a frozen hash raised, and
+  one shared between fibers raced. The hash is copied before `traceparent` is injected.
+- **`Notifier#publish` iterates a snapshot**, so a subscriber that unsubscribes itself no longer
+  causes the next subscriber to be skipped.
+
+### Added
+
+- `Channel#on_handler_error` — called when a consumer block raises, with the exception, the
+  `Basic::Deliver` frame and the queue name.
+- `Channel#wait_for_confirms(timeout:)` — raises `ConfirmTimeoutError` instead of waiting
+  forever for a broker that accepts a publish and never confirms it. Unbounded by default.
+- `Channel#unconfirmed_messages` — the publishes the broker has not resolved, as
+  `UnconfirmedMessage` records carrying the payload and its routing, so they can be republished
+  on another connection. A `Cluster#on_node_down` block that declares a fourth parameter is
+  handed them; under `:drop` that is the only chance to see them.
+- `Session.new(tcp_user_timeout:)` — milliseconds, defaulting to twice the heartbeat.
+- `TopologyRegistry#clear_transient`.
+
+### Changed
+
+- **`delivery_tag` is a `VersionedDeliveryTag`, not an `Integer`.** It converts (`to_int`),
+  compares, sorts, hashes and prints as the integer it wraps, so `basic_ack(di.delivery_tag)`,
+  comparisons and array membership are unaffected. Code calling `.is_a?(Integer)` on it, or
+  serialising it directly, needs `.to_i`.
+- **`clear_topology_on_drop:` now clears only what the lost connection owned** — exclusive,
+  auto-delete and server-named queues, auto-delete exchanges, and the bindings that referred to
+  them. Durable topology is kept, so a node that comes back from an empty data directory still
+  has it re-declared. Previously the whole registry for that node was dropped.
+- `basic_ack`, `basic_nack` and `basic_reject` return `true` when sent and `false` when the tag
+  was stale, where they previously returned the write's result.
+- `Channel#basic_consume` warns once per channel when called without a prior `basic_qos`: the
+  broker sends the whole queue as fast as it can and one task is created per delivery, so memory
+  tracks queue depth rather than concurrency.
+
 ## [0.3.0] - 2026-09-16
 
 ### Added

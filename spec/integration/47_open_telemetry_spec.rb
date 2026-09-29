@@ -36,6 +36,39 @@ RSpec.describe "OpenTelemetry tracing", :integration do
     spans.find { |span| span.name.end_with?(suffix) }
   end
 
+  it "injects traceparent without writing into the caller's headers hash" do
+    isolated_session do |session, _|
+      channel = session.open_channel
+      queue   = channel.durable_queue("test.otel.frozen.#{SecureRandom.hex(4)}")
+
+      # A headers hash the caller owns and reuses. Injecting into it directly
+      # would raise here, and would leak traceparent into later publishes.
+      caller_headers = { "tenant" => "acme" }.freeze
+
+      expect { channel.basic_publish("x", routing_key: queue.name, headers: caller_headers) }
+        .not_to raise_error
+      expect(caller_headers).to eq({ "tenant" => "acme" })
+
+      # The message still carries the trace context.
+      sleep 0.2
+      _di, header, = channel.basic_get(queue.name, manual_ack: false)
+      expect(header.properties[:headers]).to include("tenant" => "acme")
+      expect(header.properties[:headers]).to have_key("traceparent")
+    end
+  end
+
+  it "does not let a batch publish write into the caller's headers either" do
+    isolated_session do |session, _|
+      channel = session.open_channel
+      queue   = channel.durable_queue("test.otel.frozenbatch.#{SecureRandom.hex(4)}")
+      caller_headers = { "tenant" => "acme" }.freeze
+
+      expect { channel.basic_publish_batch(%w[a b], routing_key: queue.name, headers: caller_headers) }
+        .not_to raise_error
+      expect(caller_headers).to eq({ "tenant" => "acme" })
+    end
+  end
+
   it "traces a publish as a producer span with the Bunny attribute set" do
     isolated_session do |session, _|
       channel  = session.open_channel

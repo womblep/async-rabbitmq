@@ -70,7 +70,9 @@ module AsyncRabbitMQ
 
     # Called by Instrumented#instrument once the payload exists.
     def publish(name, payload)
-      @subscribers.each do |(pattern, block)|
+      # Snapshot: a subscriber that unsubscribes itself (or another) mutates
+      # @subscribers under the iterator, which skips the next one along.
+      @subscribers.dup.each do |(pattern, block)|
         next unless match?(pattern, name)
 
         begin
