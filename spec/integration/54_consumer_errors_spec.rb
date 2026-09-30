@@ -86,6 +86,57 @@ RSpec.describe "consumer error handling", :integration do
     end
   end
 
+  it "does not nack again when the handler already acked and then raised" do
+    isolated_session do |session, _|
+      ch = session.open_channel
+      ch.basic_qos(prefetch_count: 5)
+      qname = "test.handler.acked.#{SecureRandom.hex(4)}"
+      q = ch.queue(qname, durable: true)
+
+      seen = []
+      ch.basic_consume(qname, manual_ack: true) do |di, _h, body|
+        seen << body
+        ch.basic_ack(di.delivery_tag)
+        raise "raised after acking"     # e.g. post-processing blew up
+      end
+
+      ch.basic_publish("a", routing_key: qname)
+      wait_until { seen.include?("a") }
+      sleep 0.5
+
+      # Nacking a tag the broker has already resolved is a 406, which would
+      # close the channel and take the consumer with it.
+      expect(ch.open?).to be true
+
+      ch.basic_publish("b", routing_key: qname)
+      wait_until { seen.include?("b") }
+      expect(seen).to eq(%w[a b])
+      ch.close
+    end
+  end
+
+  it "still nacks when the handler rejected the message itself and then raised" do
+    isolated_session do |session, _|
+      ch = session.open_channel
+      ch.basic_qos(prefetch_count: 5)
+      qname = "test.handler.rejected.#{SecureRandom.hex(4)}"
+      q = ch.queue(qname, durable: true)
+
+      seen = []
+      ch.basic_consume(qname, manual_ack: true) do |di, _h, body|
+        seen << body
+        ch.basic_reject(di.delivery_tag, requeue: false)
+        raise "raised after rejecting"
+      end
+
+      ch.basic_publish("x", routing_key: qname)
+      wait_until { !seen.empty? }
+      sleep 0.5
+      expect(ch.open?).to be true
+      ch.close
+    end
+  end
+
   it "does not nack an auto-ack delivery" do
     isolated_session do |session, _|
       ch = session.open_channel

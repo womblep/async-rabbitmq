@@ -123,7 +123,109 @@ RSpec.describe "reliability gaps", :integration do
     end
   end
 
+  describe "unconfirmed messages" do
+    it "keeps the publish options so they can be sent again elsewhere" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        qname = "test.unconfirmed.opts.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.confirm_select
+
+        # Stop confirms resolving so the record stays outstanding to inspect.
+        allow(ch).to receive(:handle_confirm_ack)
+
+        ch.basic_publish("body", routing_key: qname, persistent: true,
+                         headers: { "tenant" => "acme" }, message_id: "m-1",
+                         correlation_id: "c-1")
+        sleep 0.3
+
+        msg = ch.unconfirmed_messages.first
+        expect(msg).not_to be_nil
+        expect(msg.payload).to eq("body")
+        expect(msg.routing_key).to eq(qname)
+        # Without these a republish on another node silently downgrades the
+        # message: no persistence, no headers, no correlation.
+        expect(msg.options[:persistent]).to be true
+        expect(msg.options[:headers]).to eq("tenant" => "acme")
+        expect(msg.options[:message_id]).to eq("m-1")
+        expect(msg.options[:correlation_id]).to eq("c-1")
+      end
+    end
+  end
+
+  describe "recovery retry after a drop mid-reopen" do
+    it "tears the half-built connection down before going round again" do
+      isolated_session(recovery_interval: 0.2, recovery_max_interval: 0.3) do |session, _|
+        session.open_channel
+
+        states = []
+        stopped = []
+        first = true
+
+        # Fail the first reopen the way a drop mid-reopen does.
+        allow(session).to receive(:reopen_channels).and_wrap_original do |orig, *args|
+          if first
+            first = false
+            io = session.instance_variable_get(:@frame_io)
+            allow(io).to receive(:stop).and_wrap_original { |m, *a| stopped << io; m.call(*a) }
+            false
+          else
+            orig.call(*args)
+          end
+        end
+
+        watcher = Async do
+          200.times { states << session.instance_variable_get(:@state); sleep 0.02 }
+        end
+
+        session.trigger_recovery(AsyncRabbitMQ::ConnectionError.new(code: 0, text: "forced"))
+        wait_until(20) { session.open? }
+        watcher.stop
+
+        # While retrying it must not advertise itself as open: a Cluster would
+        # place new channels on a connection that is already dead.
+        expect(states).to include(:recovering)
+        expect(stopped).not_to be_empty
+        expect(session.instance_variable_get(:@channel0_task)).not_to be_nil
+      end
+    end
+  end
+
   describe "background loops" do
+    it "keeps the connection alive after the task that called connect has finished" do
+      vhost = "test-#{SecureRandom.hex(6)}"
+      create_vhost(vhost)
+      session = nil
+
+      # connect inside a task that is then STOPPED. Async stops a task's
+      # children with it, so if the reader and writer hang off the connect
+      # caller they die here and the connection is silently dead while the
+      # session still reports itself open.
+      Async do |task|
+        inner = task.async do
+          session = AsyncRabbitMQ::Session.new(host: RABBITMQ_HOST, port: RABBITMQ_PORT, vhost: vhost)
+          session.connect
+          sleep 30                    # keep the task alive until it is stopped
+        end
+        wait_until(10) { session&.open? }
+        inner.stop
+      end.wait
+      sleep 0.2
+
+      expect(session.open?).to be true
+
+      # The connection still works, which means the reader and writer survived.
+      ch = session.open_channel
+      qname = "test.connparent.#{SecureRandom.hex(4)}"
+      ch.queue(qname, durable: true)
+      ch.basic_publish("still alive", routing_key: qname)
+      sleep 0.3
+      expect(ch.basic_get(qname, manual_ack: false)[2]).to eq("still alive")
+    ensure
+      session&.close rescue nil
+      delete_vhost(vhost) rescue nil
+    end
+
     it "keeps consuming after the task that opened the channel has finished" do
       isolated_session do |session, _|
         qname = "test.taskparent.#{SecureRandom.hex(4)}"

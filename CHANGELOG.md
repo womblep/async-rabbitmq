@@ -38,14 +38,26 @@ Reliability review against a payments workload. The two delivery-correctness ite
   dead-letters instead of looping) and `Channel#on_handler_error` is called.
 - **An RPC timeout no longer leaves the channel out of step.** AMQP replies carry nothing to
   match them to a request, so a reply that arrived after the caller gave up went to whoever
-  asked next. The channel is closed and reopened, the late reply discarded, and its consumers
-  re-registered.
-- **Background loops survive the task that started them.** Channel dispatch, the heartbeat and
-  the channel-0 monitor were children of whichever task opened the channel; a short-lived caller
-  took its dispatch loop down with it while the channel still reported itself open. The same
-  applied to every node's supervisor in a `Cluster`.
+  asked next. The channel is closed and reopened, the late reply discarded, its unconfirmed
+  publishes replayed (which is also what resets the client's confirm tag counter to match the
+  broker, since it restarts at 1 on the reopened channel), and its consumers re-registered.
+  The channel reports `resyncing?` for the duration and parks other fibers, so nothing publishes
+  onto a channel that is closing — the broker would drop it silently — and no other request has
+  its reply discarded. Confirms that arrive during the window are still applied.
+- **A handler that acks and then raises no longer closes the channel.** The automatic nack was
+  unconditional, so a delivery the handler had already settled was nacked a second time: a 406
+  that closed the channel and took its consumers with it. Settled deliveries are tracked and
+  skipped.
+- **Background loops survive the task that started them.** Channel dispatch, the heartbeat, the
+  channel-0 monitor, the frame reader and writer, the recovery loop and every `Cluster` node
+  supervisor were children of whichever task opened the channel or called `connect`. A
+  short-lived caller took them down with it while the session still reported itself open. They
+  are parented at the reactor instead.
 - **The frame writer starts recovery on a non-IO error** instead of exiting quietly and leaving
   publishers blocked once the write queue filled.
+- **Recovery that has to retry tears down the half-built connection first.** A drop while
+  channels were being reopened left the session reporting `:open` (so a `Cluster` would place new
+  channels on a dead node), left the socket open, and leaked a channel-0 monitor fiber per flap.
 - **`Cluster#update_secret` cannot leave nodes on different secrets.** One node raising skipped
   every node after it. The secret is stored everywhere first, each node is then attempted, and
   the failures are raised together as `ClusterError`.
@@ -61,10 +73,13 @@ Reliability review against a payments workload. The two delivery-correctness ite
 - `Channel#wait_for_confirms(timeout:)` — raises `ConfirmTimeoutError` instead of waiting
   forever for a broker that accepts a publish and never confirms it. Unbounded by default.
 - `Channel#unconfirmed_messages` — the publishes the broker has not resolved, as
-  `UnconfirmedMessage` records carrying the payload and its routing, so they can be republished
-  on another connection. A `Cluster#on_node_down` block that declares a fourth parameter is
+  `UnconfirmedMessage` records carrying the payload, its routing and the publish options
+  (`persistent`, `headers`, `message_id`, `correlation_id`, ...), so they can be republished on
+  another connection without silently losing their properties. A `Cluster#on_node_down` block that declares a fourth parameter is
   handed them; under `:drop` that is the only chance to see them.
 - `Session.new(tcp_user_timeout:)` — milliseconds, defaulting to twice the heartbeat.
+- `Channel#resyncing?` — true while the channel is being closed and reopened after an RPC
+  timeout. Operations park until it is back, as they do during connection recovery.
 - `TopologyRegistry#clear_transient`.
 
 ### Changed
