@@ -75,6 +75,24 @@ module AsyncRabbitMQ
     end
   end
 
+  # Raised when a cluster-wide operation did not succeed on every node, e.g.
+  # a credential rotation that some nodes refused. The message names which.
+  class ClusterError < Error; end
+
+  # Raised by Channel#wait_for_confirms(timeout:) when the broker has not
+  # confirmed every outstanding publish in time. The messages named by
+  # #unconfirmed_tags are in an unknown state: the broker may still have them.
+  class ConfirmTimeoutError < Error
+    attr_reader :unconfirmed_tags, :channel_id
+
+    def initialize(msg = nil, unconfirmed_tags: [], channel_id: nil)
+      @unconfirmed_tags = unconfirmed_tags
+      @channel_id       = channel_id
+      super(msg || "Broker did not confirm #{unconfirmed_tags.size} message(s) on channel " \
+                   "#{channel_id} in time: tags #{unconfirmed_tags.inspect}")
+    end
+  end
+
   # Raised when the broker does not answer a synchronous channel operation
   # (queue.declare, basic.consume, ...) within the session's rpc_timeout.
   # Bunny calls this a continuation timeout.

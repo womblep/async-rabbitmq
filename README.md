@@ -141,7 +141,48 @@ ch.each("q") { |delivery, header, body| ... }   # blocks until the consumer or c
 ```
 
 Consumer handlers run in their own fibers, at most `pool_size` at a time per
-channel.
+channel. Set `basic_qos` before `basic_consume`: without a prefetch limit the
+broker sends the whole queue as fast as it can and one fiber is created per
+delivery, so memory tracks queue depth rather than concurrency. The client
+warns once per channel if you don't.
+
+### Acknowledging, and delivery tags across a reconnect
+
+`delivery.delivery_tag` is a `VersionedDeliveryTag`: the broker's tag plus the
+generation of the channel it arrived on. It converts (`to_int`), compares,
+sorts, hashes and prints as the integer it wraps, so passing it to
+`basic_ack`, comparing it or putting it in a collection all work unchanged.
+Call `.to_i` if you need a real `Integer` — to serialise it, or where something
+tests `is_a?(Integer)`.
+
+The generation is what makes an ack safe across a reconnect. Delivery tags are
+scoped to a channel on a connection, and the broker restarts numbering at 1
+when a channel is reopened, so a handler that was still running when the
+connection dropped would otherwise acknowledge whichever message now holds that
+number:
+
+```ruby
+ch.basic_qos(prefetch_count: 10)
+ch.basic_consume("q", manual_ack: true) do |delivery, _header, body|
+  handle(body)                              # may outlive the connection
+  ch.basic_ack(delivery.delivery_tag)       # => false if the connection went; nothing is sent
+end
+```
+
+`basic_ack`, `basic_nack` and `basic_reject` return `true` when the frame was
+sent and `false` when the tag belonged to an earlier generation and was
+dropped. A dropped ack is not a lost message: the broker requeued it when the
+channel went, and it is redelivered on the new connection.
+
+When a handler raises, the delivery is nacked with `requeue: false` — so a
+message that always fails dead-letters instead of looping — and
+`on_handler_error` is called:
+
+```ruby
+ch.on_handler_error do |error, delivery, queue_name|
+  Sentry.capture_exception(error, extra: { queue: queue_name })
+end
+```
 
 ### RabbitMQ 4.2+ and transient queues
 
@@ -166,7 +207,15 @@ ch.unconfirmed_tags
 ch.confirm_select(tracking: true, outstanding_limit: 1000)
 # publishes park while 1000 messages are unconfirmed (backpressure);
 # wait_for_confirms raises AsyncRabbitMQ::MessageNacked on a nack.
+
+ch.wait_for_confirms(timeout: 5)           # ConfirmTimeoutError instead of waiting forever
+ch.unconfirmed_messages                    # what the broker has not resolved, with payload and routing
 ```
+
+`wait_for_confirms` waits indefinitely by default. Pass `timeout:` if a broker
+that accepts a publish and then never confirms it should raise
+`ConfirmTimeoutError` (which carries `unconfirmed_tags`) rather than park the
+fiber for good.
 
 Messages published under confirms are kept until the broker acks them. If
 the connection drops first they are re-published on the recovered channel
@@ -251,7 +300,9 @@ All errors derive from `AsyncRabbitMQ::Error`: `ConnectionTimeoutError`
 connection or it was lost), `ChannelError` (`code`, `text`, `channel_id`,
 `close_method`, plus `delivery_ack_timeout?`, `unknown_delivery_tag?`,
 `message_too_large?`), `NotOpenError`, `RpcTimeoutError`, `MessageNacked`
-(`nacked_tags`), `HeartbeatTimeoutError`, `ChannelLimitError` (every id up to
+(`nacked_tags`), `ConfirmTimeoutError` (`unconfirmed_tags`, `channel_id`),
+`ClusterError` (a cluster-wide operation that did not succeed on every node),
+`HeartbeatTimeoutError`, `ChannelLimitError` (every id up to
 the negotiated `channel_max` is in use; the broker would otherwise have closed
 the connection). Channel ids are reused as channels close, so opening a
 channel per unit of work is fine for the life of the connection.
@@ -366,11 +417,16 @@ cluster = AsyncRabbitMQ::Cluster.new(
   addresses: %w[rabbit1:5672 rabbit2:5672 rabbit3:5672],   # one connection each
   username: "app", password: secret,
   on_node_down: :drop,            # :park (default), :drop, or ->(session, channels, error) { ... }
-  clear_topology_on_drop: true    # with :drop, forget what the lost connection had declared
+  clear_topology_on_drop: true    # with :drop, forget the lost connection's transient topology
 )
 cluster.connect                   # every node, concurrently; the ones that are down are retried in the background
 channel = cluster.open_channel    # on the node with the fewest channels
 cluster.on_node_down { |session, channels, error| ... }
+# declare a fourth parameter to also receive the publishes the broker never
+# confirmed, so they can be sent again on another node:
+cluster.on_node_down do |session, channels, error, unconfirmed|
+  unconfirmed.each { |m| elsewhere.basic_publish(m.payload, exchange: m.exchange, routing_key: m.routing_key) }
+end
 cluster.on_node_up   { |session| ... }
 ```
 
@@ -381,9 +437,12 @@ node when it returns. `:drop` closes them at once: calls in flight raise
 the fibers using them can open a new channel, which lands on a node that is up.
 A callable receives the node's session, its channels and the error while the
 channels are parked, and closes the ones it wants dropped; the rest wait. With
-`:drop` the lost connection's topology registry is cleared as well
-(`clear_topology_on_drop: true`), so nothing is re-declared when the node
-returns; `false` keeps the usual registry rules. Publishing and shared durable
+`:drop` the lost connection's transient topology is forgotten as well
+(`clear_topology_on_drop: true`): exclusive, auto-delete and server-named
+queues, auto-delete exchanges, and the bindings that referred to them. Durable
+exchanges, queues and bindings are kept, so a node that comes back from an
+empty data directory still has them re-declared; `false` keeps the usual
+registry rules. Publishing and shared durable
 topology are expected to live on a plain `Session` alongside: the cluster is
 for the mass of per-client channels.
 
@@ -395,7 +454,9 @@ with `AuthenticationError` if a node refuses the credentials. Nodes that are
 down at startup, or later, are retried with the recovery backoff.
 `open?` is true while any node is; `close` closes them all. `open_channel`,
 `with_channel`, `queue_exists?` and `exchange_exists?` use the least loaded
-node; `update_secret` reaches every node, stored for the ones that are down.
+node; `update_secret` stores the new secret on every node first and then updates each
+one that is up, so a node that refuses it cannot leave the nodes after it on
+the old credential; failures are raised together as `ClusterError`.
 The `on_*` callbacks fire for every node with that node's `Session`, `on_event`
 sees every node's events (each carries `host` and `port`), `topology` is a
 read-only view over every node's registry, and `host` and `port` are the first

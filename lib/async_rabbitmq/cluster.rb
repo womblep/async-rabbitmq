@@ -123,9 +123,14 @@ module AsyncRabbitMQ
       pending  = @sessions.size
       errors   = {}
       reported = Async::Condition.new
-      root     = Async::Task.current
+      # Parent the per-node supervisors at the reactor, not at whichever task
+      # called connect. A caller that finishes, or is stopped, would otherwise
+      # take every node's supervisor down with it — and with them the retry
+      # loop that brings a node back — without raising anything. Transient so
+      # they never hold the reactor open on their own; #close stops them.
+      root = Async::Task.current.root
       @sessions.each do |session|
-        @supervisors[session] = root.async do
+        @supervisors[session] = root.async(transient: true) do
           supervise(session) do |error|
             errors[session] = error
             pending -= 1
@@ -165,6 +170,10 @@ module AsyncRabbitMQ
       @closed = true
       @sessions.each { |s| s.close rescue nil }
       @wakeups.values.each { |c| c.signal rescue nil }
+      # The supervisors are parented at the reactor, so dropping the references
+      # would not stop them; a node still in its retry backoff would keep
+      # reconnecting after the cluster was closed.
+      @supervisors.each_value { |task| task.stop rescue nil }
       @supervisors.clear
     end
 
@@ -193,9 +202,32 @@ module AsyncRabbitMQ
 
     # Rotate the secret on every node: sent to the connected ones, stored for
     # the next connect on the ones that are down.
+    # Rotate the credential on every node. The new secret is stored on all of
+    # them first, so a node that refuses the live update — or is down — still
+    # reconnects with the new secret rather than the old one. Every node is
+    # attempted; the failures are collected and raised together, so one bad
+    # node cannot leave the ones after it on the previous secret.
     def update_secret(new_secret, reason = "secret update")
       raise NotOpenError, "No cluster node is connected" unless open?
-      @sessions.each { |s| s.open? ? s.update_secret(new_secret, reason) : s.store_secret(new_secret) }
+
+      @sessions.each { |s| s.store_secret(new_secret) }
+
+      errors = {}
+      @sessions.each do |s|
+        next unless s.open?
+
+        begin
+          s.update_secret(new_secret, reason)
+        rescue => e
+          errors[s] = e
+        end
+      end
+
+      unless errors.empty?
+        detail = errors.map { |s, e| "#{s.host}:#{s.port} (#{e.class}: #{e.message})" }.join(", ")
+        raise ClusterError, "update_secret failed on #{errors.size} of #{@sessions.size} node(s): #{detail}"
+      end
+
       true
     end
 
@@ -253,7 +285,10 @@ module AsyncRabbitMQ
 
     # Register a callback invoked when a node's connection is lost, after the
     # +on_node_down:+ policy has been applied. The block receives the node's
-    # Session, the channels that were on it and the error.
+    # Session, the channels that were on it and the error; declare a fourth
+    # parameter to also receive the UnconfirmedMessage records the broker never
+    # acked, so they can be republished on another node. Under +:drop+ that is
+    # the only chance to see them.
     def on_node_down(&block)
       @on_node_down = block
     end
@@ -349,6 +384,10 @@ module AsyncRabbitMQ
 
     def node_down(session, error)
       channels = session.channels
+      # Collected before the policy runs: :drop discards the channels, and
+      # with them any record of what the broker never confirmed.
+      unconfirmed = channels.flat_map { |ch| ch.unconfirmed_messages rescue [] }
+
       begin
         case @on_node_down_policy
         when :park then nil
@@ -359,13 +398,28 @@ module AsyncRabbitMQ
         @logger.error("on_node_down failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
       end
       @on_connection_lost&.call(session, error)
-      @on_node_down&.call(session, channels, error)
+      notify_node_down(session, channels, error, unconfirmed)
+    end
+
+    # on_node_down took three arguments before unconfirmed messages were passed
+    # to it, so a block that declares three still works.
+    def notify_node_down(session, channels, error, unconfirmed)
+      return unless @on_node_down
+
+      if @on_node_down.arity >= 0 && @on_node_down.arity <= 3
+        @on_node_down.call(session, channels, error)
+      else
+        @on_node_down.call(session, channels, error, unconfirmed)
+      end
     end
 
     def drop_channels(session, channels, error)
       lost = ConnectionError.new(code: 0, text: "Connection to #{session.host}:#{session.port} lost: #{error.message}")
       channels.each { |ch| ch.drop!(lost) }
-      session.topology.clear if @clear_topology_on_drop
+      # Only what was tied to this connection. Durable exchanges, queues and
+      # bindings stay recorded: if this node comes back from an empty data
+      # directory they still need re-declaring.
+      session.topology.clear_transient if @clear_topology_on_drop
       @logger.info("Dropped #{channels.size} channel(s) on #{session.host}:#{session.port}")
     end
 

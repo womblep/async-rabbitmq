@@ -9,6 +9,15 @@ module AsyncRabbitMQ
   # Duck-typed stream interface: #each (yields deliveries) and #write (publishes).
   # Does NOT inherit Async::IO::Stream — a channel is logical, not physical IO.
   class Channel
+    # A message published under confirms whose fate is unknown: the broker
+    # neither acked nor nacked it before the connection went. +payload+ and its
+    # routing are kept so it can be published again on another connection.
+    UnconfirmedMessage = Struct.new(:delivery_tag, :payload, :exchange, :routing_key, keyword_init: true)
+
+    # Fallback bound on the wait for channel.close-ok while resynchronising
+    # after an RPC timeout, used when the session has no rpc_timeout set.
+    RESYNC_TIMEOUT = 5
+
     include Instrumented
 
     attr_reader :channel_id, :pool_size
@@ -32,7 +41,8 @@ module AsyncRabbitMQ
       @each_waiters      = {}        # consumer_tag => Async::Condition, fibers blocked in #each
       @return_handler    = nil
       @delivery_tag      = 0
-      @pending_confirms  = {}        # delivery_tag => delivery_tag, awaiting basic.ack/nack
+      @pending_confirms  = {}        # delivery_tag => encoded frames, awaiting basic.ack/nack
+      @unconfirmed_meta  = {}        # delivery_tag => UnconfirmedMessage, for on_node_down
       @nacked_tags       = []        # tags the broker rejected since confirm_select (Bunny: nacked_set)
       @only_acks         = true      # false once a nack arrives; read and reset by wait_for_confirms
       @confirms_enabled  = false
@@ -46,6 +56,14 @@ module AsyncRabbitMQ
       @flow_active       = true
       @on_cancel         = nil
       @on_error          = nil
+      @on_handler_error  = nil
+      @resyncing         = false
+      @resync_condition  = nil
+      # Incremented on every reopen (connection recovery or a single-channel
+      # reopen). Delivery tags are stamped with it so acks raised against a
+      # previous generation can be dropped instead of hitting a live message.
+      @delivery_generation = 0
+      @qos_warned        = false
       @mutex             = Async::Semaphore.new(1)
       @publish_sem       = Async::Semaphore.new(1)   # one publish's frames go out contiguously
       @rpc_sem           = Async::Semaphore.new(1)   # one request/reply in flight per channel
@@ -260,7 +278,7 @@ module AsyncRabbitMQ
         assert_open!
         wait_for_outstanding_slot(1)
         @frame_io.write_frame(bytes, publish: true)
-        reserve_confirm_tag(bytes) if @confirms_enabled
+        reserve_confirm_tag(bytes, payload, exchange, routing_key) if @confirms_enabled
       end
       instrument("message.published") do
         { channel: @channel_id, exchange: exchange, routing_key: routing_key, count: 1,
@@ -286,7 +304,9 @@ module AsyncRabbitMQ
         assert_open!
         wait_for_outstanding_slot(encoded.size)
         @frame_io.write_frame(encoded.join, publish: true)
-        encoded.map { |bytes| reserve_confirm_tag(bytes) } if @confirms_enabled
+        if @confirms_enabled
+          payloads.each_with_index.map { |p, i| reserve_confirm_tag(encoded[i], p, exchange, routing_key) }
+        end
       end
       instrument("message.published") do
         { channel: @channel_id, exchange: exchange, routing_key: routing_key, count: encoded.size,
@@ -304,6 +324,7 @@ module AsyncRabbitMQ
         assert_open!
         @frame_io.write_frame(AMQ::Protocol::Basic::Get.encode(@channel_id, queue_name, !manual_ack).encode)
         m = wait_for_any(AMQ::Protocol::Basic::GetOk, AMQ::Protocol::Basic::GetEmpty)
+        stamp_delivery_tag(m) if m.is_a?(AMQ::Protocol::Basic::GetOk)
         # After GetOk the content header + body follow on this channel.
         [m, m.is_a?(AMQ::Protocol::Basic::GetOk) ? wait_content : nil]
       end
@@ -312,25 +333,34 @@ module AsyncRabbitMQ
       [msg, content[:header], content[:body]]
     end
 
+    # Acknowledge a delivery. Returns true if the ack was sent, false if the
+    # tag came from an earlier connection (or an earlier life of this channel)
+    # and was dropped — see VersionedDeliveryTag.
     def basic_ack(delivery_tag, multiple: false)
       assert_open!
+      return false if stale_delivery_tag?(delivery_tag, "ack")
       @frame_io.write_frame(
-        AMQ::Protocol::Basic::Ack.encode(@channel_id, delivery_tag, multiple).encode
+        AMQ::Protocol::Basic::Ack.encode(@channel_id, delivery_tag.to_i, multiple).encode
       )
+      true
     end
 
     def basic_nack(delivery_tag, multiple: false, requeue: true)
       assert_open!
+      return false if stale_delivery_tag?(delivery_tag, "nack")
       @frame_io.write_frame(
-        AMQ::Protocol::Basic::Nack.encode(@channel_id, delivery_tag, multiple, requeue).encode
+        AMQ::Protocol::Basic::Nack.encode(@channel_id, delivery_tag.to_i, multiple, requeue).encode
       )
+      true
     end
 
     def basic_reject(delivery_tag, requeue: true)
       assert_open!
+      return false if stale_delivery_tag?(delivery_tag, "reject")
       @frame_io.write_frame(
-        AMQ::Protocol::Basic::Reject.encode(@channel_id, delivery_tag, requeue).encode
+        AMQ::Protocol::Basic::Reject.encode(@channel_id, delivery_tag.to_i, requeue).encode
       )
+      true
     end
 
     def basic_qos(prefetch_count:, prefetch_size: 0, global: false)
@@ -347,6 +377,7 @@ module AsyncRabbitMQ
     # handlers run concurrently across all consumers on this channel.
     # Returns the consumer tag.
     def basic_consume(queue_name, consumer_tag: "", manual_ack: false, exclusive: false, arguments: {}, &block)
+      warn_unbounded_prefetch(queue_name)
       resp = rpc(
         AMQ::Protocol::Basic::Consume.encode(@channel_id, queue_name, consumer_tag, false, !manual_ack, exclusive, false, arguments),
         AMQ::Protocol::Basic::ConsumeOk
@@ -398,6 +429,7 @@ module AsyncRabbitMQ
       @outstanding_limit = tracking ? (outstanding_limit || DEFAULT_OUTSTANDING_LIMIT) : nil
       @delivery_tag      = 0
       @pending_confirms  = {}
+      @unconfirmed_meta  = {}
       @nacked_tags       = []
       @nacked_this_cycle = []
       @only_acks         = true
@@ -414,12 +446,30 @@ module AsyncRabbitMQ
     # nacked by the broker. Returns true if all of them were acked since the
     # previous call, false if at least one was nacked (see #nacked_tags).
     # Raises ConnectionError if the session disconnects while waiting.
-    def wait_for_confirms
+    # +timeout+ in seconds bounds the whole wait; nil (the default) waits
+    # forever, as before. A broker that accepts a publish and then never
+    # confirms it otherwise parks the caller indefinitely.
+    def wait_for_confirms(timeout: nil)
+      deadline = timeout && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout)
+
       until @pending_confirms.empty?
         # Lazily (re)created: interrupt_wait! clears it on connection loss and a
         # caller may arrive before reopen_after_recovery has re-selected confirms.
         @confirm_condition ||= Async::Condition.new
-        @confirm_condition.wait
+
+        if deadline
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          raise ConfirmTimeoutError.new(unconfirmed_tags: @pending_confirms.keys, channel_id: @channel_id) if remaining <= 0
+
+          begin
+            Async::Task.current.with_timeout(remaining) { @confirm_condition.wait }
+          rescue Async::TimeoutError
+            raise ConfirmTimeoutError.new(unconfirmed_tags: @pending_confirms.keys, channel_id: @channel_id)
+          end
+        else
+          @confirm_condition.wait
+        end
+
         raise ConnectionError, "Session disconnected while waiting for confirms" unless open?
       end
       result       = @only_acks
@@ -438,6 +488,15 @@ module AsyncRabbitMQ
     # Delivery tags published but not yet acked or nacked.
     def unconfirmed_tags
       @pending_confirms.keys
+    end
+
+    # The messages published under confirms that the broker has not yet acked
+    # or nacked, as UnconfirmedMessage records carrying the payload and where
+    # it was going. Unlike the encoded frames kept for replay on this channel,
+    # these can be republished anywhere — which is what a caller handed them by
+    # Cluster#on_node_down needs to do when the node they were on is gone.
+    def unconfirmed_messages
+      @unconfirmed_meta.values
     end
 
     # -------------------------------------------------------------------------
@@ -487,6 +546,14 @@ module AsyncRabbitMQ
     # AMQ::Protocol::Channel::Close method frame.
     def on_error(&block)
       @on_error = block
+    end
+
+    # Register a callback invoked when a consumer block raises. The block
+    # receives the exception, the Basic::Deliver method frame and the queue
+    # name. The delivery has already been nacked (requeue: false) if the
+    # consumer was registered with manual_ack: true.
+    def on_handler_error(&block)
+      @on_handler_error = block
     end
 
     # -------------------------------------------------------------------------
@@ -661,6 +728,12 @@ module AsyncRabbitMQ
     # until the topology has been replayed (see #finish_recovery!).
     def reopen_on(frame_io, state: :open)
       @frame_io = frame_io
+      # The broker restarts delivery tags at 1 on a reopened channel, so any
+      # tag handed out before this point is now stale.
+      @delivery_generation += 1
+      # Content parked for a basic_get that never collected it belongs to the
+      # old channel; leaving it would hand it to the next basic_get.
+      @pending_content = nil
       @queue    = @frame_io.register_channel(@channel_id)
       start_dispatch_task
       send_and_wait(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk)
@@ -681,11 +754,97 @@ module AsyncRabbitMQ
     private
 
     # -------------------------------------------------------------------------
+    # Delivery tags
+    # -------------------------------------------------------------------------
+
+    # Replace the broker's raw tag with one that also carries this channel's
+    # generation. Basic::Deliver and Basic::GetOk expose delivery_tag through
+    # attr_reader, so setting the ivar is enough for handlers to pick it up.
+    def stamp_delivery_tag(method)
+      raw = method.instance_variable_get(:@delivery_tag)
+      return if raw.is_a?(VersionedDeliveryTag)
+
+      method.instance_variable_set(:@delivery_tag,
+                                   VersionedDeliveryTag.new(raw, @delivery_generation))
+    end
+
+    # A tag from an earlier generation refers to a message on a connection (or
+    # a life of this channel) that no longer exists. The broker restarts tag
+    # numbering at 1, so sending it now would either ack an unrelated message
+    # or draw a 406 that closes the channel and takes its consumers with it.
+    def stale_delivery_tag?(delivery_tag, action)
+      return false unless delivery_tag.is_a?(VersionedDeliveryTag)
+      return false unless delivery_tag.stale?(@delivery_generation)
+
+      @logger.warn(
+        "Channel #{@channel_id}: dropped #{action} for delivery tag #{delivery_tag.to_i} from " \
+        "generation #{delivery_tag.generation} (now #{@delivery_generation}) — the message was " \
+        "redelivered on the new connection"
+      )
+      instrument("delivery_tag.stale") do
+        { channel: @channel_id, action: action, delivery_tag: delivery_tag.to_i,
+          generation: delivery_tag.generation, current_generation: @delivery_generation }
+      end
+      true
+    end
+
+    # Without a prefetch limit the broker sends as fast as it can and the
+    # dispatch loop starts a task per delivery. pool_size caps how many run at
+    # once, not how many exist, so memory grows with the queue depth rather
+    # than with the concurrency. Warned once per channel; basic_qos fixes it.
+    def warn_unbounded_prefetch(queue_name)
+      return if @qos_warned
+      return if @prefetch && @prefetch[:count].to_i > 0
+
+      @qos_warned = true
+      @logger.warn(
+        "Channel #{@channel_id}: consuming from #{queue_name} without basic_qos. " \
+        "The broker will send the whole queue as fast as it can and one task is " \
+        "created per delivery, so memory tracks queue depth. Call " \
+        "basic_qos(prefetch_count: n) before basic_consume."
+      )
+    end
+
+    # A consumer block raised. Without this the delivery stays unacked for the
+    # life of the connection and, once prefetch messages are stuck that way,
+    # the consumer stops receiving anything at all.
+    def handle_consumer_error(error, method, entry)
+      @logger.error(
+        "Channel #{@channel_id}: consumer #{method.consumer_tag} raised " \
+        "#{error.class}: #{error.message}"
+      )
+      instrument("consumer.error") do
+        { channel: @channel_id, consumer_tag: method.consumer_tag, queue: entry[:queue_name],
+          error: error.class.name, message: error.message }
+      end
+
+      # Only manual-ack deliveries are still outstanding at the broker.
+      # requeue: false so a message that always raises goes to the dead-letter
+      # exchange instead of looping forever; on_handler_error is where a caller
+      # decides to do something else.
+      if entry[:manual_ack]
+        begin
+          basic_nack(method.delivery_tag, requeue: false)
+        rescue => e
+          @logger.error("Channel #{@channel_id}: could not nack after consumer error: #{e.class}: #{e.message}")
+        end
+      end
+
+      return unless @on_handler_error
+
+      begin
+        @on_handler_error.call(error, method, entry[:queue_name])
+      rescue => e
+        @logger.error("Channel #{@channel_id}: on_handler_error hook raised #{e.class}: #{e.message}")
+      end
+    end
+
+    # -------------------------------------------------------------------------
     # Frame dispatch
     # -------------------------------------------------------------------------
 
     def start_dispatch_task
-      Async::Task.current.async { dispatch_loop }
+      @session.spawn_background { dispatch_loop }
     end
 
     def dispatch_loop
@@ -722,6 +881,20 @@ module AsyncRabbitMQ
     end
 
     def handle_method(method)
+      # While resynchronising, everything except the close-ok we are waiting
+      # for belongs to the request that timed out. Dropping it here is the
+      # point of the reopen: it must not reach the next caller.
+      if @resync_condition
+        if method.is_a?(AMQ::Protocol::Channel::CloseOk)
+          cond = @resync_condition
+          @resync_condition = nil
+          cond.signal(:closed)
+        else
+          @logger.warn("Channel #{@channel_id}: discarded #{method.class} while resynchronising")
+        end
+        return
+      end
+
       case method
       when AMQ::Protocol::Basic::Deliver
         # Pop content directly — must not suspend dispatch_loop via wait_content.
@@ -730,11 +903,14 @@ module AsyncRabbitMQ
         _, header, body = content_msg
         entry = @consumers[method.consumer_tag]
         if entry
+          stamp_delivery_tag(method)
           Async do
             @pool_sem.acquire do
               started = instrument_clock
               begin
                 entry[:block].call(method, header, body)
+              rescue => e
+                handle_consumer_error(e, method, entry)
               ensure
                 if started
                   instrument("message.consumed") do
@@ -813,8 +989,10 @@ module AsyncRabbitMQ
       @mutex.acquire do
         if method.multiple
           @pending_confirms.reject! { |tag, _| tag <= method.delivery_tag }
+          @unconfirmed_meta.reject! { |tag, _| tag <= method.delivery_tag }
         else
           @pending_confirms.delete(method.delivery_tag)
+          @unconfirmed_meta.delete(method.delivery_tag)
         end
         @confirm_condition&.signal
         release_outstanding_slots
@@ -833,7 +1011,7 @@ module AsyncRabbitMQ
         else
           [method.delivery_tag]
         end
-        rejected.each { |tag| @pending_confirms.delete(tag) }
+        rejected.each { |tag| @pending_confirms.delete(tag); @unconfirmed_meta.delete(tag) }
         @nacked_tags.concat(rejected)
         @nacked_this_cycle.concat(rejected)
         @only_acks = false
@@ -902,10 +1080,64 @@ module AsyncRabbitMQ
       # Park before taking the semaphore so that reopen_after_recovery (which
       # bypasses it) is never blocked by a waiter holding it.
       wait_for_recovery! if recovering?
-      @rpc_sem.acquire do
-        assert_open!
-        send_and_wait(frame, *expected_classes)
+      timed_out = false
+      begin
+        @rpc_sem.acquire do
+          assert_open!
+          send_and_wait(frame, *expected_classes)
+        end
+      rescue RpcTimeoutError
+        timed_out = true
+        raise
+      ensure
+        # Outside the semaphore: the reply we gave up on may still be in
+        # flight, and AMQP replies carry nothing to match them to a request,
+        # so the next caller on this channel would collect it instead.
+        resync_after_rpc_timeout if timed_out
       end
+    end
+
+    # Close and reopen the channel after a reply never arrived, discarding
+    # anything the broker sends for the abandoned request. Consumers are
+    # re-registered, so a timeout costs a round trip rather than the channel's
+    # deliveries. Runs outside @rpc_sem (re-registering consumers needs it).
+    def resync_after_rpc_timeout
+      return if @resyncing
+      return unless open?
+
+      @resyncing = true
+      @logger.warn(
+        "Channel #{@channel_id}: reopening after an RPC timeout. A late reply carries nothing " \
+        "to match it to its request, so it would be handed to the next caller on this channel."
+      )
+      instrument("channel.resync") { { channel: @channel_id, reason: :rpc_timeout } }
+
+      consumers = @consumers.dup
+      cond = @resync_condition = Async::Condition.new
+      @frame_io.write_frame(
+        AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Resynchronising after RPC timeout", 0, 0).encode
+      )
+
+      begin
+        Async::Task.current.with_timeout(@rpc_timeout || RESYNC_TIMEOUT) { cond.wait }
+      rescue Async::TimeoutError
+        @logger.error("Channel #{@channel_id}: no channel.close-ok while resynchronising")
+      ensure
+        @resync_condition = nil
+      end
+
+      @state = :closed
+      @consumers.clear
+      @session.reopen_channel(self)
+      @consumers.replace(consumers)
+      re_register_consumers
+    rescue => e
+      @logger.error("Channel #{@channel_id}: could not resynchronise after an RPC timeout: #{e.class}: #{e.message}")
+      mark_closed!(ChannelError.new("Channel could not be resynchronised after an RPC timeout: #{e.message}",
+                                    channel_id: @channel_id))
+      @session.channel_closed(@channel_id) rescue nil
+    ensure
+      @resyncing = false
     end
 
     def send_and_wait(frame, *expected_classes)
@@ -955,9 +1187,16 @@ module AsyncRabbitMQ
 
     # Under confirms: take the next delivery tag and keep the encoded message
     # until the broker acks it, so it can be re-published after a reconnect.
-    def reserve_confirm_tag(bytes)
+    def reserve_confirm_tag(bytes, payload = nil, exchange = nil, routing_key = nil)
       @delivery_tag += 1
       @pending_confirms[@delivery_tag] = bytes
+      # The encoded frames carry this channel's id, so they can only be
+      # replayed on this channel. Keep the payload and its routing alongside
+      # (references, not copies) so a caller handed these on a node failure can
+      # republish them somewhere else. See Channel#unconfirmed_messages.
+      @unconfirmed_meta[@delivery_tag] =
+        UnconfirmedMessage.new(delivery_tag: @delivery_tag, payload: payload,
+                               exchange: exchange, routing_key: routing_key)
       @delivery_tag
     end
 
@@ -992,14 +1231,17 @@ module AsyncRabbitMQ
     # A message the broker had in fact accepted before the drop is delivered
     # twice: the usual at-least-once trade-off of confirms across a reconnect.
     def republish_unconfirmed
-      pending            = @pending_confirms.values
+      pending            = @pending_confirms.keys.map { |tag| [@pending_confirms[tag], @unconfirmed_meta[tag]] }
       @pending_confirms  = {}
+      @unconfirmed_meta  = {}
       @delivery_tag      = 0
       @confirm_condition ||= Async::Condition.new   # keep one an early waiter created
-      pending.each do |bytes|
+      pending.each do |(bytes, meta)|
         @frame_io.write_frame(bytes, publish: true)
         @delivery_tag += 1
         @pending_confirms[@delivery_tag] = bytes
+        @unconfirmed_meta[@delivery_tag] = meta && meta.class.new(delivery_tag: @delivery_tag, payload: meta.payload,
+                                                                 exchange: meta.exchange, routing_key: meta.routing_key)
       end
       @logger.info("Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
     end

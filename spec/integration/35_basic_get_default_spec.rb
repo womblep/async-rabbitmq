@@ -17,7 +17,11 @@ RSpec.describe "basic_get acknowledgement default and Queue#pop", :integration d
 
       di, _h, body = ch.basic_get(q.name)
       expect(body).to eq("keep me")
-      expect(di.delivery_tag).to be_a(Integer)
+      # A VersionedDeliveryTag since delivery tags carry their generation, but
+      # it stands in for the Integer it wraps.
+      expect(di.delivery_tag).to be_a(AsyncRabbitMQ::VersionedDeliveryTag)
+      expect(di.delivery_tag.to_i).to be_a(Integer)
+      expect(di.delivery_tag).to eq(di.delivery_tag.to_i)
       expect(ready_count(session, q.name)).to eq(0)   # unacked, not ready
 
       ch.close

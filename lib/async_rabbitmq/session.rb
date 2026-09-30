@@ -149,6 +149,7 @@ module AsyncRabbitMQ
       verify_peer: true,
       tls_min_version: :TLS1_2,
       heartbeat: 60,
+      tcp_user_timeout: nil,
       frame_max: 131_072,
       channel_max: 2047,
       connect_timeout: CONNECT_TIMEOUT,
@@ -181,6 +182,7 @@ module AsyncRabbitMQ
       @verify_peer          = verify_peer
       @tls_min_version      = tls_min_version
       @heartbeat            = heartbeat
+      @tcp_user_timeout     = tcp_user_timeout
       @frame_max            = frame_max
       @channel_max          = channel_max
       @connect_timeout      = connect_timeout
@@ -205,6 +207,7 @@ module AsyncRabbitMQ
       @negotiated_fm     = nil
       @negotiated_cmax   = nil
       @recovery_in_progress = false
+      @recovery_interrupted = false
       @closed_by_user    = false
       @connecting        = false
       @open_condition    = nil
@@ -305,6 +308,22 @@ module AsyncRabbitMQ
 
     def closed?
       @state == :closed
+    end
+
+    # Internal. Run a long-lived background loop (channel dispatch, heartbeat,
+    # channel-0 monitor).
+    #
+    # These must not become children of whichever task happened to open the
+    # channel or the session: a short-lived caller that finishes, or is stopped,
+    # would silently take its dispatch loop with it while the channel still
+    # reported itself open. Parent them at the reactor instead, and mark them
+    # transient so they never hold the reactor open by themselves — #close
+    # stops them explicitly.
+    #
+    # @api private
+    def spawn_background(&block)
+      @root_task ||= Async::Task.current.root
+      @root_task.async(transient: true, &block)
     end
 
     # Close the session gracefully. Also works if recovery is in progress.
@@ -510,8 +529,13 @@ module AsyncRabbitMQ
     # --- Internal ---
 
     # Called by FrameIO when a connection-level error triggers recovery.
-    def trigger_recovery(error)
+    def trigger_recovery(error, from: nil)
       return if @closed_by_user
+      # A frame_io that a later connection attempt has already replaced is
+      # still draining its dead socket, and its errors are not the live
+      # connection's. Letting them through made a reconnect look like it had
+      # dropped again the moment it succeeded.
+      return if from && !@frame_io.equal?(from)
 
       if @connecting
         # The handshake is in flight in another fiber; hand it the IO error so
@@ -543,6 +567,7 @@ module AsyncRabbitMQ
         # Unblock any fiber stuck in wait_channel0_method or channel wait_for
         # so that the current recover_loop iteration fails fast and retries.
         recovery_error = ConnectionError.new(code: 0, text: "Connection lost during recovery")
+        @recovery_interrupted = true
         q0 = @frame_io&.channel_queue(0)
         q0&.push([:method, recovery_error]) rescue nil
         @channels.each_value { |ch| ch.interrupt_wait!(recovery_error) rescue nil }
@@ -634,16 +659,41 @@ module AsyncRabbitMQ
         handshaked = false
         begin
           ssl = OpenSSL::SSL::SSLSocket.new(raw, ctx)
+          # Without this, closing the SSL socket sends close_notify but leaves
+          # the TCP socket open until the GC finalises it, so every amqps
+          # reconnect strands a connection (Amazon MQ, for example).
+          ssl.sync_close = true
           ssl.hostname = target_host
           ssl.connect
           handshaked = true
+          apply_socket_timeouts(raw)
           ssl
         ensure
           raw.close unless handshaked
         end
       else
-        TCPSocket.new(target_host, target_port)
+        TCPSocket.new(target_host, target_port).tap { |sock| apply_socket_timeouts(sock) }
       end
+    end
+
+    # Bound how long the kernel will retransmit unacknowledged data before it
+    # gives up on the socket. Without it a peer that disappears mid-write (a
+    # network partition with a full send buffer) is only noticed when the TCP
+    # retransmit timer expires, which on Linux is around 15 minutes — far
+    # longer than the heartbeat timeout we promise callers.
+    #
+    # TCP_USER_TIMEOUT is Linux-only; elsewhere the heartbeat task's own write
+    # timeout is the backstop, so a missing constant is not an error.
+    def apply_socket_timeouts(sock)
+      millis = @tcp_user_timeout
+      millis ||= (@heartbeat.to_i > 0 ? @heartbeat.to_i * 2 * 1000 : nil)
+      return unless millis && millis > 0
+      return unless Socket.const_defined?(:TCP_USER_TIMEOUT)
+
+      sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_USER_TIMEOUT, millis)
+    rescue StandardError => e
+      # Unsupported on this platform or socket type; the heartbeat still covers us.
+      @logger.debug("Could not set TCP_USER_TIMEOUT: #{e.class}: #{e.message}")
     end
 
     def build_tls_context
@@ -658,7 +708,7 @@ module AsyncRabbitMQ
 
       # Override trigger_recovery to delegate to Session
       session = self
-      io.define_singleton_method(:trigger_recovery) { |error| session.trigger_recovery(error) }
+      io.define_singleton_method(:trigger_recovery) { |error| session.trigger_recovery(error, from: io) }
 
       # Update heartbeat timestamp on every received frame
       io.on_frame = -> { @last_frame_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) }
@@ -817,17 +867,31 @@ module AsyncRabbitMQ
       # Seed the timestamp now; the on_frame callback will keep it fresh.
       @last_frame_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-      @heartbeat_task = Async::Task.current.async do
+      @heartbeat_task = spawn_background do
         loop do
           sleep interval
           break unless open?
-          @frame_io.write_heartbeat
-          instrument("heartbeat.sent") { { interval: interval } }
+
+          # Liveness first. The write below needs the socket lock, and after a
+          # partition the writer can be parked inside @socket.write holding it
+          # with a full send buffer. Checking afterwards meant this task blocked
+          # with the rest and nothing declared the peer dead until the kernel
+          # gave up retransmitting — around 15 minutes on Linux.
           last = @last_frame_at
-          next unless last   # not yet seeded — skip this tick
-          elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - last
-          if elapsed > dead_after
-            trigger_recovery(HeartbeatTimeoutError.new("No frame received in #{elapsed.round(1)}s (timeout #{dead_after}s)"))
+          if last
+            elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - last
+            if elapsed > dead_after
+              trigger_recovery(HeartbeatTimeoutError.new("No frame received in #{elapsed.round(1)}s (timeout #{dead_after}s)"))
+              break
+            end
+          end
+
+          # Bounded so a socket that never drains cannot park this task either.
+          begin
+            Async::Task.current.with_timeout(interval) { @frame_io.write_heartbeat }
+            instrument("heartbeat.sent") { { interval: interval } }
+          rescue Async::TimeoutError
+            trigger_recovery(HeartbeatTimeoutError.new("Heartbeat write blocked for #{interval}s — peer is not reading"))
             break
           end
         end
@@ -934,20 +998,35 @@ module AsyncRabbitMQ
         end
 
         if connected
+          # Only drops from here on belong to this connection: the old socket
+          # goes on failing throughout the backoff, and those errors must not
+          # make the reconnect we just made look like it had dropped too.
+          @recovery_interrupted = false
           @heartbeat_task&.cancel rescue nil
           start_heartbeat_task
           start_channel0_monitor_task
           @state = :open
           @channel_ids = fresh_channel_ids
-          @recovery_in_progress = false
           # NOTE: keep @recovery_task non-nil until reopen_channels completes so
           # that session.close can still cancel this task (and therefore interrupt
           # any wait_for calls inside reopen_after_recovery) if the user closes
           # the session while channels are being reopened.
           @logger.info("Recovery successful after #{attempts} attempt(s)")
 
-          # Re-open channels and re-register consumers
-          reopen_channels
+          # Re-open channels and re-register consumers. @recovery_in_progress
+          # stays true across this: clearing it first leaves a window where a
+          # second drop starts a competing recovery while this one is still
+          # failing channels through mark_closed!, which loses those channels
+          # and their consumers for good.
+          unless reopen_channels
+            # Dropped again mid-reopen. Channels are still :recovering, so go
+            # round again and reopen them on the next connection.
+            @logger.warn("Connection lost while reopening channels; retrying recovery")
+            delay = [delay * 2, @recovery_max_interval].min
+            next
+          end
+
+          @recovery_in_progress = false
           instrument("recovery.succeeded") do
             { attempts: attempts, host: @host, port: @port, channels: @channels.size,
               duration: recovery_started_at ? instrument_elapsed(recovery_started_at) : nil }
@@ -969,23 +1048,33 @@ module AsyncRabbitMQ
     # After reconnect: reopen every channel, replay the recorded topology
     # (session-wide, in dependency order), then release parked callers and
     # re-register consumers.
+    # Returns false if the connection dropped again while channels were being
+    # reopened. Channels are then left :recovering rather than closed, so the
+    # next pass through recover_loop can reopen them; only a failure that is
+    # this channel's own (a broker rejection) closes it for good.
     def reopen_channels
-      reopened = @channels.values.select do |channel|
+      reopened = []
+
+      @channels.values.each do |channel|
         begin
           channel.reopen_on(@frame_io, state: :recovering)
-          true
+          reopened << channel
         rescue => e
+          return false if @recovery_interrupted
+
           # Fail the channel loudly rather than leave its parked callers hanging.
           @logger.error("Channel #{channel.channel_id} could not be reopened after recovery: #{e.class}: #{e.message}")
           channel.mark_closed!(ChannelError.new("Channel could not be reopened after recovery: #{e.message}",
                                                 channel_id: channel.channel_id))
           channel_closed(channel.channel_id)
-          false
         end
       end
 
       recover_topology_on(reopened) if @recover_topology && !@topology.empty?
+      return false if @recovery_interrupted
+
       reopened.each { |channel| channel.finish_recovery! rescue nil }
+      true
     end
 
     # Re-declare exchanges, then queues, then bindings. Each entity is replayed
@@ -1012,7 +1101,7 @@ module AsyncRabbitMQ
     # by delegating to FrameIO's blocked-state gate so write_frame yields
     # automatically when the broker is resource-constrained.
     def start_channel0_monitor_task
-      @channel0_task = Async::Task.current.async { channel0_monitor_loop }
+      @channel0_task = spawn_background { channel0_monitor_loop }
     end
 
     def channel0_monitor_loop

@@ -18,6 +18,10 @@ end
 
 require "async"
 require "async/rspec"
+# The gem takes any logger-like object and no longer depends on the stdlib
+# Logger, but several specs pass one. Required here so they do not depend on
+# some other spec having pulled it in first.
+require "logger"
 require "async_rabbitmq"
 require "uri"
 require "securerandom"

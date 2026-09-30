@@ -160,7 +160,10 @@ module AsyncRabbitMQ
     rescue IOError, Errno::EPIPE, Errno::EBADF, Errno::ECONNRESET
       # Socket closed — reader_loop will detect and call trigger_recovery.
     rescue => e
+      # The writer is gone either way; without recovery every publisher would
+      # block forever once the write queue fills, with nothing to drain it.
       @logger.error("FrameIO writer: #{e.class}: #{e.message}")
+      trigger_recovery(e) if @running
     end
 
     def reader_loop
@@ -247,6 +250,14 @@ module AsyncRabbitMQ
         route_to_channel(channel_id, [:method, method])
 
       when AMQ::Protocol::HeaderFrame
+        # A zero-length body has no body frames at all: neither RabbitMQ nor
+        # amq-protocol emits one. Route now, or the content would sit here
+        # forever and the next method frame would be taken as its body.
+        if frame_obj.body_size == 0
+          route_to_channel(channel_id, [:content, frame_obj, "".b])
+          return
+        end
+
         @content_state[channel_id] = {
           header:     frame_obj,
           body_parts: [],
