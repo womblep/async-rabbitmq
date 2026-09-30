@@ -243,7 +243,7 @@ module AsyncRabbitMQ
           Async::Task.current.with_timeout(@connect_timeout) do
             raw_socket = open_socket(target_host, target_port)
             @frame_io  = build_frame_io(raw_socket)
-            @frame_io.start
+            @frame_io.start(spawn: method(:spawn_background))
             handshake
             start_heartbeat_task
             start_channel0_monitor_task
@@ -596,11 +596,11 @@ module AsyncRabbitMQ
       # cancels reader/writer tasks; if we ARE the reader task, cancel raises
       # Async::Cancel (< Exception) which bypasses `rescue nil` and propagates,
       # so anything after stop might not run.
-      # Spawn recovery as a child of @session_root_task (the connect-call task),
-      # NOT of Async::Task.current (the reader task). If we're in the reader task,
-      # its Cancel propagation would also cancel a child recovery task.
-      parent_task = @session_root_task || Async::Task.current
-      @recovery_task = parent_task.async { recover_loop }
+      # Parent recovery at the reactor, not at Async::Task.current — which here
+      # is usually the reader task, whose Cancel would propagate into a child
+      # recovery task — and not at the task that called connect either, since
+      # that one may be short-lived while the session outlives it.
+      @recovery_task = spawn_background { recover_loop }
 
       # Stop the old frame_io: closes the dead socket, pushes nil to channel
       # queues (unblocking wait_channel0_method), and cancels writer task.
@@ -887,11 +887,14 @@ module AsyncRabbitMQ
           end
 
           # Bounded so a socket that never drains cannot park this task either.
+          # Bounded by the full dead-peer window, not by the send interval: the
+          # heartbeat needs the socket lock, and a large batch going out over a
+          # slow link can legitimately hold it for longer than one interval.
           begin
-            Async::Task.current.with_timeout(interval) { @frame_io.write_heartbeat }
+            Async::Task.current.with_timeout(dead_after) { @frame_io.write_heartbeat }
             instrument("heartbeat.sent") { { interval: interval } }
           rescue Async::TimeoutError
-            trigger_recovery(HeartbeatTimeoutError.new("Heartbeat write blocked for #{interval}s — peer is not reading"))
+            trigger_recovery(HeartbeatTimeoutError.new("Heartbeat write blocked for #{dead_after}s — peer is not reading"))
             break
           end
         end
@@ -972,7 +975,7 @@ module AsyncRabbitMQ
             Async::Task.current.with_timeout(@connect_timeout) do
               raw_socket = open_socket(target_host, target_port)
               @frame_io  = build_frame_io(raw_socket)
-              @frame_io.start
+              @frame_io.start(spawn: method(:spawn_background))
               handshake
             end
             @host = target_host
@@ -1020,8 +1023,17 @@ module AsyncRabbitMQ
           # and their consumers for good.
           unless reopen_channels
             # Dropped again mid-reopen. Channels are still :recovering, so go
-            # round again and reopen them on the next connection.
+            # round again and reopen them on the next connection — but tear
+            # this half-built connection down first. Leaving it up reported the
+            # session as open (so a Cluster would place new channels on a dead
+            # node), held the socket, and leaked a channel-0 monitor per flap.
             @logger.warn("Connection lost while reopening channels; retrying recovery")
+            @state = :recovering
+            @heartbeat_task&.cancel rescue nil
+            @heartbeat_task = nil
+            @channel0_task&.cancel rescue nil
+            @channel0_task = nil
+            @frame_io&.stop rescue nil
             delay = [delay * 2, @recovery_max_interval].min
             next
           end
@@ -1101,6 +1113,9 @@ module AsyncRabbitMQ
     # by delegating to FrameIO's blocked-state gate so write_frame yields
     # automatically when the broker is resource-constrained.
     def start_channel0_monitor_task
+      # Cancel any predecessor: a recovery that has to retry starts this again,
+      # and the old one would otherwise sit on a dead queue for good.
+      @channel0_task&.cancel rescue nil
       @channel0_task = spawn_background { channel0_monitor_loop }
     end
 

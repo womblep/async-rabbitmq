@@ -68,10 +68,14 @@ module AsyncRabbitMQ
       @channels[channel_id]
     end
 
-    def start(task: Async::Task.current)
+    # +spawn+ makes the reader and writer tasks. It defaults to the calling
+    # task, which is only right for a throwaway connection: the session passes
+    # one that parents them at the reactor, so a short-lived task that happened
+    # to call connect cannot take the connection's IO down with it.
+    def start(task: Async::Task.current, spawn: ->(&block) { task.async(&block) })
       @running = true
-      @writer_task = task.async { writer_loop }
-      @reader_task = task.async { reader_loop }
+      @writer_task = spawn.call { writer_loop }
+      @reader_task = spawn.call { reader_loop }
     end
 
     def stop

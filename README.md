@@ -176,7 +176,8 @@ channel went, and it is redelivered on the new connection.
 
 When a handler raises, the delivery is nacked with `requeue: false` — so a
 message that always fails dead-letters instead of looping — and
-`on_handler_error` is called:
+`on_handler_error` is called. A delivery the handler already settled itself is
+left alone, so acking and then raising in whatever follows is safe:
 
 ```ruby
 ch.on_handler_error do |error, delivery, queue_name|
@@ -209,7 +210,7 @@ ch.confirm_select(tracking: true, outstanding_limit: 1000)
 # wait_for_confirms raises AsyncRabbitMQ::MessageNacked on a nack.
 
 ch.wait_for_confirms(timeout: 5)           # ConfirmTimeoutError instead of waiting forever
-ch.unconfirmed_messages                    # what the broker has not resolved, with payload and routing
+ch.unconfirmed_messages                    # what the broker has not resolved: payload, routing and options
 ```
 
 `wait_for_confirms` waits indefinitely by default. Pass `timeout:` if a broker
@@ -425,7 +426,7 @@ cluster.on_node_down { |session, channels, error| ... }
 # declare a fourth parameter to also receive the publishes the broker never
 # confirmed, so they can be sent again on another node:
 cluster.on_node_down do |session, channels, error, unconfirmed|
-  unconfirmed.each { |m| elsewhere.basic_publish(m.payload, exchange: m.exchange, routing_key: m.routing_key) }
+  unconfirmed.each { |m| elsewhere.basic_publish(m.payload, exchange: m.exchange, routing_key: m.routing_key, **m.options) }
 end
 cluster.on_node_up   { |session| ... }
 ```
