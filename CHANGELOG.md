@@ -86,6 +86,11 @@ Reliability review against a payments workload. The two delivery-correctness ite
   another connection without silently losing their properties. A `Cluster#on_node_down` block that declares a fourth parameter is
   handed them; under `:drop` that is the only chance to see them.
 - `Session.new(tcp_user_timeout:)` — milliseconds, defaulting to twice the heartbeat.
+- `Channel#delivery_generation` — how many times the channel has been opened on a connection.
+  The broker restarts both delivery tags and publisher confirm tags at 1 on a reopened channel,
+  so a tag only identifies a message together with its generation. Deliveries carry theirs on
+  the tag itself; confirm tags from `basic_publish` are plain integers, so code keeping its own
+  confirm bookkeeping across a reconnect reads this.
 - `Channel#resyncing?` — true while the channel is being reopened, after an RPC timeout or
   through `Channel#reopen`. Operations park until it is back, as they do during connection
   recovery, and unconfirmed messages are replayed before it goes `:open` so a new publish

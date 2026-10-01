@@ -28,6 +28,17 @@ module AsyncRabbitMQ
 
     attr_reader :channel_id, :pool_size
 
+    # How many times this channel has been opened on a connection: 0 until the
+    # first reopen, then one more for each connection recovery or #reopen.
+    #
+    # The broker restarts both delivery tags and publisher confirm tags at 1 on
+    # a reopened channel, so a tag only identifies a message together with the
+    # generation it was issued in. Deliveries carry theirs (see
+    # VersionedDeliveryTag); confirm tags returned by #basic_publish are plain
+    # integers, so code keeping its own confirm bookkeeping across a reconnect
+    # reads this.
+    attr_reader :delivery_generation
+
     # +pool_size+ bounds the number of consumer-handler fibers that can run
     # concurrently on this channel (Bunny-parity: default 1 = serialized).
     # Resizable at runtime via #pool_size=; basic_qos adjusts it automatically

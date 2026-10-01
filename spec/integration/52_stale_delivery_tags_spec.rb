@@ -23,8 +23,26 @@ RSpec.describe "Stale delivery tags", :integration do
 
       di, = ch.basic_get(q.name, manual_ack: true)
       expect(di.delivery_tag).to be_a(AsyncRabbitMQ::VersionedDeliveryTag)
-      expect(di.delivery_tag.generation).to eq(ch.send(:instance_variable_get, :@delivery_generation))
+      expect(di.delivery_tag.generation).to eq(ch.delivery_generation)
       expect(ch.basic_ack(di.delivery_tag)).to be true
+      ch.close
+    end
+  end
+
+  it "reports the channel's generation publicly, and counts each reopen" do
+    isolated_session do |session, _|
+      ch = session.open_channel
+      # Confirm tags are plain integers and restart with the channel, so code
+      # keeping its own confirm bookkeeping across a reconnect needs this.
+      expect(ch.delivery_generation).to eq(0)
+
+      close_by_broker(ch)
+      ch.reopen
+      expect(ch.delivery_generation).to eq(1)
+
+      close_by_broker(ch)
+      ch.reopen
+      expect(ch.delivery_generation).to eq(2)
       ch.close
     end
   end
@@ -55,7 +73,7 @@ RSpec.describe "Stale delivery tags", :integration do
       # delivery and restarts tag numbering, exactly as after a reconnect.
       close_by_broker(ch)
       ch.reopen
-      expect(ch.send(:instance_variable_get, :@delivery_generation)).to eq(1)
+      expect(ch.delivery_generation).to eq(1)
 
       # The message was requeued by the channel close; take it again so that
       # tag 1 on this generation is a real, different delivery.
