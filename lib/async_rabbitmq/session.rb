@@ -322,8 +322,10 @@ module AsyncRabbitMQ
     #
     # @api private
     def spawn_background(&block)
-      @root_task ||= Async::Task.current.root
-      @root_task.async(transient: true, &block)
+      # Looked up per call, never memoised: a Session reused across two
+      # separate Sync/Async reactors would otherwise keep spawning onto the
+      # first, finished one.
+      Async::Task.current.root.async(transient: true, &block)
     end
 
     # Close the session gracefully. Also works if recovery is in progress.
@@ -487,7 +489,7 @@ module AsyncRabbitMQ
 
     # Put a channel the broker closed back into the channel table and reopen
     # it on the current connection under its original id (Channel#reopen).
-    def reopen_channel(channel)
+    def reopen_channel(channel, state: :open)
       raise NotOpenError, "Session is not open" unless open?
       @channel_mutex.acquire do
         existing = @channels[channel.channel_id]
@@ -498,7 +500,7 @@ module AsyncRabbitMQ
         @channel_ids.reserve(channel.channel_id) unless existing
         @channels[channel.channel_id] = channel
       end
-      channel.reopen_on(@frame_io)
+      channel.reopen_on(@frame_io, state: state)
     end
 
     # Called by a channel when topology recovery re-declared a server-named
