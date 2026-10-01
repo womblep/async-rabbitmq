@@ -15,6 +15,11 @@ module AsyncRabbitMQ
     UnconfirmedMessage = Struct.new(:delivery_tag, :payload, :exchange, :routing_key, :options,
                                     keyword_init: true)
 
+    # Where one publish call was addressed. Built once per call and shared by
+    # every message in a batch, so the send path allocates one small pair per
+    # message instead of a keyword struct and a copy of the options hash.
+    PublishContext = Struct.new(:exchange, :routing_key, :options)
+
     # Fallback bound on the wait for channel.close-ok while resynchronising
     # after an RPC timeout, used when the session has no rpc_timeout set.
     RESYNC_TIMEOUT = 5
@@ -53,8 +58,7 @@ module AsyncRabbitMQ
       @each_waiters      = {}        # consumer_tag => Async::Condition, fibers blocked in #each
       @return_handler    = nil
       @delivery_tag      = 0
-      @pending_confirms  = {}        # delivery_tag => encoded frames, awaiting basic.ack/nack
-      @unconfirmed_meta  = {}        # delivery_tag => UnconfirmedMessage, for on_node_down
+      @pending_confirms  = {}        # delivery_tag => [frames, payload, PublishContext]
       @nacked_tags       = []        # tags the broker rejected since confirm_select (Bunny: nacked_set)
       @only_acks         = true      # false once a nack arrives; read and reset by wait_for_confirms
       @confirms_enabled  = false
@@ -292,7 +296,8 @@ module AsyncRabbitMQ
     # plus a raw properties: hash. Returns the confirm delivery tag when the
     # channel is in confirm mode, nil otherwise.
     def basic_publish(payload, exchange: "", routing_key: "", **opts)
-      bytes = encode_publish(payload, exchange: exchange, routing_key: routing_key, **opts)
+      bytes   = encode_publish(payload, exchange: exchange, routing_key: routing_key, **opts)
+      context = @confirms_enabled ? publish_context(exchange, routing_key, opts) : nil
       # One publish's frames must reach the wire contiguously and confirm tags
       # must follow wire order, so the write and the tag assignment happen
       # under one semaphore (write_frame can yield on a full queue or the
@@ -301,7 +306,7 @@ module AsyncRabbitMQ
         assert_open!
         wait_for_outstanding_slot(1)
         @frame_io.write_frame(bytes, publish: true)
-        reserve_confirm_tag(bytes, payload, exchange, routing_key, opts) if @confirms_enabled
+        reserve_confirm_tag(bytes, payload, context) if @confirms_enabled
       end
       instrument("message.published") do
         { channel: @channel_id, exchange: exchange, routing_key: routing_key, count: 1,
@@ -328,7 +333,8 @@ module AsyncRabbitMQ
         wait_for_outstanding_slot(encoded.size)
         @frame_io.write_frame(encoded.join, publish: true)
         if @confirms_enabled
-          payloads.each_with_index.map { |p, i| reserve_confirm_tag(encoded[i], p, exchange, routing_key, opts) }
+          context = publish_context(exchange, routing_key, opts)
+          payloads.each_with_index.map { |p, i| reserve_confirm_tag(encoded[i], p, context) }
         end
       end
       instrument("message.published") do
@@ -455,7 +461,6 @@ module AsyncRabbitMQ
       @outstanding_limit = tracking ? (outstanding_limit || DEFAULT_OUTSTANDING_LIMIT) : nil
       @delivery_tag      = 0
       @pending_confirms  = {}
-      @unconfirmed_meta  = {}
       @nacked_tags       = []
       @nacked_this_cycle = []
       @only_acks         = true
@@ -522,7 +527,11 @@ module AsyncRabbitMQ
     # these can be republished anywhere — which is what a caller handed them by
     # Cluster#on_node_down needs to do when the node they were on is gone.
     def unconfirmed_messages
-      @unconfirmed_meta.values
+      @pending_confirms.map do |tag, (_bytes, payload, context)|
+        UnconfirmedMessage.new(delivery_tag: tag, payload: payload,
+                               exchange: context&.exchange, routing_key: context&.routing_key,
+                               options: context ? context.options.dup : {})
+      end
     end
 
     # -------------------------------------------------------------------------
@@ -1055,10 +1064,8 @@ module AsyncRabbitMQ
       @mutex.acquire do
         if method.multiple
           @pending_confirms.reject! { |tag, _| tag <= method.delivery_tag }
-          @unconfirmed_meta.reject! { |tag, _| tag <= method.delivery_tag }
         else
           @pending_confirms.delete(method.delivery_tag)
-          @unconfirmed_meta.delete(method.delivery_tag)
         end
         @confirm_condition&.signal
         release_outstanding_slots
@@ -1077,7 +1084,7 @@ module AsyncRabbitMQ
         else
           [method.delivery_tag]
         end
-        rejected.each { |tag| @pending_confirms.delete(tag); @unconfirmed_meta.delete(tag) }
+        rejected.each { |tag| @pending_confirms.delete(tag) }
         @nacked_tags.concat(rejected)
         @nacked_this_cycle.concat(rejected)
         @only_acks = false
@@ -1267,29 +1274,27 @@ module AsyncRabbitMQ
 
     # Under confirms: take the next delivery tag and keep the encoded message
     # until the broker acks it, so it can be re-published after a reconnect.
-    def reserve_confirm_tag(bytes, payload = nil, exchange = nil, routing_key = nil, options = nil)
+    def reserve_confirm_tag(bytes, payload = nil, context = nil)
       @delivery_tag += 1
-      @pending_confirms[@delivery_tag] = bytes
-      # The encoded frames carry this channel's id, so they can only be
-      # replayed on this channel. Keep the payload and its routing alongside
-      # (references, not copies) so a caller handed these on a node failure can
-      # republish them somewhere else. See Channel#unconfirmed_messages.
-      @unconfirmed_meta[@delivery_tag] =
-        UnconfirmedMessage.new(delivery_tag: @delivery_tag, payload: payload,
-                               exchange: exchange, routing_key: routing_key,
-                               options: copy_publish_options(options))
+      @pending_confirms[@delivery_tag] = [bytes, payload, context]
+      # The encoded frames carry this channel's id, so they can only be replayed
+      # on this channel. Keep the payload and where it was going alongside, so a
+      # caller handed these on a node failure can republish them somewhere else
+      # (see #unconfirmed_messages). A pair, not a record: this runs for every
+      # confirmed publish, and building the record here cost a quarter of the
+      # send throughput. #unconfirmed_messages builds them on read instead,
+      # which only happens when a node has actually gone.
       @delivery_tag
     end
 
-    # The caller keeps its headers hash and may go on mutating it after the
-    # publish returns, so copy that too rather than only the options around it.
-    def copy_publish_options(options)
-      return {} unless options
-
-      copy = options.dup
+    # One per publish call. The caller keeps its headers hash and may go on
+    # mutating it after the publish returns, so copy that too rather than only
+    # the options around it.
+    def publish_context(exchange, routing_key, options)
+      copy = options ? options.dup : {}
       copy[:headers] = copy[:headers].dup if copy[:headers].is_a?(Hash)
       copy[:properties] = copy[:properties].dup if copy[:properties].is_a?(Hash)
-      copy
+      PublishContext.new(exchange, routing_key, copy).freeze
     end
 
     # Confirm tracking backpressure: park until there is room for +needed+ more
@@ -1323,18 +1328,14 @@ module AsyncRabbitMQ
     # A message the broker had in fact accepted before the drop is delivered
     # twice: the usual at-least-once trade-off of confirms across a reconnect.
     def republish_unconfirmed
-      pending            = @pending_confirms.keys.map { |tag| [@pending_confirms[tag], @unconfirmed_meta[tag]] }
+      pending            = @pending_confirms.values
       @pending_confirms  = {}
-      @unconfirmed_meta  = {}
       @delivery_tag      = 0
       @confirm_condition ||= Async::Condition.new   # keep one an early waiter created
-      pending.each do |(bytes, meta)|
-        @frame_io.write_frame(bytes, publish: true)
+      pending.each do |entry|
+        @frame_io.write_frame(entry[0], publish: true)
         @delivery_tag += 1
-        @pending_confirms[@delivery_tag] = bytes
-        @unconfirmed_meta[@delivery_tag] = meta && meta.class.new(delivery_tag: @delivery_tag, payload: meta.payload,
-                                                                 exchange: meta.exchange, routing_key: meta.routing_key,
-                                                                 options: meta.options)
+        @pending_confirms[@delivery_tag] = entry
       end
       @logger.info("Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
     end

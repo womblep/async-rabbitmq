@@ -63,6 +63,14 @@ Reliability review against a payments workload. The two delivery-correctness ite
   the failures are raised together as `ClusterError`.
 - **OpenTelemetry no longer writes into the caller's headers hash** — a frozen hash raised, and
   one shared between fibers raced. The hash is copied before `traceparent` is injected.
+- **Tracking unconfirmed publishes no longer costs a quarter of the send throughput.** Keeping
+  the payload and routing for `unconfirmed_messages` built a keyword struct and copied the
+  options hash for every confirmed publish, and put it in a second hash alongside
+  `@pending_confirms`. Measured against 0.3.0 that cost 22% of publish throughput under simple
+  confirms and 33% with `basic_publish_batch`. The routing is now shared by one publish call
+  (a batch builds it once), the record is built when `unconfirmed_messages` is read rather than
+  when the message is sent, and it lives in the hash that was already there. Back to 0.3.0
+  throughput: batch +0.2%, simple confirms within run-to-run spread.
 - **`Notifier#publish` iterates a snapshot**, so a subscriber that unsubscribes itself no longer
   causes the next subscriber to be skipped.
 

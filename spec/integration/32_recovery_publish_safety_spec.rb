@@ -57,8 +57,13 @@ RSpec.describe "channel state and publish safety across recovery", :integration 
       expect(ch.wait_for_confirms).to be true
 
       # Stand in for a message whose ack never arrived: pending on the channel
-      # with its encoded frames, but never received by the broker.
-      ch.instance_variable_get(:@pending_confirms)[99] = encoded_publish(ch, session, "replayed after drop", q.name)
+      # with its encoded frames, but never received by the broker. Reserved
+      # through the channel's own path so this does not depend on the shape of
+      # what it keeps per outstanding publish.
+      ch.send(:reserve_confirm_tag,
+              encoded_publish(ch, session, "replayed after drop", q.name),
+              "replayed after drop",
+              nil)
 
       recover_connection!(session)
 
