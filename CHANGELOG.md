@@ -78,12 +78,31 @@ Reliability review against a payments workload. The two delivery-correctness ite
   another connection without silently losing their properties. A `Cluster#on_node_down` block that declares a fourth parameter is
   handed them; under `:drop` that is the only chance to see them.
 - `Session.new(tcp_user_timeout:)` — milliseconds, defaulting to twice the heartbeat.
-- `Channel#resyncing?` — true while the channel is being closed and reopened after an RPC
-  timeout. Operations park until it is back, as they do during connection recovery.
+- `Channel#resyncing?` — true while the channel is being reopened, after an RPC timeout or
+  through `Channel#reopen`. Operations park until it is back, as they do during connection
+  recovery, and unconfirmed messages are replayed before it goes `:open` so a new publish
+  cannot take a delivery tag that no longer matches its place on the wire.
 - `TopologyRegistry#clear_transient`.
 
 ### Changed
 
+- **A connection no longer keeps the reactor alive by itself.** The background loops are
+  transient tasks now, so a program that calls `connect` and `basic_consume` and then lets its
+  main task finish exits immediately instead of running the consumer — silently, with no error.
+  This is correct Async behaviour (nothing was waiting), but it is a change from 0.3.0, where
+  those tasks were children of the caller and held the reactor open. The caller has to block on
+  something it owns:
+
+  ```ruby
+  Async do
+    session.connect
+    ch = session.open_channel
+    ch.basic_qos(prefetch_count: 10)
+    ch.each("q") { |delivery, header, body| ... }   # blocks until the consumer goes away
+  end
+  ```
+
+  `Async::Condition#wait`, `sleep`, or anything else that parks the task will do.
 - **`delivery_tag` is a `VersionedDeliveryTag`, not an `Integer`.** It converts (`to_int`),
   compares, sorts, hashes and prints as the integer it wraps, so `basic_ack(di.delivery_tag)`,
   comparisons and array membership are unaffected. Code calling `.is_a?(Integer)` on it, or

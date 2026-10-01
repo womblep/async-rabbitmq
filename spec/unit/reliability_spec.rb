@@ -74,6 +74,27 @@ RSpec.describe "reliability fixes" do
     end
   end
 
+  describe "background task parent" do
+    it "uses the reactor it is called in, not the one it first saw" do
+      session = AsyncRabbitMQ::Session.new(host: "localhost")
+      roots = []
+
+      # Two separate reactors, as a CLI-style script or a test suite gives it.
+      2.times do
+        Sync do
+          task = session.spawn_background { sleep 0 }
+          roots << task.parent
+          task.stop
+        end
+      end
+
+      expect(roots.size).to eq(2)
+      # Memoising the first reactor's root would keep spawning onto a reactor
+      # that has already finished.
+      expect(roots[0]).not_to equal(roots[1])
+    end
+  end
+
   describe AsyncRabbitMQ::Cluster do
     it "stores the new secret on every node before updating any of them" do
       cluster = described_class.new(addresses: %w[a b c])

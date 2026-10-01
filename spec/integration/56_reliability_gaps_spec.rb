@@ -151,6 +151,58 @@ RSpec.describe "reliability gaps", :integration do
         expect(msg.options[:correlation_id]).to eq("c-1")
       end
     end
+
+    it "copies the caller's headers hash rather than holding a reference" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        qname = "test.unconfirmed.copy.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.confirm_select
+        allow(ch).to receive(:handle_confirm_ack)
+
+        headers = { "tenant" => "acme" }
+        ch.basic_publish("body", routing_key: qname, headers: headers)
+        sleep 0.3
+
+        headers["tenant"] = "mutated"       # the caller reuses its hash
+        headers["added"]  = "later"
+
+        stored = ch.unconfirmed_messages.first.options[:headers]
+        expect(stored).to eq("tenant" => "acme")
+      end
+    end
+  end
+
+  describe "reopening a channel" do
+    it "replays unconfirmed messages before it accepts new publishes" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        qname = "test.replay.order.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.confirm_select
+
+        # Hold a publish unconfirmed, then have the broker close the channel.
+        allow(ch).to receive(:handle_confirm_ack)
+        ch.basic_publish("first", routing_key: qname)
+        sleep 0.2
+        expect(ch.unconfirmed_messages.size).to eq(1)
+
+        observed = []
+        allow(ch).to receive(:republish_unconfirmed).and_wrap_original do |orig, *args|
+          observed << ch.instance_variable_get(:@state)
+          orig.call(*args)
+        end
+
+        ch.basic_ack(4242)                 # unknown tag: 406, broker closes it
+        wait_until { ch.closed? }
+        ch.reopen
+
+        # The replay must run before the channel is open, or a publish arriving
+        # mid-replay takes a tag that no longer matches its place on the wire.
+        expect(observed).to eq([:resyncing])
+        expect(ch.open?).to be true
+      end
+    end
   end
 
   describe "recovery retry after a drop mid-reopen" do

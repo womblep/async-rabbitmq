@@ -97,10 +97,12 @@ module AsyncRabbitMQ
       @state == :recovering
     end
 
-    # True while the channel is being closed and reopened after an RPC timeout.
-    # Operations park until it is back, as they do during recovery: the channel
-    # is about to go, so a publish issued now would be dropped by the broker
-    # and a request's reply would be discarded as the late one we are shedding.
+    # True while the channel is being reopened — after an RPC timeout, or
+    # through #reopen. Operations park until it is back, as they do during
+    # recovery: a publish issued now would either be dropped by the broker
+    # (the channel is closing) or overtake the unconfirmed messages being
+    # replayed onto the new one, and a request's reply would be discarded as
+    # the late one we are shedding.
     def resyncing?
       @state == :resyncing
     end
@@ -657,11 +659,13 @@ module AsyncRabbitMQ
     # topology: release parked publishers/RPCs first (they may hold the
     # semaphores basic_consume needs), then re-register the consumers.
     def finish_recovery!
-      @state = :open
       # After the session has replayed the topology, so a message addressed to a
       # queue or exchange the broker lost is not sent into the void before it is
-      # re-declared. Before the parked callers, so the older messages go first.
+      # re-declared. Before the channel goes :open, so that a new publisher
+      # cannot slip in if the replay yields on a full write queue and take a
+      # delivery tag that no longer matches its place on the wire.
       republish_unconfirmed if @confirms_enabled
+      @state = :open
       resume_parked!(:open)
       re_register_consumers
     end
@@ -726,10 +730,14 @@ module AsyncRabbitMQ
         raise NotOpenError, "Channel #{@channel_id} is #{@state}; only a closed channel can be reopened"
       end
       @consumers.clear unless recover_consumers
-      @session.reopen_channel(self)   # re-registers the id, then calls reopen_on
+      # Reopened :resyncing, not :open: the replay below must reach the wire
+      # before any new publish, or a tag no longer matches its position on it.
+      @session.reopen_channel(self, state: :resyncing)
       # Only this channel was closed, so the topology is intact and anything
       # left unconfirmed can go straight back out.
       republish_unconfirmed if @confirms_enabled
+      @state = :open
+      resume_parked!(:open)
       re_register_consumers if recover_consumers
       self
     end
@@ -1180,7 +1188,7 @@ module AsyncRabbitMQ
 
       @state = :closed
       @consumers.clear
-      @session.reopen_channel(self)
+      @session.reopen_channel(self, state: :resyncing)
       # reopen_on restores confirm mode but deliberately leaves the unconfirmed
       # messages alone: during connection recovery the topology they are
       # addressed to may not be back yet. Here only this channel went, so they
@@ -1188,6 +1196,7 @@ module AsyncRabbitMQ
       # broker also restarts at 1 on the reopened channel. Without it the two
       # drift apart and every later confirm resolves the wrong publish.
       republish_unconfirmed if @confirms_enabled
+      @state = :open
       @consumers.replace(consumers)
       re_register_consumers
       resume_parked!(:open)
@@ -1257,8 +1266,19 @@ module AsyncRabbitMQ
       @unconfirmed_meta[@delivery_tag] =
         UnconfirmedMessage.new(delivery_tag: @delivery_tag, payload: payload,
                                exchange: exchange, routing_key: routing_key,
-                               options: options ? options.dup : {})
+                               options: copy_publish_options(options))
       @delivery_tag
+    end
+
+    # The caller keeps its headers hash and may go on mutating it after the
+    # publish returns, so copy that too rather than only the options around it.
+    def copy_publish_options(options)
+      return {} unless options
+
+      copy = options.dup
+      copy[:headers] = copy[:headers].dup if copy[:headers].is_a?(Hash)
+      copy[:properties] = copy[:properties].dup if copy[:properties].is_a?(Hash)
+      copy
     end
 
     # Confirm tracking backpressure: park until there is room for +needed+ more

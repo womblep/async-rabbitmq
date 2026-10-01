@@ -254,6 +254,37 @@ declares matters.
 `ch.tx_select`, `ch.tx_commit`, `ch.tx_rollback`, `ch.using_tx?`. A channel
 cannot be both transactional and in confirm mode.
 
+### The reactor does not stay alive on its own
+
+The client's background work — the frame reader and writer, channel dispatch,
+heartbeats, recovery — runs in transient tasks, so it never holds the reactor
+open by itself. A program that connects, subscribes and then lets its main task
+finish exits immediately, without running the consumer and without an error:
+
+```ruby
+Async do
+  session.connect
+  ch = session.open_channel
+  ch.basic_qos(prefetch_count: 10)
+  ch.basic_consume("q") { |delivery, header, body| ... }
+end   # returns at once; nothing was waiting
+```
+
+Block on something you own instead:
+
+```ruby
+Async do
+  session.connect
+  ch = session.open_channel
+  ch.basic_qos(prefetch_count: 10)
+  ch.each("q") { |delivery, header, body| ... }   # blocks until the consumer or channel goes away
+end
+```
+
+`Async::Condition#wait`, a `sleep`, or your own supervisor task work equally
+well. Versions up to 0.3.0 kept the reactor alive by accident, because those
+tasks were children of whichever task called `connect`.
+
 ## Connection recovery
 
 When the connection is lost the session reconnects with exponential backoff
