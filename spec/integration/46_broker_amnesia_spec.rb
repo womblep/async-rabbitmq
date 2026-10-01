@@ -57,8 +57,12 @@ RSpec.describe "recovery against a broker that lost the topology", :integration 
       # rather than raced: publishing and severing at the right instant is not
       # reproducible, and the point here is the ordering, not the timing.
       encoded = channel.send(:encode_publish, "unconfirmed at drop", exchange: exchange, routing_key: "rk")
-      channel.instance_variable_set(:@pending_confirms, { 1 => encoded })
-      channel.instance_variable_set(:@delivery_tag, 1)
+      channel.instance_variable_set(:@pending_confirms, {})
+      channel.instance_variable_set(:@delivery_tag, 0)
+      # Through the channel's own path, so this does not depend on the shape of
+      # what it keeps per outstanding publish.
+      channel.send(:reserve_confirm_tag, encoded, "unconfirmed at drop",
+                   channel.send(:publish_context, exchange, "rk", {}))
 
       delete_queue(vhost, queue)
       delete_exchange(vhost, exchange)

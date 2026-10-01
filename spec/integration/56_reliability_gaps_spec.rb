@@ -112,7 +112,7 @@ RSpec.describe "reliability gaps", :integration do
         ch.basic_publish("x", routing_key: q.name)
 
         # Drop the broker's confirm so nothing ever resolves the publish.
-        ch.instance_variable_set(:@pending_confirms, { 99_999 => "never confirmed" })
+        ch.instance_variable_set(:@pending_confirms, { 99_999 => ["never confirmed", nil, nil] })
 
         expect { ch.wait_for_confirms(timeout: 0.5) }
           .to raise_error(AsyncRabbitMQ::ConfirmTimeoutError) { |e|
