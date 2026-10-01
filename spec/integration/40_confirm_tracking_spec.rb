@@ -27,7 +27,7 @@ RSpec.describe "publisher confirm tracking", :integration do
       # yet. The real delivery-tag counter is left alone so the broker's ack
       # for the parked publish (tag 1) still matches.
       pending = ch.instance_variable_get(:@pending_confirms)
-      (101..103).each { |t| pending[t] = "unconfirmed".b }
+      (101..103).each { |t| pending[t] = ["unconfirmed".b, nil, nil] }
 
       published = false
       publisher = Async::Task.current.async do
