@@ -218,6 +218,10 @@ if (summary = latencies.summary_ms)
   puts format("latency ms       p50 %.2f  p90 %.2f  p99 %.2f  max %.2f  min %.2f",
               summary[:p50], summary[:p90], summary[:p99], summary[:max], summary[:min])
   puts "                 (publish to handler, so both programs must share a clock: same host)"
+  if summary[:sampled] < summary[:count]
+    puts format("                 count and min/max exact over %d; percentiles from a %d sample",
+                summary[:count], summary[:sampled])
+  end
 end
 
 puts format("order            %s",

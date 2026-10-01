@@ -243,26 +243,52 @@ module Perf
   end
 
   # Latency samples in nanoseconds; percentiles computed on demand.
+  # Five numbers are reported from however many samples arrive, so the samples
+  # are not all kept. A soak takes millions: at one Integer slot each that was
+  # ~50 MB over a three-hour run, which in a tool whose job is to find leaks
+  # reads exactly like one. Count, min and max stay exact; the percentiles come
+  # from a bounded uniform sample of the stream.
   class Latencies
-    def initialize
-      @values = []
+    # 500k samples is ~4 MB, flat however long the run is, and keeps every
+    # percentile within about 1% of the exact value even where the tail is
+    # sparse. Shorter runs never reach it, so they stay exact.
+    CAPACITY = 500_000
+
+    def initialize(capacity: CAPACITY)
+      @capacity = capacity
+      @values   = []
+      @count    = 0
+      @min      = nil
+      @max      = nil
     end
 
     def <<(nanoseconds)
-      @values << nanoseconds
+      @count += 1
+      @min = nanoseconds if @min.nil? || nanoseconds < @min
+      @max = nanoseconds if @max.nil? || nanoseconds > @max
+
+      if @values.size < @capacity
+        @values << nanoseconds
+      else
+        # Vitter's algorithm R: every sample seen so far has the same chance of
+        # being one of the ones kept, so the percentiles stay unbiased however
+        # long the run is.
+        slot = Kernel.rand(@count)
+        @values[slot] = nanoseconds if slot < @capacity
+      end
     end
 
     def empty?
-      @values.empty?
+      @count.zero?
     end
 
     def summary_ms
-      return nil if @values.empty?
+      return nil if @count.zero?
 
       sorted = @values.sort
       at = ->(quantile) { sorted[[(quantile * sorted.size).ceil - 1, 0].max] / 1e6 }
-      { count: sorted.size, min: sorted.first / 1e6, p50: at.call(0.50),
-        p90: at.call(0.90), p99: at.call(0.99), max: sorted.last / 1e6 }
+      { count: @count, sampled: sorted.size, min: @min / 1e6, p50: at.call(0.50),
+        p90: at.call(0.90), p99: at.call(0.99), max: @max / 1e6 }
     end
   end
 
