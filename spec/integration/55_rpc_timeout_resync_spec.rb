@@ -152,7 +152,7 @@ RSpec.describe "channel resync after an RPC timeout", :integration do
         # window itself rather than guessing at a delay.
         100.times { break if ch.resyncing?; sleep 0.02 }
         ch.basic_publish("parked", routing_key: qname)
-        publish_generation = ch.send(:instance_variable_get, :@delivery_generation)
+        publish_generation = ch.delivery_generation
       end
 
       expect { ch.queue("test.resync.p2.#{SecureRandom.hex(4)}", durable: true) }

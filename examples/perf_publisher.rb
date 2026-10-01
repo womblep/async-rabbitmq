@@ -11,8 +11,11 @@
 # and concurrent request/reply calls on it are where frames get interleaved and
 # replies get handed to the wrong fiber. What this side checks:
 #
-#   * every confirm delivery tag is unique and the tags cover 1..published,
-#     so no publish took another publish's tag and none went missing
+#   * every confirm delivery tag is unique within the generation it was issued
+#     in, and the tags of a generation form one unbroken run, so no publish took
+#     another publish's tag and none went missing. Tags are per channel and per
+#     generation: a reopened channel starts again at 1, so a run that reconnects
+#     legitimately reuses numbers
 #   * no message came back unroutable (basic.return)
 #   * concurrent passive declares on the busy shared channel each get their
 #     own reply, not another fiber's ("crossed replies", --rpc-probe)
@@ -80,7 +83,14 @@ published_bytes = 0
 returned = []
 rpc_calls = 0
 rpc_crossed = []
-confirm_tags = Hash.new { |h, k| h[k] = { seen: Perf::Bitset.new, count: 0, duplicates: 0, max: 0 } }
+# Keyed by [channel, generation]. A reopened channel restarts its confirm tags
+# at 1, so tags are only unique within one generation; pooling them across a
+# reconnect reports every reused number as a publish that crossed another.
+confirm_tags = Hash.new { |h, k| h[k] = { seen: Perf::Bitset.new, count: 0, duplicates: 0, max: 0, min: nil } }
+# Publishes whose generation changed under them: the tag belongs to one side of
+# a reconnect but which cannot be told from here, so it is reported rather than
+# attributed to a generation and counted as a duplicate there.
+straddled = 0
 nacked = 0
 unconfirmed = 0
 started_at = nil
@@ -192,19 +202,35 @@ Sync do
     Async do
       channel = channels[stream]
       routing_key = Perf.routing_key(options[:run], stream)
-      tags = confirm_tags[channel.object_id]
       stream_started = Perf.monotonic_ns
       sent = 0
 
-      record = lambda do |tag|
+      record = lambda do |tag, generation|
         next if tag.nil?
 
+        tags = confirm_tags[[channel.object_id, generation]]
         if tags[:seen].set?(tag)
           tags[:duplicates] += 1
         else
           tags[:seen].set(tag)
           tags[:count] += 1
           tags[:max] = tag if tag > tags[:max]
+          tags[:min] = tag if tags[:min].nil? || tag < tags[:min]
+        end
+      end
+
+      # The generation can only be read either side of the publish, so a
+      # reconnect in between leaves the tag ambiguous. Say so instead of
+      # guessing: a parked publish resumes on the new generation, while one that
+      # had already taken its tag belongs to the old.
+      publish_in_generation = lambda do |&block|
+        before = channel.delivery_generation
+        result = block.call
+        after  = channel.delivery_generation
+        if before == after
+          Array(result).each { |t| record.call(t, after) }
+        else
+          straddled += Array(result).size
         end
       end
 
@@ -215,8 +241,10 @@ Sync do
           body = Perf.body(run: options[:run], stream: stream, seq: sent, size: options[:size])
           props = Perf.properties(run: options[:run], stream: stream, seq: sent,
                                   size: options[:size], persistent: options[:persistent])
-          record.call(channel.basic_publish(body, exchange: Perf::EXCHANGE, routing_key: routing_key,
-                                                  mandatory: true, **props))
+          publish_in_generation.call do
+            channel.basic_publish(body, exchange: Perf::EXCHANGE, routing_key: routing_key,
+                                        mandatory: true, **props)
+          end
           published_bytes += body.bytesize
         else
           bodies = (0...chunk).map do |i|
@@ -227,9 +255,10 @@ Sync do
           # the batch size, and the receiver checks the body against them.
           props = Perf.properties(run: options[:run], stream: stream, seq: sent,
                                   size: options[:size], persistent: options[:persistent], batch: chunk)
-          batch_tags = channel.basic_publish_batch(bodies, exchange: Perf::EXCHANGE, routing_key: routing_key,
-                                                           mandatory: true, **props)
-          Array(batch_tags).each { |t| record.call(t) }
+          publish_in_generation.call do
+            channel.basic_publish_batch(bodies, exchange: Perf::EXCHANGE, routing_key: routing_key,
+                                                mandatory: true, **props)
+          end
           published_bytes += bodies.sum(&:bytesize)
         end
 
@@ -248,8 +277,10 @@ Sync do
       eos_body = Perf.body(run: options[:run], stream: stream, seq: sent, size: Perf::MIN_SIZE)
       eos_props = Perf.properties(run: options[:run], stream: stream, seq: sent,
                                   size: Perf::MIN_SIZE, persistent: options[:persistent], eos: sent)
-      record.call(channel.basic_publish(eos_body, exchange: Perf::EXCHANGE, routing_key: routing_key,
-                                                  mandatory: true, **eos_props))
+      publish_in_generation.call do
+        channel.basic_publish(eos_body, exchange: Perf::EXCHANGE, routing_key: routing_key,
+                                        mandatory: true, **eos_props)
+      end
       sent
     end
   end
@@ -295,12 +326,25 @@ if options[:confirms] == "none"
 else
   total_tags = confirm_tags.values.sum { |t| t[:count] }
   dupes = confirm_tags.values.sum { |t| t[:duplicates] }
-  gaps = confirm_tags.values.sum { |t| t[:max] - t[:count] }
-  puts format("confirm tags     %d unique, %d issued twice, %d gap(s) below the highest tag", total_tags, dupes, gaps)
+  # Within a generation the tags this side was handed must be one unbroken run.
+  # Not necessarily from 1: after a reconnect the client renumbers the messages
+  # it replays, so the first tag a publisher sees on the new generation is just
+  # past them.
+  gaps = confirm_tags.values.sum { |t| t[:min].nil? ? 0 : (t[:max] - t[:min] + 1) - t[:count] }
+  generations = confirm_tags.keys.map(&:last).uniq.size
+  reopened = generations - 1
+
+  puts format("confirm tags     %d unique, %d issued twice, %d gap(s) in the run of tags", total_tags, dupes, gaps)
+  if reopened.positive?
+    puts format("                 across %d generation(s): the channel was reopened %d time(s) and the",
+                generations, reopened)
+    puts "                 broker restarts tags at 1 each time, so they are only unique within one"
+  end
+  puts format("                 %d publish(es) straddled a reopen, generation unknown", straddled) if straddled.positive?
   puts format("confirms         %d nacked, %d still unconfirmed at close", nacked, unconfirmed)
   problems << "#{dupes} delivery tag(s) issued twice: two publishes crossed" if dupes.positive?
   problems << "#{gaps} delivery tag(s) never issued" if gaps.positive?
-  problems << "#{total_tags} tags for #{expected_tags} publishes" if total_tags != expected_tags && !stop
+  problems << "#{total_tags + straddled} tags for #{expected_tags} publishes" if total_tags + straddled != expected_tags && !stop
   problems << "#{nacked} message(s) nacked by the broker" if nacked.positive?
   problems << "#{unconfirmed} message(s) unconfirmed at close" if unconfirmed.positive?
 end
