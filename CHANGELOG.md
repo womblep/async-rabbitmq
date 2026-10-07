@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-07
 
 Reliability review against a payments workload. The two delivery-correctness items
 (stale acks, empty bodies) are the reason to take this.
