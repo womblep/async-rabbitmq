@@ -1,8 +1,36 @@
 # async-rabbitmq
 
-A fiber-native RabbitMQ (AMQP 0-9-1) client for Ruby, built on the
+A fiber-native RabbitMQ (AMQP 0-9-1) client for Ruby, built on the amazing work
+of [Bunny](https://github.com/ruby-amqp/bunny).
+
+## Bunny is the gold standard
+
+Bunny is the client Ruby learned RabbitMQ on. Its API is the one Ruby developers
+already know, its defaults are the ones a decade of production traffic settled,
+and its source is the reference this library was written against. None of that
+is improved on here, and none of it is meant to be.
+
+**Parity with Bunny is a design goal**, chosen deliberately over fiber-native
+maximalism: the audience for this gem is people who already know Bunny, and
+surprising them is a bug. Where Bunny has an answer, that is the answer here.
+`pool_size` defaults to 1 and serialises handlers because `ConsumerWorkPool`
+does. A consumer backlog is an unbounded queue drained by a fixed set of workers
+because that is what `ConsumerWorkPool` is. `basic_get` acknowledges manually by
+default because Bunny's does. `spec/integration/25_bunny_api_parity_spec.rb`
+exists to keep it honest.
+
+Where this client does diverge, the README says so and says why - see the two
+publishing differences below, and `basic_qos`, which also resizes the handler
+pool where Bunny's leaves it alone.
+
+If you are not running under the fiber scheduler, use Bunny. It is excellent,
+and this gem has no advantage over it outside an async application.
+
+## What this adds
+
+The runtime, not the API. Built on the
 [async](https://github.com/socketry/async) ecosystem and
-[amq-protocol](https://github.com/ruby-amqp/amq-protocol). No threads: the
+[amq-protocol](https://github.com/ruby-amqp/amq-protocol), with no threads: the
 reader, writer, heartbeat and every consumer handler are fibers, so it fits
 Falcon, async-http and anything else running under the fiber scheduler.
 
@@ -152,6 +180,19 @@ RabbitMQ applies prefetch only to *unacknowledged* messages, so the broker
 treats each one as acked on send and keeps sending whatever you set. The client
 warns once per channel in either case, and says which of the two you are in.
 
+If you have read that warning and accepted the trade - an auto-ack consumer on a
+queue you know stays shallow, say - switch it off during boot:
+
+```ruby
+AsyncRabbitMQ.warn_unbounded_consumers = false
+```
+
+It is deliberately one process-wide setting rather than a per-channel option: an
+application either accepts unbounded consumers or it does not. The point of
+having it at all is that the alternative is turning the logger down, which would
+also lose stale delivery tags, broker-cancelled consumers and handler
+exceptions.
+
 ### Acknowledging, and delivery tags across a reconnect
 
 `delivery.delivery_tag` is a `VersionedDeliveryTag`: the broker's tag plus the
@@ -288,8 +329,7 @@ end
 ```
 
 `Async::Condition#wait`, a `sleep`, or your own supervisor task work equally
-well. Versions up to 0.3.0 kept the reactor alive by accident, because those
-tasks were children of whichever task called `connect`.
+well.
 
 ## Connection recovery
 

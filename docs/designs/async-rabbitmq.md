@@ -1,7 +1,6 @@
 # async-rabbitmq — architecture
 
-How the client is built, as of 0.3.0 (September 2026). It describes what exists,
-not what was planned. `README.md` is the usage documentation; this document is
+How the client is built. It describes what exists, not what was planned. `README.md` is the usage documentation; this document is
 for people changing the internals.
 
 ## Purpose
