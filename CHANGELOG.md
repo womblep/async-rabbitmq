@@ -31,6 +31,10 @@ All notable changes to this project will be documented in this file.
 
 - `Channel#backlog` — deliveries handed to the handler workers but not yet picked up, the number
   Bunny reports as `ConsumerWorkPool#backlog`.
+- `AsyncRabbitMQ.warn_unbounded_consumers` — a deliberate way to silence the unbounded-consumer
+  warning for someone who has read it and accepted the trade, instead of turning the logger down
+  and losing every other warning a channel raises (stale delivery tags, broker-cancelled consumers,
+  handler exceptions). One process-wide setting, read when a consumer starts; defaults to `true`.
 
 ### Changed
 

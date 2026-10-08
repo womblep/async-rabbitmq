@@ -54,6 +54,15 @@ RSpec.describe "reliability gaps", :integration do
   # manual-ack consumer and does nothing whatsoever for an auto-ack one.
   # Pointing an auto-ack caller at basic_qos would send them to a no-op.
   describe "consuming without a bound" do
+    # AsyncRabbitMQ.warn_unbounded_consumers is process-wide, and the suite runs
+    # in random order, so put it back whatever an example did to it.
+    around do |example|
+      previous = AsyncRabbitMQ.warn_unbounded_consumers
+      example.run
+    ensure
+      AsyncRabbitMQ.warn_unbounded_consumers = previous
+    end
+
     # Collect what the channel logs as warnings.
     def warnings_from(channel)
       [].tap do |collected|
@@ -111,6 +120,54 @@ RSpec.describe "reliability gaps", :integration do
         ch.basic_consume(qname, manual_ack: true) { |_d, _h, _b| }
 
         expect(warnings.grep(/basic_qos/)).to be_empty
+        ch.close
+      end
+    end
+
+    # Silencing is a boot-time decision, not a per-channel one: an application
+    # either accepts unbounded consumers or it does not. It needs to be possible
+    # without turning the logger down, which would lose every other warning a
+    # channel raises.
+    it "stays quiet everywhere once switched off" do
+      AsyncRabbitMQ.warn_unbounded_consumers = false
+
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        qname = "test.optout.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+
+        # A second channel too: the setting is not per-channel state captured
+        # when one happened to be opened.
+        other      = session.open_channel
+        other_warn = warnings_from(other)
+        oname      = "test.optout2.#{SecureRandom.hex(4)}"
+        other.queue(oname, durable: true)
+        other.basic_consume(oname, manual_ack: true) { |_d, _h, _b| }
+
+        expect(warnings).to be_empty
+        expect(other_warn).to be_empty
+        ch.close
+        other.close
+      end
+    end
+
+    it "defaults to warning, and warns again once switched back on" do
+      expect(AsyncRabbitMQ.warn_unbounded_consumers).to be(true)
+      AsyncRabbitMQ.warn_unbounded_consumers = false
+      AsyncRabbitMQ.warn_unbounded_consumers = true
+
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        qname = "test.optin.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+
+        expect(warnings.grep(/basic_qos cannot bound/).size).to eq(1)
         ch.close
       end
     end

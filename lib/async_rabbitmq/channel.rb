@@ -859,6 +859,7 @@ module AsyncRabbitMQ
     # messages, so on an auto-ack consumer basic_qos never engages and telling
     # the user to call it would be wrong. Warned once per channel.
     def warn_unbounded_prefetch(queue_name, manual_ack)
+      return unless AsyncRabbitMQ.warn_unbounded_consumers
       return if @qos_warned
       # A prefetch answers the manual-ack case, so having set one is a reason to
       # stay quiet there. It does nothing for an auto-ack consumer, so it is not
