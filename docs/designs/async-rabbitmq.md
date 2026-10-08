@@ -1,7 +1,6 @@
 # async-rabbitmq — architecture
 
-How the client is built, as of 0.3.0 (September 2026). It describes what exists,
-not what was planned. `README.md` is the usage documentation; this document is
+How the client is built. It describes what exists, not what was planned. `README.md` is the usage documentation; this document is
 for people changing the internals.
 
 ## Purpose
@@ -48,7 +47,7 @@ Session ── Channel ── Queue / Exchange              public API
    │          ├── per-channel Async::Queue of decoded frames
    │          ├── @rpc_sem      one request/reply in flight
    │          ├── @publish_sem  one publish's frames written contiguously
-   │          └── @pool_sem     bounds concurrent consumer handlers
+   │          └── @work_queue   deliveries waiting for pool_size handler workers
    │
    ├── TopologyRegistry     what to re-declare after a reconnect
    ├── Notifier             structured events, shared with every channel
@@ -103,10 +102,22 @@ serialises publishes so frames stay contiguous and confirm delivery tags follow
 wire order. Sharing a channel is still a bottleneck, and a synchronous call
 queues behind a publish backlog.
 
-Consumer handlers are spawned as tasks and gated by `@pool_sem`, sized by
-`pool_size` and coupled to `basic_qos(prefetch_count:)`. Deliveries to one queue
-are therefore ordered on the wire but may be processed concurrently, so ordering
-guarantees only hold end to end with one handler.
+Consumer handlers run in `pool_size` long-lived worker fibers draining
+`@work_queue`, sized by `pool_size` and coupled to `basic_qos(prefetch_count:)`.
+Deliveries to one queue are therefore ordered on the wire but may be processed
+concurrently, so ordering guarantees only hold end to end with one handler.
+
+The hand-off queue is deliberately unbounded. `dispatch_loop` is the only fiber
+popping this channel's frames, and so the only thing that delivers its confirms,
+close-ok and returns; blocking it on a full queue would deadlock a handler that
+publishes and waits for confirms against the loop that would have woken it. The
+Java client bounds the equivalent queue and has exactly that deadlock
+(rabbitmq-amqp-java-client#328), where the I/O thread parks in
+`LinkedBlockingQueue#put`. Bunny, the .NET client and amqp091-go all make the
+same choice we do: an unbounded queue of cheap items drained by a fixed set of
+workers. Memory is therefore bounded by prefetch on a manual-ack consumer, and
+not bounded at all on an auto-ack one - which is true of every client, because
+automatic acknowledgement has no backpressure mechanism to offer.
 
 ## Channel states and recovery
 

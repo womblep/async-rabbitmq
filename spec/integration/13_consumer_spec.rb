@@ -56,21 +56,50 @@ RSpec.describe "Consumer (basic.consume)", :integration do
     end
   end
 
-  it "subscriber block runs in a new Async::Task per delivery" do
+  # Handlers run in the channel's long-lived worker fibers, one per pool_size,
+  # rather than a fresh task per delivery. That is what keeps a backlog costing
+  # its messages instead of a fiber stack per message, and it is why a pool of
+  # one serialises deliveries through a single fiber.
+  it "runs the subscriber block in a handler worker, off the calling fiber" do
     isolated_session do |session, _|
-      ch     = session.open_channel
-      q      = ch.queue("test.async.task", durable: true)
-      tasks  = []
+      ch    = session.open_channel # pool_size: 1
+      q     = ch.queue("test.async.task", durable: true)
+      tasks = []
 
-      tag = q.subscribe(manual_ack: false) do |*|
-        tasks << Async::Task.current
-      end
+      tag = q.subscribe(manual_ack: false) { |*| tasks << Async::Task.current }
 
       3.times { ch.basic_publish("x", routing_key: q.name) }
       sleep 0.3
 
-      # Each delivery ran in a distinct task
-      expect(tasks.uniq.size).to eq(tasks.size) if tasks.size > 1
+      expect(tasks.size).to eq(3)
+      # One worker at pool_size 1, so all three share it.
+      expect(tasks.uniq.size).to eq(1)
+      # And it is not the fiber that published, nor the one dispatching frames.
+      expect(tasks.first).not_to eq(Async::Task.current)
+      ch.basic_cancel(tag)
+      ch.close
+    end
+  end
+
+  it "runs handlers in pool_size distinct workers" do
+    isolated_session do |session, _|
+      ch    = session.open_channel(pool_size: 2)
+      q     = ch.queue("test.async.workers", durable: true)
+      tasks = []
+      gate  = Async::Condition.new
+
+      # Both workers have to be busy at once for the second to be observed, so
+      # hold the first handler until its partner has also recorded itself.
+      tag = q.subscribe(manual_ack: false) do |*|
+        tasks << Async::Task.current
+        gate.wait if tasks.size < 2
+      end
+
+      2.times { ch.basic_publish("x", routing_key: q.name) }
+      sleep 0.4
+
+      expect(tasks.uniq.size).to eq(2)
+      gate.signal
       ch.basic_cancel(tag)
       ch.close
     end

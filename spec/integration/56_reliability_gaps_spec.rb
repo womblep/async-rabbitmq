@@ -49,18 +49,36 @@ RSpec.describe "reliability gaps", :integration do
     end
   end
 
-  describe "consuming without basic_qos" do
-    it "warns once, naming the queue" do
-      isolated_session do |session, _|
-        warnings = []
-        logger = session.instance_variable_get(:@logger)
-        logger.define_singleton_method(:warn) { |msg| warnings << msg.to_s }
+  # The warning has to be ack-mode aware, because the advice is. RabbitMQ
+  # applies prefetch only to unacknowledged messages, so basic_qos bounds a
+  # manual-ack consumer and does nothing whatsoever for an auto-ack one.
+  # Pointing an auto-ack caller at basic_qos would send them to a no-op.
+  describe "consuming without a bound" do
+    # AsyncRabbitMQ.warn_unbounded_consumers is process-wide, and the suite runs
+    # in random order, so put it back whatever an example did to it.
+    around do |example|
+      previous = AsyncRabbitMQ.warn_unbounded_consumers
+      example.run
+    ensure
+      AsyncRabbitMQ.warn_unbounded_consumers = previous
+    end
 
-        ch = session.open_channel
-        ch.instance_variable_set(:@logger, logger)
+    # Collect what the channel logs as warnings.
+    def warnings_from(channel)
+      [].tap do |collected|
+        logger = channel.instance_variable_get(:@logger)
+        logger.define_singleton_method(:warn) { |msg| collected << msg.to_s }
+      end
+    end
+
+    it "warns a manual-ack consumer once per channel, naming the queue" do
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
         qname = "test.noqos.#{SecureRandom.hex(4)}"
         ch.queue(qname, durable: true)
-        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+        ch.basic_consume(qname, manual_ack: true) { |_d, _h, _b| }
 
         expect(warnings.grep(/without basic_qos/).size).to eq(1)
         expect(warnings.join).to include(qname)
@@ -68,25 +86,105 @@ RSpec.describe "reliability gaps", :integration do
         # Only once per channel, however many consumers.
         other = "test.noqos2.#{SecureRandom.hex(4)}"
         ch.queue(other, durable: true)
-        ch.basic_consume(other, manual_ack: false) { |_d, _h, _b| }
+        ch.basic_consume(other, manual_ack: true) { |_d, _h, _b| }
         expect(warnings.grep(/without basic_qos/).size).to eq(1)
         ch.close
       end
     end
 
-    it "stays quiet when prefetch is set" do
+    it "tells an auto-ack consumer that basic_qos cannot bound it" do
       isolated_session do |session, _|
-        warnings = []
-        ch = session.open_channel
-        logger = ch.instance_variable_get(:@logger)
-        logger.define_singleton_method(:warn) { |msg| warnings << msg.to_s }
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        qname = "test.autoack.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+
+        expect(warnings.grep(/basic_qos cannot bound/).size).to eq(1)
+        expect(warnings.join).to include(qname)
+        # It must not send them to the no-op.
+        expect(warnings.grep(/Call basic_qos/)).to be_empty
+        ch.close
+      end
+    end
+
+    it "stays quiet for a manual-ack consumer once prefetch is set" do
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
 
         ch.basic_qos(prefetch_count: 10)
         qname = "test.qos.#{SecureRandom.hex(4)}"
         ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: true) { |_d, _h, _b| }
+
+        expect(warnings.grep(/basic_qos/)).to be_empty
+        ch.close
+      end
+    end
+
+    # Silencing is a boot-time decision, not a per-channel one: an application
+    # either accepts unbounded consumers or it does not. It needs to be possible
+    # without turning the logger down, which would lose every other warning a
+    # channel raises.
+    it "stays quiet everywhere once switched off" do
+      AsyncRabbitMQ.warn_unbounded_consumers = false
+
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        qname = "test.optout.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
         ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
 
-        expect(warnings.grep(/without basic_qos/)).to be_empty
+        # A second channel too: the setting is not per-channel state captured
+        # when one happened to be opened.
+        other      = session.open_channel
+        other_warn = warnings_from(other)
+        oname      = "test.optout2.#{SecureRandom.hex(4)}"
+        other.queue(oname, durable: true)
+        other.basic_consume(oname, manual_ack: true) { |_d, _h, _b| }
+
+        expect(warnings).to be_empty
+        expect(other_warn).to be_empty
+        ch.close
+        other.close
+      end
+    end
+
+    it "defaults to warning, and warns again once switched back on" do
+      expect(AsyncRabbitMQ.warn_unbounded_consumers).to be(true)
+      AsyncRabbitMQ.warn_unbounded_consumers = false
+      AsyncRabbitMQ.warn_unbounded_consumers = true
+
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        qname = "test.optin.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+
+        expect(warnings.grep(/basic_qos cannot bound/).size).to eq(1)
+        ch.close
+      end
+    end
+
+    it "still warns an auto-ack consumer that has set a prefetch" do
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        ch.basic_qos(prefetch_count: 10)
+        qname = "test.qos.autoack.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+
+        # Having set a prefetch is the case where the caller most believes the
+        # consumer is bounded, so silence here would be the worst outcome.
+        expect(warnings.grep(/basic_qos cannot bound/).size).to eq(1)
         ch.close
       end
     end
