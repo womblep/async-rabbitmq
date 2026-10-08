@@ -24,6 +24,10 @@ module AsyncRabbitMQ
     # after an RPC timeout, used when the session has no rpc_timeout set.
     RESYNC_TIMEOUT = 5
 
+    # Pushed onto the work queue to retire one handler worker. Compared by
+    # identity, so it can never collide with a delivery.
+    WORKER_STOP = Object.new.freeze
+
     include Instrumented
 
     attr_reader :channel_id, :pool_size
@@ -89,14 +93,27 @@ module AsyncRabbitMQ
       @pending_content   = nil
       @recovered_condition = nil     # fibers parked while the connection recovers
       @pool_size         = validate_pool_size!(pool_size)
-      @pool_sem          = Async::Semaphore.new(@pool_size)
+      @work_queue        = nil       # Async::Queue of [method, header, body, entry]
+      @workers           = []        # long-lived handler fibers draining it
     end
 
-    # Resize the consumer-handler concurrency cap. Shrinking does not evict
-    # already-running handlers; new deliveries park until permits free up.
+    # Resize the consumer-handler concurrency cap by adding or retiring
+    # workers. Growing takes effect at once. Shrinking is a sentinel on the
+    # work queue, so it retires a worker as soon as the queue drains to it:
+    # immediately when idle, after the current backlog when busy. A handler
+    # already running is never interrupted.
     def pool_size=(n)
-      @pool_size      = validate_pool_size!(n)
-      @pool_sem.limit = @pool_size
+      n = validate_pool_size!(n)
+      return if n == @pool_size
+
+      @pool_size = n
+      resize_workers
+    end
+
+    # Deliveries handed to the handler workers but not yet picked up. Bunny
+    # reports the same number as ConsumerWorkPool#backlog.
+    def backlog
+      @work_queue&.size || 0
     end
 
     def open?
@@ -147,6 +164,7 @@ module AsyncRabbitMQ
       instrument("channel.closed") { { channel: @channel_id, reason: :user } }
       @session.channel_closed(@channel_id)
       @queue&.push(nil)  # wake dispatch_loop so it can detect :closed and exit
+      stop_workers
       wake_each_waiters
     end
 
@@ -409,7 +427,7 @@ module AsyncRabbitMQ
     # handlers run concurrently across all consumers on this channel.
     # Returns the consumer tag.
     def basic_consume(queue_name, consumer_tag: "", manual_ack: false, exclusive: false, arguments: {}, &block)
-      warn_unbounded_prefetch(queue_name)
+      warn_unbounded_prefetch(queue_name, manual_ack)
       resp = rpc(
         AMQ::Protocol::Basic::Consume.encode(@channel_id, queue_name, consumer_tag, false, !manual_ack, exclusive, false, arguments),
         AMQ::Protocol::Basic::ConsumeOk
@@ -667,6 +685,9 @@ module AsyncRabbitMQ
       @confirm_condition = nil
       release_outstanding_slots(error)
       @queue&.push(nil) rescue nil
+      # The connection is gone, so the queued deliveries are too: the broker
+      # requeues whatever was unacknowledged and sends it again on the new one.
+      stop_workers(discard: true)
     rescue => e
       # ignore — best-effort unblock
     end
@@ -832,20 +853,33 @@ module AsyncRabbitMQ
       true
     end
 
-    # Without a prefetch limit the broker sends as fast as it can and the
-    # dispatch loop starts a task per delivery. pool_size caps how many run at
-    # once, not how many exist, so memory grows with the queue depth rather
-    # than with the concurrency. Warned once per channel; basic_qos fixes it.
-    def warn_unbounded_prefetch(queue_name)
+    # Without a bound the broker sends as fast as it can and the backlog is
+    # held in this process. What can bound it depends on the ack mode, so the
+    # advice does too: RabbitMQ applies prefetch only to *unacknowledged*
+    # messages, so on an auto-ack consumer basic_qos never engages and telling
+    # the user to call it would be wrong. Warned once per channel.
+    def warn_unbounded_prefetch(queue_name, manual_ack)
       return if @qos_warned
-      return if @prefetch && @prefetch[:count].to_i > 0
+      # A prefetch answers the manual-ack case, so having set one is a reason to
+      # stay quiet there. It does nothing for an auto-ack consumer, so it is not
+      # a reason here: that is precisely the case where the caller believes the
+      # consumer is bounded and it is not.
+      return if manual_ack && @prefetch && @prefetch[:count].to_i > 0
 
       @qos_warned = true
       @logger.warn(
-        "Channel #{@channel_id}: consuming from #{queue_name} without basic_qos. " \
-        "The broker will send the whole queue as fast as it can and one task is " \
-        "created per delivery, so memory tracks queue depth. Call " \
-        "basic_qos(prefetch_count: n) before basic_consume."
+        if manual_ack
+          "Channel #{@channel_id}: consuming from #{queue_name} without basic_qos. " \
+          "The broker will send the whole queue as fast as it can and the backlog is " \
+          "held in this process. Call basic_qos(prefetch_count: n) before " \
+          "basic_consume to bound it."
+        else
+          "Channel #{@channel_id}: consuming from #{queue_name} with automatic acks. " \
+          "The broker treats every message as acknowledged on send, so basic_qos " \
+          "cannot bound this consumer and the whole queue is held in this process. " \
+          "Use manual_ack: true with basic_qos(prefetch_count: n) to get " \
+          "backpressure, or watch #backlog."
+        end
       )
     end
 
@@ -904,7 +938,78 @@ module AsyncRabbitMQ
     # -------------------------------------------------------------------------
 
     def start_dispatch_task
+      start_workers
       @session.spawn_background { dispatch_loop }
+    end
+
+    # One long-lived fiber per pool_size, each draining the work queue for the
+    # life of this channel generation. A backlogged delivery costs a 4-element
+    # array (~48 bytes) rather than a parked Async::Task and its fiber stack
+    # (~15.7 KB measured), so memory tracks the messages held, not the fibers
+    # holding them. Bunny's ConsumerWorkPool is the same shape: fixed workers
+    # draining an unbounded ::Queue.
+    def start_workers
+      stop_workers(discard: true)
+      queue    = @work_queue = Async::Queue.new
+      @workers = Array.new(@pool_size) { @session.spawn_background { worker_loop(queue) } }
+    end
+
+    # Retire this generation's workers. The sentinel goes on the back of the
+    # queue, so by default they finish the deliveries already queued before
+    # standing down - Bunny's ConsumerWorkPool#shutdown drains the same way.
+    #
+    # +discard+ throws that backlog away instead, for when the connection
+    # underneath it has gone: the broker requeues whatever was unacknowledged
+    # and sends it again on the new one, so running these handlers too would
+    # process every queued message twice. dequeue(timeout: 0) returns at once
+    # on an empty queue, so the drain cannot suspend us mid-teardown.
+    def stop_workers(discard: false)
+      queue = @work_queue
+      nil while discard && queue&.dequeue(timeout: 0)
+      @workers.size.times { queue&.push(WORKER_STOP) }
+      @workers    = []
+      @work_queue = nil
+    end
+
+    # Workers are bound to the queue they were started on, never to @work_queue,
+    # so a worker outliving its generation cannot start draining the next one.
+    def resize_workers
+      queue = @work_queue
+      return unless queue
+
+      delta = @pool_size - @workers.size
+      if delta.positive?
+        delta.times { @workers << @session.spawn_background { worker_loop(queue) } }
+      elsif delta.negative?
+        (-delta).times { queue.push(WORKER_STOP) }
+        @workers.pop(-delta)
+      end
+    end
+
+    def worker_loop(queue)
+      loop do
+        job = queue.dequeue
+        break if job.nil? || job.equal?(WORKER_STOP)
+
+        run_handler(*job)
+      end
+    end
+
+    def run_handler(method, header, body, entry)
+      started = instrument_clock
+      begin
+        entry[:block].call(method, header, body)
+      rescue => e
+        handle_consumer_error(e, method, entry)
+      ensure
+        if started
+          instrument("message.consumed") do
+            { channel: @channel_id, queue: entry[:queue_name], consumer_tag: method.consumer_tag,
+              bytes: body.to_s.bytesize, redelivered: method.redelivered,
+              duration: instrument_elapsed(started) }
+          end
+        end
+      end
     end
 
     def dispatch_loop
@@ -979,24 +1084,15 @@ module AsyncRabbitMQ
         if entry
           stamp_delivery_tag(method)
           @unsettled[method.delivery_tag.to_i] = true if entry[:manual_ack]
-          Async do
-            @pool_sem.acquire do
-              started = instrument_clock
-              begin
-                entry[:block].call(method, header, body)
-              rescue => e
-                handle_consumer_error(e, method, entry)
-              ensure
-                if started
-                  instrument("message.consumed") do
-                    { channel: @channel_id, queue: entry[:queue_name], consumer_tag: method.consumer_tag,
-                      bytes: body.to_s.bytesize, redelivered: method.redelivered,
-                      duration: instrument_elapsed(started) }
-                  end
-                end
-              end
-            end
-          end
+          # Hand off without suspending: Async::Queue wraps Thread::Queue,
+          # whose push never blocks. dispatch_loop must stay free, because it
+          # is also what delivers this channel's confirms, close-ok and
+          # returns - a handler that publishes and waits for confirms would
+          # otherwise deadlock against the loop that would have woken it. That
+          # is not hypothetical: it is rabbitmq-amqp-java-client#328, where a
+          # bounded work pool parked the I/O thread in LinkedBlockingQueue#put.
+          # A nil queue means the channel is going away and the delivery is moot.
+          @work_queue&.push([method, header, body, entry])
         else
           @logger.warn("Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
         end
@@ -1119,6 +1215,7 @@ module AsyncRabbitMQ
       @reply_condition = nil
       # Stop dispatch_loop
       @queue&.push(nil)
+      stop_workers(discard: true)
       wake_each_waiters
     end
 

@@ -140,11 +140,17 @@ ch.basic_cancel(tag)
 ch.each("q") { |delivery, header, body| ... }   # blocks until the consumer or channel goes away
 ```
 
-Consumer handlers run in their own fibers, at most `pool_size` at a time per
-channel. Set `basic_qos` before `basic_consume`: without a prefetch limit the
-broker sends the whole queue as fast as it can and one fiber is created per
-delivery, so memory tracks queue depth rather than concurrency. The client
-warns once per channel if you don't.
+Each channel runs `pool_size` long-lived handler fibers (default 1, serialized,
+Bunny parity) draining a queue of deliveries, so a backlog costs the messages it
+holds rather than a fiber per message. `ch.backlog` reports how many deliveries
+are waiting, as Bunny's `ConsumerWorkPool#backlog` does.
+
+What bounds that backlog depends on the ack mode. With `manual_ack: true`, set
+`basic_qos` before `basic_consume` and the broker holds everything past the
+prefetch window. With automatic acks there is no backpressure to be had:
+RabbitMQ applies prefetch only to *unacknowledged* messages, so the broker
+treats each one as acked on send and keeps sending whatever you set. The client
+warns once per channel in either case, and says which of the two you are in.
 
 ### Acknowledging, and delivery tags across a reconnect
 

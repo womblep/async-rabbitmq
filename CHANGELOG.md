@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **A consumer backlog no longer costs a fiber per queued message.** The dispatch loop started an
+  `Async::Task` per delivery and took the pool semaphore from inside it, so `pool_size` capped how
+  many handlers *ran*, not how many *existed*. A parked task measured ~15.7 KB (the fiber object
+  plus its touched stack pages) against ~48 bytes for a queue entry, and 20,000 backlogged messages
+  cost 315 MB of RSS. Handlers now run in `pool_size` long-lived worker fibers draining a queue of
+  deliveries — the same shape as Bunny's `ConsumerWorkPool`, the .NET client's consumer dispatcher
+  and amqp091-go.
+
+  That queue is deliberately unbounded. The dispatch loop is also what delivers this channel's
+  confirms, close-ok and returns, so blocking it on a full queue would deadlock a handler that
+  publishes and waits for confirms — which is precisely rabbitmq-amqp-java-client#328, where a
+  bounded work pool parked the I/O thread in `LinkedBlockingQueue#put`. Memory is therefore bounded
+  by prefetch on a manual-ack consumer and unbounded on an auto-ack one, as it is in every client,
+  because automatic acknowledgement has no backpressure to offer.
+- **The missing-prefetch warning no longer sends auto-ack consumers to a no-op.** RabbitMQ applies
+  prefetch only to *unacknowledged* messages, so `basic_qos` does nothing at all on a
+  `manual_ack: false` consumer. The warning told you to call it anyway, and then went quiet once you
+  had — silence in the one case where the caller most believes the consumer is bounded and it is
+  not. It now says which of the two cases you are in, and still warns an auto-ack consumer that has
+  set a prefetch.
+
+### Added
+
+- `Channel#backlog` — deliveries handed to the handler workers but not yet picked up, the number
+  Bunny reports as `ConsumerWorkPool#backlog`.
+
+### Changed
+
+- A backlog still queued when the channel goes away is now **finished on a graceful `close`** (as
+  Bunny's `ConsumerWorkPool#shutdown` drains) and **discarded when the connection is lost or the
+  channel is reopened**, where the broker requeues the same messages and running the queued handlers
+  too would process each one twice.
+- `Channel#pool_size=` resizes by adding or retiring workers rather than resizing a semaphore.
+  Growing takes effect at once; shrinking retires a worker as soon as the queue drains to the
+  sentinel — immediately when idle, after the current backlog when busy. A running handler is never
+  interrupted.
+
 ## [0.4.0] - 2026-10-07
 
 Reliability review against a payments workload. The two delivery-correctness items

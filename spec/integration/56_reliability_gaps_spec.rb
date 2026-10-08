@@ -49,18 +49,27 @@ RSpec.describe "reliability gaps", :integration do
     end
   end
 
-  describe "consuming without basic_qos" do
-    it "warns once, naming the queue" do
-      isolated_session do |session, _|
-        warnings = []
-        logger = session.instance_variable_get(:@logger)
-        logger.define_singleton_method(:warn) { |msg| warnings << msg.to_s }
+  # The warning has to be ack-mode aware, because the advice is. RabbitMQ
+  # applies prefetch only to unacknowledged messages, so basic_qos bounds a
+  # manual-ack consumer and does nothing whatsoever for an auto-ack one.
+  # Pointing an auto-ack caller at basic_qos would send them to a no-op.
+  describe "consuming without a bound" do
+    # Collect what the channel logs as warnings.
+    def warnings_from(channel)
+      [].tap do |collected|
+        logger = channel.instance_variable_get(:@logger)
+        logger.define_singleton_method(:warn) { |msg| collected << msg.to_s }
+      end
+    end
 
-        ch = session.open_channel
-        ch.instance_variable_set(:@logger, logger)
+    it "warns a manual-ack consumer once per channel, naming the queue" do
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
         qname = "test.noqos.#{SecureRandom.hex(4)}"
         ch.queue(qname, durable: true)
-        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+        ch.basic_consume(qname, manual_ack: true) { |_d, _h, _b| }
 
         expect(warnings.grep(/without basic_qos/).size).to eq(1)
         expect(warnings.join).to include(qname)
@@ -68,25 +77,57 @@ RSpec.describe "reliability gaps", :integration do
         # Only once per channel, however many consumers.
         other = "test.noqos2.#{SecureRandom.hex(4)}"
         ch.queue(other, durable: true)
-        ch.basic_consume(other, manual_ack: false) { |_d, _h, _b| }
+        ch.basic_consume(other, manual_ack: true) { |_d, _h, _b| }
         expect(warnings.grep(/without basic_qos/).size).to eq(1)
         ch.close
       end
     end
 
-    it "stays quiet when prefetch is set" do
+    it "tells an auto-ack consumer that basic_qos cannot bound it" do
       isolated_session do |session, _|
-        warnings = []
-        ch = session.open_channel
-        logger = ch.instance_variable_get(:@logger)
-        logger.define_singleton_method(:warn) { |msg| warnings << msg.to_s }
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        qname = "test.autoack.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
+
+        expect(warnings.grep(/basic_qos cannot bound/).size).to eq(1)
+        expect(warnings.join).to include(qname)
+        # It must not send them to the no-op.
+        expect(warnings.grep(/Call basic_qos/)).to be_empty
+        ch.close
+      end
+    end
+
+    it "stays quiet for a manual-ack consumer once prefetch is set" do
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
 
         ch.basic_qos(prefetch_count: 10)
         qname = "test.qos.#{SecureRandom.hex(4)}"
         ch.queue(qname, durable: true)
+        ch.basic_consume(qname, manual_ack: true) { |_d, _h, _b| }
+
+        expect(warnings.grep(/basic_qos/)).to be_empty
+        ch.close
+      end
+    end
+
+    it "still warns an auto-ack consumer that has set a prefetch" do
+      isolated_session do |session, _|
+        ch       = session.open_channel
+        warnings = warnings_from(ch)
+
+        ch.basic_qos(prefetch_count: 10)
+        qname = "test.qos.autoack.#{SecureRandom.hex(4)}"
+        ch.queue(qname, durable: true)
         ch.basic_consume(qname, manual_ack: false) { |_d, _h, _b| }
 
-        expect(warnings.grep(/without basic_qos/)).to be_empty
+        # Having set a prefetch is the case where the caller most believes the
+        # consumer is bounded, so silence here would be the worst outcome.
+        expect(warnings.grep(/basic_qos cannot bound/).size).to eq(1)
         ch.close
       end
     end
