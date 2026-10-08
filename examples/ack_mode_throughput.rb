@@ -24,13 +24,18 @@
 #     message, which is why it is the classic throughput killer; raising it
 #     trades memory back for speed and flattens out well before the queue depth.
 #
-# The run measures one bare request/reply to the broker first and prints it as a
-# floor, because a consumer at prefetch 1 cannot beat it - it waits for the
-# window to reopen after every message - and that floor is a property of the
-# machine, not of this client. On Windows it lands on the ~15.6 ms scheduler
-# tick, which caps prefetch 1 at around 64 msg/s however fast the broker is; on
-# Linux loopback it is usually well under a millisecond. Read the prefetch 1 row
-# against the floor, never on its own.
+# The run measures one synchronous request/reply to the broker first, because
+# the low-prefetch rows are network turnaround rather than client throughput,
+# and that turnaround belongs to the machine. Measured: ~15.5 ms on a Windows
+# dev box - the 15.625 ms scheduler tick, which pins prefetch 1 near 64 msg/s
+# however fast the broker is - against 0.48 ms on a Linux box with a local
+# broker, where prefetch 1 reached 3709 msg/s.
+#
+# Note that prefetch 1 beat the synchronous round trip there: 0.27 ms per
+# message against 0.48 ms. That is expected and worth understanding, because
+# basic.ack expects no reply, so an ack and the broker's next delivery overlap,
+# where queue.declare must wait for its answer. Read the round trip as the order
+# of magnitude the low-prefetch rows live in, not a ceiling they cannot pass.
 #
 # Handler concurrency is pinned at 1 for every run so the numbers compare ack
 # modes rather than concurrency. That needs saying out loud, because
@@ -156,7 +161,11 @@ Sync do
   puts
   puts Perf.rule("ack mode: #{COUNT} messages of #{options[:size]} B, pool_size #{options[:handlers]}")
   puts
-  printf("  broker round trip here: %.2f ms, so prefetch 1 cannot exceed ~%.0f msg/s\n\n", rtt, 1000.0 / rtt)
+  printf("  one synchronous broker round trip here: %.2f ms - the order of
+", rtt)
+  puts   "  magnitude the low-prefetch rows live in, though acks pipeline so they"
+  puts   "  can beat it"
+  puts
 
   runs = [{ label: "auto-ack", manual_ack: false, prefetch: nil }]
   # Auto-ack with a prefetch set is worth showing precisely because it looks
@@ -190,10 +199,16 @@ Sync do
   puts "  slowest: #{slowest.label} at #{Perf.fmt_rate(COUNT, slowest.seconds)}" \
        " (#{format('%.1fx', Perf.rate(COUNT, fastest.seconds) / Perf.rate(COUNT, slowest.seconds))} slower)"
   puts
-  puts "  The slowest row is a round-trip measurement, not a client one: at"
-  puts "  prefetch 1 every message waits for the window to reopen, and the"
-  puts "  floor above says what that costs on this machine."
-  puts
+  if (p1 = results.find { |r| r.label == "manual-ack, prefetch 1" })
+    printf("  prefetch 1 cost %.2f ms per message against a %.2f ms synchronous round
+",
+           p1.seconds * 1000.0 / COUNT, rtt)
+    puts "  trip. That row measures network turnaround, not this client: every message"
+    puts "  waits for the broker to reopen the window. It can come in under the round"
+    puts "  trip because basic.ack expects no reply, so the ack and the next delivery"
+    puts "  overlap - which is why the round trip is a reference point, not a ceiling."
+    puts
+  end
   puts "  Peak backlog is what the client was holding, so roughly"
   puts "  peak x #{options[:size]} B of message plus the client's own per-delivery"
   puts "  overhead. The auto-ack rows peak at the whole batch however the"
