@@ -33,12 +33,6 @@ All notable changes to this project will be documented in this file.
   decides that one message; returning anything else takes the configured default. A hook that
   raises is logged and the default applies, so a broken hook cannot strand a delivery.
 
-- **README: an installation section**, missing since the gem was first published, and a section on
-  letting a quorum queue do the retrying with `x-delivery-limit` and `x-delayed-retry-*` — which
-  replaces the hand-rolled delay-queue pattern entirely. It also records that a channel closing
-  with a delivery unacknowledged counts as a failed delivery, so reconnects spend the same budget
-  handler failures do and a message can be dead-lettered by reconnects alone.
-
 ## [0.5.0] - 2026-10-09
 
 ### Fixed
