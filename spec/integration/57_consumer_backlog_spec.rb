@@ -136,6 +136,69 @@ RSpec.describe "consumer backlog memory", :integration do
   end
 
   # ---------------------------------------------------------------------------
+  # Handler reentrancy. Workers are spawned from dispatch_loop and Async runs a
+  # new task immediately rather than scheduling it, so a worker could take its
+  # first delivery inside dispatch_loop's own turn. dispatch_loop is also what
+  # delivers this channel's confirms, close-ok and returns, so a handler that
+  # waits on any of those from inside that turn is the case to prove.
+  # ---------------------------------------------------------------------------
+
+  it "runs a handler that publishes and waits for its own confirms" do
+    isolated_session do |session, _|
+      ch  = session.open_channel
+      q   = ch.queue("reentrant.in.#{SecureRandom.hex(4)}", durable: true)
+      out = ch.queue("reentrant.out.#{SecureRandom.hex(4)}", durable: true)
+      ch.confirm_select
+
+      confirmed = false
+      failure   = nil
+
+      ch.basic_consume(q.name, manual_ack: false) do |_d, _h, _b|
+        ch.basic_publish("echo", routing_key: out.name)
+        ch.wait_for_confirms
+        confirmed = true
+      rescue StandardError => e
+        failure = e
+      end
+
+      # The very first delivery is the one that matters: it is the delivery that
+      # creates the worker, so it is the only one that could run inline.
+      ch.basic_publish("trigger", routing_key: q.name)
+
+      wait_until(timeout: 15) { confirmed || failure }
+      raise failure if failure
+
+      expect(confirmed).to be(true)
+      ch.close
+    end
+  end
+
+  it "runs a handler that issues a synchronous RPC on its own channel" do
+    isolated_session do |session, _|
+      ch = session.open_channel
+      q  = ch.queue("reentrant.rpc.#{SecureRandom.hex(4)}", durable: true)
+
+      declared = nil
+      failure  = nil
+
+      ch.basic_consume(q.name, manual_ack: false) do |_d, _h, _b|
+        # queue.declare-ok comes back through dispatch_loop, same as a confirm.
+        declared = ch.queue(q.name, passive: true).name
+      rescue StandardError => e
+        failure = e
+      end
+
+      ch.basic_publish("trigger", routing_key: q.name)
+
+      wait_until(timeout: 15) { declared || failure }
+      raise failure if failure
+
+      expect(declared).to eq(q.name)
+      ch.close
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Workers are created on demand. basic_qos couples pool_size to prefetch, so
   # creating them eagerly meant asking for a prefetch of 500 cost 500 fibers,
   # and setting pool_size back down - the documented escape hatch from that

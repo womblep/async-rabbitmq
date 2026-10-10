@@ -1082,15 +1082,15 @@ module AsyncRabbitMQ
 
     # Workers are bound to the queue they were started on, never to @work_queue,
     # so a worker outliving its generation cannot start draining the next one.
+    #
+    # A worker spawned from dispatch_loop takes its first delivery inside
+    # dispatch_loop's own turn, because Async runs a new task immediately rather
+    # than scheduling it. That is safe: a handler that waits - on a confirm, on
+    # an RPC reply - suspends, and suspending hands control back to
+    # dispatch_loop, so the reply still arrives. The two reentrancy examples in
+    # 57_consumer_backlog_spec.rb pin that. An earlier revision yielded here
+    # first; it was removed because no test could show it preventing anything.
     def worker_loop(queue)
-      # Hand control back before touching the queue. Workers are now spawned
-      # from dispatch_loop, and Async runs a new task immediately rather than
-      # scheduling it, so without this the first delivery would run its handler
-      # inside dispatch_loop's own turn. That is the thing the worker pool
-      # exists to prevent: a handler that publishes and waits for confirms would
-      # be waiting on the loop that delivers them.
-      Async::Task.current.yield
-
       loop do
         job = queue.dequeue
         break if job.nil? || job.equal?(WORKER_STOP)
