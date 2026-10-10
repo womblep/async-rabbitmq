@@ -1018,16 +1018,38 @@ module AsyncRabbitMQ
       @session.spawn_background { dispatch_loop }
     end
 
-    # One long-lived fiber per pool_size, each draining the work queue for the
-    # life of this channel generation. A backlogged delivery costs a 4-element
-    # array (~48 bytes) rather than a parked Async::Task and its fiber stack
-    # (~15.7 KB measured), so memory tracks the messages held, not the fibers
-    # holding them. Bunny's ConsumerWorkPool is the same shape: fixed workers
-    # draining an unbounded ::Queue.
+    # Up to pool_size long-lived fibers drain the work queue for the life of
+    # this channel generation. A backlogged delivery costs a 4-element array
+    # (~48 bytes) rather than a parked Async::Task and its fiber stack (~15.7 KB
+    # measured), so memory tracks the messages held, not the fibers holding
+    # them. Bunny's ConsumerWorkPool is the same shape: workers draining an
+    # unbounded ::Queue.
+    #
+    # The queue is made here; the workers are not. See #ensure_worker.
     def start_workers
       stop_workers(discard: true)
-      queue    = @work_queue = Async::Queue.new
-      @workers = Array.new(@pool_size) { @session.spawn_background { worker_loop(queue) } }
+      @work_queue = Async::Queue.new
+      @workers    = []
+    end
+
+    # Create a worker on demand, never up front.
+    #
+    # basic_qos couples pool_size to prefetch_count, so creating them eagerly
+    # meant a caller asking for a prefetch of 500 got 500 fibers, and a caller
+    # who then set pool_size back down - the documented escape hatch from that
+    # coupling - retired all but pool_size of them without a single delivery
+    # between them. A fiber's touched stack pages stay in the process RSS after
+    # it exits, measured at ~12 KB apiece: 12.6 MB at prefetch 500 across two
+    # channels, which is the whole of the consumer memory difference the 24-hour
+    # soaks showed.
+    #
+    # Demand never exceeds pool_size, so the concurrency bound is unchanged: a
+    # channel that genuinely runs pool_size handlers at once still gets there,
+    # one delivery at a time.
+    def ensure_worker(queue)
+      return if queue.nil? || @workers.size >= @pool_size
+
+      @workers << @session.spawn_background { worker_loop(queue) }
     end
 
     # Retire this generation's workers. The sentinel goes on the back of the
@@ -1047,22 +1069,28 @@ module AsyncRabbitMQ
       @work_queue = nil
     end
 
-    # Workers are bound to the queue they were started on, never to @work_queue,
-    # so a worker outliving its generation cannot start draining the next one.
+    # Only ever shrinks. Growing is left to #ensure_worker, so raising pool_size
+    # costs nothing until there are deliveries that need the extra concurrency.
     def resize_workers
-      queue = @work_queue
-      return unless queue
+      queue  = @work_queue
+      excess = @workers.size - @pool_size
+      return if queue.nil? || !excess.positive?
 
-      delta = @pool_size - @workers.size
-      if delta.positive?
-        delta.times { @workers << @session.spawn_background { worker_loop(queue) } }
-      elsif delta.negative?
-        (-delta).times { queue.push(WORKER_STOP) }
-        @workers.pop(-delta)
-      end
+      excess.times { queue.push(WORKER_STOP) }
+      @workers.pop(excess)
     end
 
+    # Workers are bound to the queue they were started on, never to @work_queue,
+    # so a worker outliving its generation cannot start draining the next one.
     def worker_loop(queue)
+      # Hand control back before touching the queue. Workers are now spawned
+      # from dispatch_loop, and Async runs a new task immediately rather than
+      # scheduling it, so without this the first delivery would run its handler
+      # inside dispatch_loop's own turn. That is the thing the worker pool
+      # exists to prevent: a handler that publishes and waits for confirms would
+      # be waiting on the loop that delivers them.
+      Async::Task.current.yield
+
       loop do
         job = queue.dequeue
         break if job.nil? || job.equal?(WORKER_STOP)
@@ -1168,7 +1196,10 @@ module AsyncRabbitMQ
           # is not hypothetical: it is rabbitmq-amqp-java-client#328, where a
           # bounded work pool parked the I/O thread in LinkedBlockingQueue#put.
           # A nil queue means the channel is going away and the delivery is moot.
-          @work_queue&.push([method, header, body, entry])
+          if (queue = @work_queue)
+            queue.push([method, header, body, entry])
+            ensure_worker(queue)
+          end
         else
           @logger.warn("Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
         end

@@ -136,6 +136,65 @@ RSpec.describe "consumer backlog memory", :integration do
   end
 
   # ---------------------------------------------------------------------------
+  # Workers are created on demand. basic_qos couples pool_size to prefetch, so
+  # creating them eagerly meant asking for a prefetch of 500 cost 500 fibers,
+  # and setting pool_size back down - the documented escape hatch from that
+  # coupling - retired all but pool_size of them without ever handing one a
+  # delivery. Their touched stacks stay in RSS: 12.6 MB at prefetch 500 across
+  # two channels, measured on the soak box.
+  # ---------------------------------------------------------------------------
+
+  it "does not create a fiber per prefetch slot" do
+    isolated_session do |session, _|
+      ch = session.open_channel
+
+      before = live_fibers
+      ch.basic_qos(prefetch_count: 500)
+      # Sampled before pool_size is reset, because that is the peak: the eager
+      # version created 500 workers here and only then retired 499 of them.
+      created = live_fibers - before
+      ch.pool_size = 1
+
+      expect(ch.pool_size).to eq(1)
+      expect(created).to be <= 5
+      ch.close
+    end
+  end
+
+  it "creates workers only as deliveries need them, up to pool_size" do
+    isolated_session do |session, _|
+      ch = session.open_channel(pool_size: 4)
+      q  = ch.queue("lazy.#{SecureRandom.hex(4)}", durable: true)
+
+      idle = live_fibers
+      gate = Async::Condition.new
+      seen = 0
+      tag  = q.subscribe(manual_ack: false) do |_d, _h, _b|
+        seen += 1
+        gate.wait # hold every worker, so concurrency has to grow to proceed
+      end
+
+      # A consumer with nothing to do needs no workers at all.
+      expect(live_fibers - idle).to be <= 5
+
+      4.times { ch.basic_publish("x", routing_key: q.name) }
+      wait_until { seen == 4 }
+
+      # Four blocked handlers means four workers really were created, so the
+      # concurrency bound is still honoured - it is only reached on demand.
+      expect(seen).to eq(4)
+
+      gate.signal
+      begin
+        ch.basic_cancel(tag)
+      rescue StandardError
+        nil
+      end
+      ch.close
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # What happens to a backlog that is still queued when the channel goes away.
   # The retirement sentinel goes on the BACK of the work queue, so workers
   # finish what is already queued before standing down. That is right for a
