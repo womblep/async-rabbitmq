@@ -6,38 +6,38 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **`on_error:` on a consumer, and `Channel#on_error_disposition` for the channel.** What happens
-  to a delivery whose handler raised: `:dead_letter` (the default — one attempt, then the queue's
-  dead-letter route), `:retry` (the message failed — hand it back and let the broker count it),
-  `:release` (not the message's fault — hand it back without counting it), or `:leave` (settle
-  nothing, as Bunny does).
-- **`:release` for failures that are not the message's fault.** `:retry` rejects, which the broker
-  counts towards `x-delivery-limit`; `:release` nacks, which it does not. Shutting down, shedding
-  load or riding out a downstream outage are not the message's fault, and rejecting through a
-  gateway outage would walk a whole backlog into the dead-letter queue in `x-delivery-limit`
-  attempts. The trade is that `:release` has no backstop, so a genuinely poison message is
-  redelivered forever.
-- **`on_handler_error` can now decide the disposition.** It runs before the delivery is settled,
-  and returning one of those three overrides the default for that message; returning anything
-  else takes the default. A hook that raises is logged and the default applies, so a broken hook
-  cannot strand a delivery.
+- **Choose what happens to a delivery whose handler raised.** `on_error:` on a consumer, or
+  `Channel#on_error_disposition` for the channel behind it:
+  - `:dead_letter` (the default) — `reject(requeue: false)`: one attempt, then the queue's
+    dead-letter route. Safe on any queue, which is why it is the default; `:retry` on a queue
+    with no delivery limit is an infinite loop, and a default must not depend on configuration
+    the client cannot see.
+  - `:retry` — `reject(requeue: true)`: the message failed, so let the broker count it towards
+    `x-delivery-limit` and retire it.
+  - `:release` — `nack(requeue: true)`: *not* the message's fault, so hand it back without
+    counting it. For shutting down, shedding load, or riding out a downstream outage — rejecting
+    through a gateway outage would walk a whole backlog into the dead-letter queue in
+    `x-delivery-limit` attempts. The trade is that nothing advances towards the limit, so a
+    genuinely poison message is redelivered forever.
+  - `:leave` — settle nothing, as Bunny does.
 
-### Fixed
+  `:retry` and `:release` differ only in blame, and the protocol draws that line: RabbitMQ counts
+  a delivery as failed on `basic.reject` (AMQP 1.0 `modified` with `delivery-failed`) but not on
+  `basic.nack` (AMQP 1.0 `released`). Measured against 4.3.2 with `x-delivery-limit: 3`: nack
+  stayed at `nil` over eight redeliveries and the message was never retired; reject went 1, 2, 3
+  and it was dead-lettered. The automatic error path previously nacked, so it could never reach
+  the limit; it now rejects. For a single delivery the verbs are otherwise equivalent, and an
+  unconfigured consumer behaves exactly as before.
 
-- **A handler that raises now rejects rather than nacks, so broker-side retry works.** RabbitMQ
-  only counts a delivery as failed on `basic.reject`; after `basic.nack` the `x-delivery-count`
-  header does not move, so a nacked message is redelivered forever and never reaches
-  `x-delivery-limit`. Measured against RabbitMQ 4.3.2: nack stayed at `nil` over eight
-  redeliveries, reject went 1, 2, 3 and the message was retired to its dead-letter queue. For a
-  single delivery the two verbs are otherwise equivalent, so this changes nothing else.
+  `on_handler_error` now runs *before* the delivery is settled, so returning one of the four
+  decides that one message; returning anything else takes the configured default. A hook that
+  raises is logged and the default applies, so a broken hook cannot strand a delivery.
 
-### Changed
-
-- **`on_handler_error` runs before the delivery is settled**, not after, so that what it returns
-  can decide the outcome. Hooks that only report are unaffected.
-- README gained an installation section, and documents letting a quorum queue do the retrying
-  with `x-delivery-limit` and `x-delayed-retry-*` — including that a reconnect spends the same
-  delivery budget a handler failure does, so a message can be dead-lettered by reconnects alone.
+- **README: an installation section**, missing since the gem was first published, and a section on
+  letting a quorum queue do the retrying with `x-delivery-limit` and `x-delayed-retry-*` — which
+  replaces the hand-rolled delay-queue pattern entirely. It also records that a channel closing
+  with a delivery unacknowledged counts as a failed delivery, so reconnects spend the same budget
+  handler failures do and a message can be dead-lettered by reconnects alone.
 
 ## [0.5.0] - 2026-10-09
 
