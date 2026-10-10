@@ -8,8 +8,15 @@ All notable changes to this project will be documented in this file.
 
 - **`on_error:` on a consumer, and `Channel#on_error_disposition` for the channel.** What happens
   to a delivery whose handler raised: `:dead_letter` (the default — one attempt, then the queue's
-  dead-letter route), `:retry` (hand it back and let the broker count the failures), or `:leave`
-  (settle nothing, as Bunny does).
+  dead-letter route), `:retry` (the message failed — hand it back and let the broker count it),
+  `:release` (not the message's fault — hand it back without counting it), or `:leave` (settle
+  nothing, as Bunny does).
+- **`:release` for failures that are not the message's fault.** `:retry` rejects, which the broker
+  counts towards `x-delivery-limit`; `:release` nacks, which it does not. Shutting down, shedding
+  load or riding out a downstream outage are not the message's fault, and rejecting through a
+  gateway outage would walk a whole backlog into the dead-letter queue in `x-delivery-limit`
+  attempts. The trade is that `:release` has no backstop, so a genuinely poison message is
+  redelivered forever.
 - **`on_handler_error` can now decide the disposition.** It runs before the delivery is settled,
   and returning one of those three overrides the default for that message; returning anything
   else takes the default. A hook that raises is logged and the default applies, so a broken hook

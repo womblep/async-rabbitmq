@@ -246,8 +246,22 @@ there are three:
 | | what it does | when |
 |---|---|---|
 | `:dead_letter` (default) | `reject(requeue: false)` | one attempt, then the queue's dead-letter route. Safe on any queue. |
-| `:retry` | `reject(requeue: true)` | hand it back and let the broker count the failures — see below. |
+| `:retry` | `reject(requeue: true)` | the message failed — hand it back and let the broker count it. See below. |
+| `:release` | `nack(requeue: true)` | *not* the message's fault — hand it back without counting it. |
 | `:leave` | nothing | you settle it yourself. This is Bunny's behaviour. |
+
+`:retry` and `:release` both return the message; the difference is blame.
+RabbitMQ counts a delivery as failed only on `basic.reject` (AMQP 1.0
+`modified` with `delivery-failed`), not on `basic.nack` (AMQP 1.0 `released`).
+So use `:retry` for a message that cannot be processed, and `:release` when the
+message is innocent and you simply cannot handle it now — shutting down,
+shedding load, a downstream outage. Rejecting during a gateway outage would
+walk your whole backlog to the dead-letter queue in `x-delivery-limit`
+attempts; releasing it costs the messages nothing.
+
+The trade is that `:release` has no backstop: nothing advances towards
+`x-delivery-limit`, so a genuinely poison message is redelivered forever. Use it
+when you know the failure is yours, not the message's.
 
 Set it per consumer, or channel-wide for all of them:
 
@@ -266,7 +280,11 @@ anything else, or nothing, to take the configured default:
 ```ruby
 ch.on_handler_error do |error, delivery, queue_name|
   Sentry.capture_exception(error, extra: { queue: queue_name })
-  error.is_a?(TransientUpstreamError) ? :retry : :dead_letter
+  case error
+  when GatewayDown           then :release      # innocent, do not count it
+  when TransientUpstreamError then :retry       # failed, count towards the limit
+  else                            :dead_letter
+  end
 end
 ```
 

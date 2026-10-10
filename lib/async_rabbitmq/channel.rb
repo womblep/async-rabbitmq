@@ -21,15 +21,21 @@ module AsyncRabbitMQ
     #               count. A quorum queue with x-delivery-limit retires it (and
     #               dead-letters it) once the limit is reached, with
     #               x-delayed-retry-* spacing the attempts.
+    # :release      nack(requeue: true) -- hand it back WITHOUT counting the
+    #               failure against the message. For a failure that is not the
+    #               message's fault: shutting down, shedding load, a downstream
+    #               outage. On a poison message this loops forever, since
+    #               nothing advances towards x-delivery-limit.
     # :leave        settle nothing. Bunny's behaviour: the delivery stays
     #               unacknowledged and it is yours to resolve.
     #
-    # reject, never nack: the broker only counts a delivery as failed on
-    # basic.reject (AMQP 1.0 modified/delivery-failed). After basic.nack the
-    # x-delivery-count does not move, so a nacked message is redelivered
-    # forever and never reaches x-delivery-limit. For a single delivery the two
-    # verbs are otherwise equivalent.
-    ERROR_DISPOSITIONS = %i[dead_letter retry leave].freeze
+    # :retry rejects and :release nacks, and the difference is the whole point.
+    # The broker counts a delivery as failed only on basic.reject (AMQP 1.0
+    # modified/delivery-failed); after basic.nack the x-delivery-count does not
+    # move (AMQP 1.0 released). So reject means "this message failed, hold it
+    # against it" and nack means "have it back, no blame". For a single
+    # delivery the verbs are otherwise equivalent.
+    ERROR_DISPOSITIONS = %i[dead_letter retry release leave].freeze
 
     # A message published under confirms whose fate is unknown: the broker
     # neither acked nor nacked it before the connection went. +payload+ and its
@@ -969,9 +975,15 @@ module AsyncRabbitMQ
       return unless entry[:manual_ack] && unsettled?(method.delivery_tag)
 
       begin
-        basic_reject(method.delivery_tag, requeue: disposition == :retry)
+        if disposition == :release
+          # nack, not reject: released rather than failed, so the broker does
+          # not count it against the message.
+          basic_nack(method.delivery_tag, requeue: true)
+        else
+          basic_reject(method.delivery_tag, requeue: disposition == :retry)
+        end
       rescue => e
-        @logger.error("Channel #{@channel_id}: could not reject after consumer error: #{e.class}: #{e.message}")
+        @logger.error("Channel #{@channel_id}: could not settle after consumer error: #{e.class}: #{e.message}")
       end
     end
 

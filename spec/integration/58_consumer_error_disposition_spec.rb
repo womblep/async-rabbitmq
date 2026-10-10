@@ -85,6 +85,52 @@ RSpec.describe "consumer error disposition", :integration do
     end
   end
 
+  describe ":release" do
+    it "hands the message back without counting it against the message" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        ch.basic_qos(prefetch_count: 5)
+        main, park = retry_queue(ch, SecureRandom.hex(4), limit: 2)
+
+        counts = []
+        ch.basic_consume(main, manual_ack: true, on_error: :release) do |_di, header, _b|
+          counts << (header.properties[:headers] || {})["x-delivery-count"]
+          raise "the gateway is down, not this message"
+        end
+        ch.basic_publish("innocent", routing_key: main)
+
+        # Well past a limit of 2: under :retry this would have been retired by
+        # now. Released deliveries never advance the count, so it keeps coming.
+        wait_until(20) { counts.size >= 5 }
+        expect(counts.uniq).to eq([nil])
+        expect(ch.basic_get(park, manual_ack: false)).to be_nil   # not dead-lettered
+
+        ch.close
+      end
+    end
+
+    it "differs from :retry only in whether the failure is counted" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        ch.basic_qos(prefetch_count: 5)
+        main, _park = retry_queue(ch, SecureRandom.hex(4), limit: 2)
+
+        seen = []
+        ch.basic_consume(main, manual_ack: true, on_error: :retry) do |_di, header, _b|
+          seen << (header.properties[:headers] || {})["x-delivery-count"]
+          raise "boom"
+        end
+        ch.basic_publish("poison", routing_key: main)
+
+        # Same queue, same limit, same handler: rejecting retires it.
+        wait_until(20) { seen.size >= 3 }
+        sleep 1.5
+        expect(seen).to eq([nil, 1, 2])
+        ch.close
+      end
+    end
+  end
+
   describe ":leave" do
     it "settles nothing, so the broker still holds the delivery" do
       isolated_session do |session, _|
