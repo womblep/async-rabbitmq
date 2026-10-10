@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Choose what happens to a delivery whose handler raised.** `on_error:` on a consumer, or
+  `Channel#on_error_disposition` for the channel behind it:
+  - `:dead_letter` (the default) — `reject(requeue: false)`: one attempt, then the queue's
+    dead-letter route. Safe on any queue, which is why it is the default; `:retry` on a queue
+    with no delivery limit is an infinite loop, and a default must not depend on configuration
+    the client cannot see.
+  - `:retry` — `reject(requeue: true)`: the message failed, so let the broker count it towards
+    `x-delivery-limit` and retire it.
+  - `:release` — `nack(requeue: true)`: *not* the message's fault, so hand it back without
+    counting it. For shutting down, shedding load, or riding out a downstream outage — rejecting
+    through a gateway outage would walk a whole backlog into the dead-letter queue in
+    `x-delivery-limit` attempts. The trade is that nothing advances towards the limit, so a
+    genuinely poison message is redelivered forever.
+  - `:leave` — settle nothing, as Bunny does.
+
+  `:retry` and `:release` differ only in blame, and the protocol draws that line: RabbitMQ counts
+  a delivery as failed on `basic.reject` (AMQP 1.0 `modified` with `delivery-failed`) but not on
+  `basic.nack` (AMQP 1.0 `released`). Measured against 4.3.2 with `x-delivery-limit: 3`: nack
+  stayed at `nil` over eight redeliveries and the message was never retired; reject went 1, 2, 3
+  and it was dead-lettered. The automatic error path previously nacked, so it could never reach
+  the limit; it now rejects. For a single delivery the verbs are otherwise equivalent, and an
+  unconfigured consumer behaves exactly as before.
+
+  `on_handler_error` now runs *before* the delivery is settled, so returning one of the four
+  decides that one message; returning anything else takes the configured default. A hook that
+  raises is logged and the default applies, so a broken hook cannot strand a delivery.
+
 ## [0.5.0] - 2026-10-09
 
 ### Fixed
