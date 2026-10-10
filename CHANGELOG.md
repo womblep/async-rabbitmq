@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`on_error:` on a consumer, and `Channel#on_error_disposition` for the channel.** What happens
+  to a delivery whose handler raised: `:dead_letter` (the default — one attempt, then the queue's
+  dead-letter route), `:retry` (hand it back and let the broker count the failures), or `:leave`
+  (settle nothing, as Bunny does).
+- **`on_handler_error` can now decide the disposition.** It runs before the delivery is settled,
+  and returning one of those three overrides the default for that message; returning anything
+  else takes the default. A hook that raises is logged and the default applies, so a broken hook
+  cannot strand a delivery.
+
+### Fixed
+
+- **A handler that raises now rejects rather than nacks, so broker-side retry works.** RabbitMQ
+  only counts a delivery as failed on `basic.reject`; after `basic.nack` the `x-delivery-count`
+  header does not move, so a nacked message is redelivered forever and never reaches
+  `x-delivery-limit`. Measured against RabbitMQ 4.3.2: nack stayed at `nil` over eight
+  redeliveries, reject went 1, 2, 3 and the message was retired to its dead-letter queue. For a
+  single delivery the two verbs are otherwise equivalent, so this changes nothing else.
+
+### Changed
+
+- **`on_handler_error` runs before the delivery is settled**, not after, so that what it returns
+  can decide the outcome. Hooks that only report are unaffected.
+- README gained an installation section, and documents letting a quorum queue do the retrying
+  with `x-delivery-limit` and `x-delayed-retry-*` — including that a reconnect spends the same
+  delivery budget a handler failure does, so a message can be dead-lettered by reconnects alone.
+
 ## [0.5.0] - 2026-10-09
 
 ### Fixed

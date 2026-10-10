@@ -3,6 +3,23 @@
 A fiber-native RabbitMQ (AMQP 0-9-1) client for Ruby, built on the amazing work
 of [Bunny](https://github.com/ruby-amqp/bunny).
 
+## Installing
+
+```ruby
+# Gemfile
+gem "async-rabbitmq", "~> 0.5"
+```
+
+or
+
+```bash
+gem install async-rabbitmq
+```
+
+Requires Ruby 3.4+ and RabbitMQ 3.13+ (tested against 4.x). The gem also
+installs an `async-rabbitmq` command for publishing, consuming, inspecting and
+purging from a terminal.
+
 ## Bunny is the gold standard
 
 Bunny is the client Ruby learned RabbitMQ on. Its API is the one Ruby developers
@@ -221,16 +238,79 @@ sent and `false` when the tag belonged to an earlier generation and was
 dropped. A dropped ack is not a lost message: the broker requeued it when the
 channel went, and it is redelivered on the new connection.
 
-When a handler raises, the delivery is nacked with `requeue: false` — so a
-message that always fails dead-letters instead of looping — and
-`on_handler_error` is called. A delivery the handler already settled itself is
-left alone, so acking and then raising in whatever follows is safe:
+### When a handler raises
+
+The delivery is settled for you. What happens to it is the *disposition*, and
+there are three:
+
+| | what it does | when |
+|---|---|---|
+| `:dead_letter` (default) | `reject(requeue: false)` | one attempt, then the queue's dead-letter route. Safe on any queue. |
+| `:retry` | `reject(requeue: true)` | hand it back and let the broker count the failures — see below. |
+| `:leave` | nothing | you settle it yourself. This is Bunny's behaviour. |
+
+Set it per consumer, or channel-wide for all of them:
+
+```ruby
+ch.on_error_disposition = :retry                       # channel default
+ch.basic_consume("q", manual_ack: true, on_error: :leave) { |d, h, b| ... }
+```
+
+A delivery the handler already settled itself is left alone, so acking and then
+raising in whatever follows is safe.
+
+`on_handler_error` runs **before** the delivery is settled, so what it returns
+can decide this one message's fate. Return a disposition to override; return
+anything else, or nothing, to take the configured default:
 
 ```ruby
 ch.on_handler_error do |error, delivery, queue_name|
   Sentry.capture_exception(error, extra: { queue: queue_name })
+  error.is_a?(TransientUpstreamError) ? :retry : :dead_letter
 end
 ```
+
+A hook that raises is logged and the configured default applies, so a broken
+hook cannot strand a delivery.
+
+### Letting the broker do the retrying
+
+`:retry` is built for quorum queues, which count failed deliveries themselves:
+
+```ruby
+ch.quorum_queue("orders.commands", arguments: {
+  "x-delivery-limit"          => 5,          # retire after 5 failures
+  "x-delayed-retry-type"      => "failed",   # back off between attempts
+  "x-delayed-retry-min"       => 1_000,
+  "x-delayed-retry-max"       => 30_000,
+  "x-dead-letter-exchange"    => "",
+  "x-dead-letter-routing-key" => "orders.commands.parked",
+})
+```
+
+The broker spaces the attempts (`min(min_delay × delivery_count, max_delay)`),
+counts them in the `x-delivery-count` header, and dead-letters the message once
+`x-delivery-limit` is reached. There is no second delay queue to declare and no
+attempt counting to write.
+
+Two things that are easy to get wrong:
+
+**It has to be `reject`, not `nack`.** RabbitMQ only treats a delivery as
+*failed* on `basic.reject`; after `basic.nack` the `x-delivery-count` does not
+move, so a nacked message is redelivered forever and never reaches the limit.
+This client always rejects, which is why `:retry` works at all. If you settle
+deliveries yourself, use `basic_reject`.
+
+**Reconnects spend the same budget.** A channel closing with the delivery
+unacknowledged — a disconnect, a recovery, a broker-side channel error — counts
+as a failed delivery too. A message can therefore be dead-lettered by three
+reconnects without your handler ever failing. Size `x-delivery-limit` for
+handler failures *plus* the reconnects you expect, and read the dead-letter
+queue as "failed or unlucky".
+
+Without `x-delivery-limit`, `:retry` is an infinite loop for a message that
+always fails. That is why the default is `:dead_letter`: it is safe on any
+queue, and a default should not depend on configuration the client cannot see.
 
 ### RabbitMQ 4.2+ and transient queues
 

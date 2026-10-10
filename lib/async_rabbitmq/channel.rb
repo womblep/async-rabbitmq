@@ -9,6 +9,28 @@ module AsyncRabbitMQ
   # Duck-typed stream interface: #each (yields deliveries) and #write (publishes).
   # Does NOT inherit Async::IO::Stream — a channel is logical, not physical IO.
   class Channel
+    # What to do with a delivery whose handler raised. Chosen per consumer, or
+    # returned by the on_handler_error hook to decide per message.
+    #
+    # :dead_letter  reject(requeue: false) -- one attempt, then the queue's
+    #               dead-letter route. Safe on any queue, so it is the default:
+    #               :retry on a queue with no delivery limit loops forever, and
+    #               a default must not depend on configuration the client
+    #               cannot see.
+    # :retry        reject(requeue: true) -- hand it back and let the broker
+    #               count. A quorum queue with x-delivery-limit retires it (and
+    #               dead-letters it) once the limit is reached, with
+    #               x-delayed-retry-* spacing the attempts.
+    # :leave        settle nothing. Bunny's behaviour: the delivery stays
+    #               unacknowledged and it is yours to resolve.
+    #
+    # reject, never nack: the broker only counts a delivery as failed on
+    # basic.reject (AMQP 1.0 modified/delivery-failed). After basic.nack the
+    # x-delivery-count does not move, so a nacked message is redelivered
+    # forever and never reaches x-delivery-limit. For a single delivery the two
+    # verbs are otherwise equivalent.
+    ERROR_DISPOSITIONS = %i[dead_letter retry leave].freeze
+
     # A message published under confirms whose fate is unknown: the broker
     # neither acked nor nacked it before the connection went. +payload+ and its
     # routing are kept so it can be published again on another connection.
@@ -77,6 +99,7 @@ module AsyncRabbitMQ
       @on_cancel         = nil
       @on_error          = nil
       @on_handler_error  = nil
+      @on_error_disposition = :dead_letter
       @resyncing         = false
       @resync_condition  = nil
       # Incremented on every reopen (connection recovery or a single-channel
@@ -426,13 +449,19 @@ module AsyncRabbitMQ
     # gated by the channel's pool_size semaphore so at most +pool_size+
     # handlers run concurrently across all consumers on this channel.
     # Returns the consumer tag.
-    def basic_consume(queue_name, consumer_tag: "", manual_ack: false, exclusive: false, arguments: {}, &block)
+    # +on_error+ decides what happens to a delivery whose handler raises; see
+    # ERROR_DISPOSITIONS. nil takes the channel's default, set with
+    # #on_error_disposition=.
+    def basic_consume(queue_name, consumer_tag: "", manual_ack: false, exclusive: false,
+                      arguments: {}, on_error: nil, &block)
+      validate_disposition!(on_error) if on_error
       warn_unbounded_prefetch(queue_name, manual_ack)
       resp = rpc(
         AMQ::Protocol::Basic::Consume.encode(@channel_id, queue_name, consumer_tag, false, !manual_ack, exclusive, false, arguments),
         AMQ::Protocol::Basic::ConsumeOk
       )
-      @consumers[resp.consumer_tag] = { queue_name: queue_name, block: block, manual_ack: manual_ack }
+      @consumers[resp.consumer_tag] = { queue_name: queue_name, block: block,
+                                        manual_ack: manual_ack, on_error: on_error }
       topology&.record_consumer(resp.consumer_tag, queue_name)
       instrument("consumer.registered") do
         { channel: @channel_id, queue: queue_name, consumer_tag: resp.consumer_tag, manual_ack: manual_ack }
@@ -605,8 +634,21 @@ module AsyncRabbitMQ
     # receives the exception, the Basic::Deliver method frame and the queue
     # name. The delivery has already been nacked (requeue: false) if the
     # consumer was registered with manual_ack: true.
+    # The block receives the exception, the Basic::Deliver frame and the queue
+    # name, and runs *before* the delivery is settled. Return one of
+    # ERROR_DISPOSITIONS to decide this message's fate; return anything else
+    # (or nothing) to take the consumer's or channel's configured default.
     def on_handler_error(&block)
       @on_handler_error = block
+    end
+
+    # The channel-wide default disposition for a handler that raises, used by
+    # any consumer that did not set its own. See ERROR_DISPOSITIONS.
+    attr_reader :on_error_disposition
+
+    def on_error_disposition=(value)
+      validate_disposition!(value)
+      @on_error_disposition = value
     end
 
     # -------------------------------------------------------------------------
@@ -905,33 +947,54 @@ module AsyncRabbitMQ
     # the consumer stops receiving anything at all.
     def handle_consumer_error(error, method, entry)
       @logger.error(
-        "Channel #{@channel_id}: consumer #{method.consumer_tag} raised " \
-        "#{error.class}: #{error.message}"
+        "Channel #{@channel_id}: consumer #{method.consumer_tag} raised "         "#{error.class}: #{error.message}"
       )
       instrument("consumer.error") do
         { channel: @channel_id, consumer_tag: method.consumer_tag, queue: entry[:queue_name],
           error: error.class.name, message: error.message }
       end
 
+      # The hook runs before the delivery is settled, so what it returns can
+      # decide the disposition. Anything outside ERROR_DISPOSITIONS (including
+      # nil, and whatever a hook that was not written to choose happens to
+      # return) falls through to the configured default.
+      chosen = call_handler_error_hook(error, method, entry)
+      disposition = ERROR_DISPOSITIONS.include?(chosen) ? chosen : consumer_disposition(entry)
+      return if disposition == :leave
+
       # Only a manual-ack delivery the handler has not already settled. A
       # handler that acks and then raises in whatever follows would otherwise
-      # be nacking a tag the broker has already resolved: that is a 406, which
-      # closes the channel and takes its consumers with it.
-      if entry[:manual_ack] && unsettled?(method.delivery_tag)
-        begin
-          basic_nack(method.delivery_tag, requeue: false)
-        rescue => e
-          @logger.error("Channel #{@channel_id}: could not nack after consumer error: #{e.class}: #{e.message}")
-        end
-      end
-
-      return unless @on_handler_error
+      # be rejecting a tag the broker has already resolved: that is a 406,
+      # which closes the channel and takes its consumers with it.
+      return unless entry[:manual_ack] && unsettled?(method.delivery_tag)
 
       begin
-        @on_handler_error.call(error, method, entry[:queue_name])
+        basic_reject(method.delivery_tag, requeue: disposition == :retry)
       rescue => e
-        @logger.error("Channel #{@channel_id}: on_handler_error hook raised #{e.class}: #{e.message}")
+        @logger.error("Channel #{@channel_id}: could not reject after consumer error: #{e.class}: #{e.message}")
       end
+    end
+
+    # Returns whatever the hook returned, or nil if there is no hook or it
+    # raised. A hook that blows up must not also lose the delivery.
+    def call_handler_error_hook(error, method, entry)
+      return nil unless @on_handler_error
+
+      @on_handler_error.call(error, method, entry[:queue_name])
+    rescue => e
+      @logger.error("Channel #{@channel_id}: on_handler_error hook raised #{e.class}: #{e.message}")
+      nil
+    end
+
+    def consumer_disposition(entry)
+      entry[:on_error] || @on_error_disposition
+    end
+
+    def validate_disposition!(value)
+      return if ERROR_DISPOSITIONS.include?(value)
+
+      raise ArgumentError,
+            "on_error must be one of #{ERROR_DISPOSITIONS.map(&:inspect).join(', ')} (got #{value.inspect})"
     end
 
     # -------------------------------------------------------------------------
