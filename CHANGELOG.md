@@ -6,44 +6,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **Handler workers are created on demand, not up front.** `basic_qos(prefetch_count:)` couples
-  `pool_size` to the prefetch, so asking for a prefetch of 500 created 500 handler fibers - and a
-  caller who then set `pool_size` back down, which the README documents as the escape hatch from
-  that coupling, retired all but `pool_size` of them without a single delivery between them. A
-  fiber's touched stack pages stay in the process RSS after it exits, measured at ~12 KB apiece:
-  12.6 MB at prefetch 500 across two channels, which was the whole of the consumer memory
-  difference between the 24-hour soaks of 0.4.0 and 0.5.0. Workers now appear one at a time as
-  deliveries arrive, never more than `pool_size`, so the concurrency bound is unchanged and a
-  large prefetch costs nothing on its own.
+- A consumer handler raising outside `StandardError` no longer stops the channel dispatching.
+  `SystemStackError` and `ScriptError` now fail that delivery through the configured error
+  disposition. `Async::Stop`, `SystemExit`, `SignalException` and `NoMemoryError` still propagate.
+  Applies equally to the `on_handler_error` hook and to settling after an error.
+- Handler workers are created on demand instead of one per prefetch slot. `basic_qos(prefetch_count: 500)`
+  previously created 500 fibers and retired all but `pool_size` of them unused: 12.6 MB at prefetch
+  500 across two channels. Concurrency is unchanged.
 
 ### Added
 
-- **Choose what happens to a delivery whose handler raised.** `on_error:` on a consumer, or
-  `Channel#on_error_disposition` for the channel behind it:
-  - `:dead_letter` (the default) — `reject(requeue: false)`: one attempt, then the queue's
-    dead-letter route. Safe on any queue, which is why it is the default; `:retry` on a queue
-    with no delivery limit is an infinite loop, and a default must not depend on configuration
-    the client cannot see.
-  - `:retry` — `reject(requeue: true)`: the message failed, so let the broker count it towards
-    `x-delivery-limit` and retire it.
-  - `:release` — `nack(requeue: true)`: *not* the message's fault, so hand it back without
-    counting it. For shutting down, shedding load, or riding out a downstream outage — rejecting
-    through a gateway outage would walk a whole backlog into the dead-letter queue in
-    `x-delivery-limit` attempts. The trade is that nothing advances towards the limit, so a
-    genuinely poison message is redelivered forever.
-  - `:leave` — settle nothing, as Bunny does.
-
-  `:retry` and `:release` differ only in blame, and the protocol draws that line: RabbitMQ counts
-  a delivery as failed on `basic.reject` (AMQP 1.0 `modified` with `delivery-failed`) but not on
-  `basic.nack` (AMQP 1.0 `released`). Measured against 4.3.2 with `x-delivery-limit: 3`: nack
-  stayed at `nil` over eight redeliveries and the message was never retired; reject went 1, 2, 3
-  and it was dead-lettered. The automatic error path previously nacked, so it could never reach
-  the limit; it now rejects. For a single delivery the verbs are otherwise equivalent, and an
-  unconfigured consumer behaves exactly as before.
-
-  `on_handler_error` now runs *before* the delivery is settled, so returning one of the four
-  decides that one message; returning anything else takes the configured default. A hook that
-  raises is logged and the default applies, so a broken hook cannot strand a delivery.
+- `on_error:` on a consumer, and `Channel#on_error_disposition` for the channel default, choose what
+  happens to a delivery whose handler raised:
+  - `:dead_letter` (default) — `reject(requeue: false)`: one attempt, then the dead-letter route.
+  - `:retry` — `reject(requeue: true)`: counts towards `x-delivery-limit`.
+  - `:release` — `nack(requeue: true)`: requeued without counting towards the limit.
+  - `:leave` — settles nothing; the handler is responsible.
+- `Channel#on_handler_error` receives `(error, delivery_info, queue_name)` and may return a
+  disposition to override the default for that delivery.
 
 ## [0.5.0] - 2026-10-09
 
