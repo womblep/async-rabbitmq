@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Handler workers are created on demand, not up front.** `basic_qos(prefetch_count:)` couples
+  `pool_size` to the prefetch, so asking for a prefetch of 500 created 500 handler fibers - and a
+  caller who then set `pool_size` back down, which the README documents as the escape hatch from
+  that coupling, retired all but `pool_size` of them without a single delivery between them. A
+  fiber's touched stack pages stay in the process RSS after it exits, measured at ~12 KB apiece:
+  12.6 MB at prefetch 500 across two channels, which was the whole of the consumer memory
+  difference between the 24-hour soaks of 0.4.0 and 0.5.0. Workers now appear one at a time as
+  deliveries arrive, never more than `pool_size`, so the concurrency bound is unchanged and a
+  large prefetch costs nothing on its own.
+
 ### Added
 
 - **Choose what happens to a delivery whose handler raised.** `on_error:` on a consumer, or
