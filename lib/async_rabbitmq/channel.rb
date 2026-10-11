@@ -37,6 +37,23 @@ module AsyncRabbitMQ
     # delivery the verbs are otherwise equivalent.
     ERROR_DISPOSITIONS = %i[dead_letter retry release leave].freeze
 
+    # A handler is application code and can raise anything. Catching only
+    # StandardError let a handler raising outside that hierarchy escape and take
+    # the channel's frame dispatch with it, so the catch below is deliberately
+    # as wide as Ruby allows - and these are what it has to put back.
+    #
+    # Async stops a task by raising Async::Stop into it, and Async::Stop is not
+    # a StandardError precisely so that ordinary rescues leave it alone.
+    # Swallowing it would leave handler workers unstoppable, and a channel close
+    # or a reactor shutdown would hang on a parked handler. The signals beside
+    # it are not this delivery's problem either: the process is exiting, was
+    # interrupted, or has run out of memory.
+    #
+    # SystemStackError and ScriptError are deliberately absent. An accidental
+    # infinite recursion in a handler is an ordinary bug and should fail that
+    # one delivery, not silence the channel.
+    PROPAGATE_FROM_HANDLER = [Async::Stop, SystemExit, SignalException, NoMemoryError].freeze
+
     # A message published under confirms whose fate is unknown: the broker
     # neither acked nor nacked it before the connection went. +payload+ and its
     # routing are kept so it can be published again on another connection.
@@ -982,7 +999,9 @@ module AsyncRabbitMQ
         else
           basic_reject(method.delivery_tag, requeue: disposition == :retry)
         end
-      rescue => e
+      rescue *PROPAGATE_FROM_HANDLER
+        raise
+      rescue Exception => e # rubocop:disable Lint/RescueException
         @logger.error("Channel #{@channel_id}: could not settle after consumer error: #{e.class}: #{e.message}")
       end
     end
@@ -993,7 +1012,12 @@ module AsyncRabbitMQ
       return nil unless @on_handler_error
 
       @on_handler_error.call(error, method, entry[:queue_name])
-    rescue => e
+    rescue *PROPAGATE_FROM_HANDLER
+      raise
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      # The hook is the caller's code as much as the handler is, and it runs
+      # while a delivery is still unsettled: letting it escape would strand the
+      # message and kill the worker.
       @logger.error("Channel #{@channel_id}: on_handler_error hook raised #{e.class}: #{e.message}")
       nil
     end
@@ -1103,7 +1127,9 @@ module AsyncRabbitMQ
       started = instrument_clock
       begin
         entry[:block].call(method, header, body)
-      rescue => e
+      rescue *PROPAGATE_FROM_HANDLER
+        raise
+      rescue Exception => e # rubocop:disable Lint/RescueException
         handle_consumer_error(e, method, entry)
       ensure
         if started
@@ -1122,8 +1148,20 @@ module AsyncRabbitMQ
         break if msg.nil?
         handle_message(msg)
       end
+    rescue *PROPAGATE_FROM_HANDLER
+      raise
     rescue => e
       @logger.error("Channel #{@channel_id} dispatch error: #{e.class}: #{e.message}")
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      # Handlers are contained now, so nothing should reach here. If something
+      # does, this channel is about to stop delivering anything at all - no
+      # confirms, no RPC replies, no close-ok - and the one thing that must not
+      # happen is for it to go quiet without saying so.
+      @logger.error(
+        "Channel #{@channel_id} dispatch died on #{e.class}: #{e.message}. " \
+        "The channel will not deliver anything further."
+      )
+      raise
     end
 
     def handle_message(msg)

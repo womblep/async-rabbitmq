@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A consumer handler can no longer take the channel down by raising outside `StandardError`.**
+  `rescue => e` is `StandardError` only, so a handler raising anything else - `SystemStackError`
+  from an accidental infinite recursion being the realistic way in - escaped both the handler
+  rescue and the dispatch loop. The channel stayed open while delivering nothing: no confirms, no
+  RPC replies, no close-ok, so the next synchronous call on it hung until `rpc_timeout`, or forever
+  without one. Such a handler now fails that one delivery through the normal error disposition and
+  the consumer keeps running.
+
+  `Async::Stop`, `SystemExit`, `SignalException` and `NoMemoryError` still propagate. The first is
+  the load-bearing one: Async stops a task by raising `Async::Stop` into it, and it deliberately
+  sits outside `StandardError`, so a rescue wide enough to catch `ScriptError` is wide enough to
+  swallow it - which would leave handler workers unstoppable and hang channel close and reactor
+  shutdown. The same widening was applied to the `on_handler_error` hook, which is caller code too
+  and runs while the delivery is still unsettled, and to settling after an error.
+
 - **Handler workers are created on demand, not up front.** `basic_qos(prefetch_count:)` couples
   `pool_size` to the prefetch, so asking for a prefetch of 500 created 500 handler fibers - and a
   caller who then set `pool_size` back down, which the README documents as the escape hatch from
