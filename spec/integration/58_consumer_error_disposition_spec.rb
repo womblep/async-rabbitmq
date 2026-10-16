@@ -284,6 +284,33 @@ RSpec.describe "consumer error disposition", :integration do
     end
   end
 
+  # #each is the third way to start a consumer, alongside basic_consume and
+  # Queue#subscribe. It forwards its remaining keywords, so a consumer started
+  # through it is configurable in the same way as one started directly.
+  describe "Channel#each" do
+    it "takes on_error like basic_consume does" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        ch.basic_qos(prefetch_count: 5)
+        main, _park = retry_queue(ch, SecureRandom.hex(4), limit: 3)
+
+        attempts = 0
+        consumer = Async::Task.current.async do
+          ch.each(main, manual_ack: true, on_error: :retry) do |_di, _h, _b|
+            attempts += 1
+            raise "boom"
+          end
+        end
+        ch.basic_publish("poison", routing_key: main)
+
+        wait_until(20) { attempts >= 4 }
+        expect(attempts).to eq(4)      # retried to the limit, not dead-lettered at once
+        consumer.stop
+        ch.close
+      end
+    end
+  end
+
   describe "configuration" do
     it "takes a channel-wide default that a consumer can override" do
       isolated_session do |session, _|

@@ -695,9 +695,11 @@ module AsyncRabbitMQ
     # the broker cancels the consumer (e.g. the queue is deleted) or closes the
     # channel. A connection loss with automatic recovery is transparent: the
     # consumer is re-registered and #each keeps waiting.
-    def each(queue_name, manual_ack: false, &block)
+    # Remaining keywords go to #basic_consume, so +on_error+, +exclusive+ and
+    # +arguments+ work here as they do there.
+    def each(queue_name, manual_ack: false, **opts, &block)
       assert_open!
-      tag  = basic_consume(queue_name, manual_ack: manual_ack, &block)
+      tag  = basic_consume(queue_name, manual_ack: manual_ack, **opts, &block)
       cond = @each_waiters[tag] = Async::Condition.new
       cond.wait
       nil
