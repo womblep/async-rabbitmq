@@ -483,8 +483,11 @@ module AsyncRabbitMQ
         AMQ::Protocol::Basic::Consume.encode(@channel_id, queue_name, consumer_tag, false, !manual_ack, exclusive, false, arguments),
         AMQ::Protocol::Basic::ConsumeOk
       )
+      # Everything basic.consume was called with, so re_register_consumers can
+      # reproduce the consumer exactly rather than a default-valued lookalike.
       @consumers[resp.consumer_tag] = { queue_name: queue_name, block: block,
-                                        manual_ack: manual_ack, on_error: on_error }
+                                        manual_ack: manual_ack, on_error: on_error,
+                                        exclusive: exclusive, arguments: arguments }
       topology&.record_consumer(resp.consumer_tag, queue_name)
       instrument("consumer.registered") do
         { channel: @channel_id, queue: queue_name, consumer_tag: resp.consumer_tag, manual_ack: manual_ack }
@@ -1639,6 +1642,7 @@ module AsyncRabbitMQ
       @consumers.each do |tag, entry|
         begin
           basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack],
+                        exclusive: entry[:exclusive], arguments: entry[:arguments] || {},
                         on_error: entry[:on_error], &entry[:block])
         rescue => e
           # Typically 404: the queue is gone and was not recovered. The broker
