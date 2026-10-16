@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- A consumer's `on_error:` survives re-registration after a reconnect or a channel reopen; it no
+  longer falls back to the channel default.
+- A consumer's `exclusive:` flag and `arguments:` (such as `x-priority`) survive re-registration
+  after a reconnect or a channel reopen; they no longer come back as the defaults.
+
+### Added
+
+- `Channel#each` passes its remaining keywords to `basic_consume`, so `on_error:`, `exclusive:`
+  and `arguments:` work there as they do on the other two ways to start a consumer.
+
 ## [0.6.0] - 2026-10-11
 
 ### Fixed
