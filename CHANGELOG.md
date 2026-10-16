@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- A consumer's `on_error:` survives re-registration after a reconnect or a channel reopen; it no
+  longer falls back to the channel default.
+
 ## [0.6.0] - 2026-10-11
 
 ### Fixed

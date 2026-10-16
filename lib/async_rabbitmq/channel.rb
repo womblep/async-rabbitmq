@@ -1638,7 +1638,8 @@ module AsyncRabbitMQ
     def re_register_consumers
       @consumers.each do |tag, entry|
         begin
-          basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack], &entry[:block])
+          basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack],
+                        on_error: entry[:on_error], &entry[:block])
         rescue => e
           # Typically 404: the queue is gone and was not recovered. The broker
           # closes the channel on that, so say so instead of failing silently.

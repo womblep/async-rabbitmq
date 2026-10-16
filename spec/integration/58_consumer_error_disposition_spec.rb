@@ -236,6 +236,54 @@ RSpec.describe "consumer error disposition", :integration do
     end
   end
 
+  # A consumer's on_error belongs to the consumer, so re-registering one has to
+  # carry it. Dropped, every :retry consumer silently falls back to the channel
+  # default and starts dead-lettering what it was told to retry.
+  describe "across recovery" do
+    def poison_until_retired(ch, main)
+      attempts = 0
+      ch.basic_consume(main, manual_ack: true, on_error: :retry) do |_di, _h, _b|
+        attempts += 1
+        raise "boom"
+      end
+      -> { attempts }
+    end
+
+    it "survives a reconnect" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        ch.basic_qos(prefetch_count: 5)
+        main, _park = retry_queue(ch, SecureRandom.hex(4), limit: 3)
+        attempts = poison_until_retired(ch, main)
+
+        recover_connection!(session)
+
+        ch.basic_publish("poison", routing_key: main)
+        wait_until(20) { attempts.call >= 4 }
+        expect(attempts.call).to eq(4)   # retried to the limit, not dead-lettered at once
+        ch.close
+      end
+    end
+
+    it "survives a channel reopen" do
+      isolated_session do |session, _|
+        ch = session.open_channel
+        ch.basic_qos(prefetch_count: 5)
+        main, _park = retry_queue(ch, SecureRandom.hex(4), limit: 3)
+        attempts = poison_until_retired(ch, main)
+
+        ch.basic_ack(4242)               # unknown delivery tag: 406, the broker closes the channel
+        wait_until { ch.closed? }
+        ch.reopen(recover_consumers: true)
+
+        ch.basic_publish("poison", routing_key: main)
+        wait_until(20) { attempts.call >= 4 }
+        expect(attempts.call).to eq(4)
+        ch.close
+      end
+    end
+  end
+
   describe "configuration" do
     it "takes a channel-wide default that a consumer can override" do
       isolated_session do |session, _|
