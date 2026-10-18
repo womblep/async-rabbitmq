@@ -32,5 +32,7 @@ require_relative "async_rabbitmq/session"
 require_relative "async_rabbitmq/cluster"
 
 module AsyncRabbitMQ
+  DEFAULT_CONTENT_TYPE = Channel::DEFAULT_CONTENT_TYPE
+
   # Optional: require "async_rabbitmq/pool" for connection pooling.
 end

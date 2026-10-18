@@ -66,6 +66,7 @@ module ServiceBootstrap
   GEN_CERTS    = File.expand_path("docker/gen-certs.sh", __dir__)
 
   def self.ensure_running!
+    return if ENV["SKIP_SERVICE_BOOTSTRAP"] == "1"
     return if port_open?(RABBITMQ_HOST, RABBITMQ_PORT)
 
     $stderr.puts "--> RabbitMQ not detected — starting docker compose services..."
