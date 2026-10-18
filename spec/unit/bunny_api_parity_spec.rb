@@ -126,4 +126,92 @@ RSpec.describe "Bunny API parity — unit tests" do
       ex.on_return(&block)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Default publish properties parity
+  # ---------------------------------------------------------------------------
+
+  describe "Default publish properties" do
+    let(:session) { double("Session", frame_max: 131_072) }
+    let(:frame_io) { double("FrameIO") }
+    let(:channel) { AsyncRabbitMQ::Channel.new(1, session, frame_io, frame_max: 131_072, logger: AsyncRabbitMQ::Log.silent) }
+
+    it "exposes DEFAULT_CONTENT_TYPE matching Bunny" do
+      expect(AsyncRabbitMQ::DEFAULT_CONTENT_TYPE).to eq("application/octet-stream")
+      expect(AsyncRabbitMQ::Channel::DEFAULT_CONTENT_TYPE).to eq("application/octet-stream")
+    end
+
+    it "defaults content_type to application/octet-stream, delivery_mode to 2 (persistent), and priority to 0" do
+      expect(AMQ::Protocol::Basic::Publish).to receive(:encode).with(
+        1,
+        "payload",
+        hash_including(
+          content_type: "application/octet-stream",
+          delivery_mode: 2,
+          priority: 0
+        ),
+        "ex",
+        "rk",
+        false,
+        false,
+        131_072
+      ).and_call_original
+
+      channel.send(:encode_publish, "payload", exchange: "ex", routing_key: "rk")
+    end
+
+    it "honors persistent: false for delivery_mode 1" do
+      expect(AMQ::Protocol::Basic::Publish).to receive(:encode).with(
+        1,
+        "payload",
+        hash_including(
+          delivery_mode: 1
+        ),
+        "ex",
+        "rk",
+        false,
+        false,
+        131_072
+      ).and_call_original
+
+      channel.send(:encode_publish, "payload", exchange: "ex", routing_key: "rk", persistent: false)
+    end
+
+    it "honors custom content_type and priority" do
+      expect(AMQ::Protocol::Basic::Publish).to receive(:encode).with(
+        1,
+        "payload",
+        hash_including(
+          content_type: "application/json",
+          priority: 5
+        ),
+        "ex",
+        "rk",
+        false,
+        false,
+        131_072
+      ).and_call_original
+
+      channel.send(:encode_publish, "payload", exchange: "ex", routing_key: "rk", content_type: "application/json", priority: 5)
+    end
+
+    it "allows properties: hash to override defaults" do
+      expect(AMQ::Protocol::Basic::Publish).to receive(:encode).with(
+        1,
+        "payload",
+        hash_including(
+          content_type: "text/plain",
+          delivery_mode: 1,
+          priority: 9
+        ),
+        "ex",
+        "rk",
+        false,
+        false,
+        131_072
+      ).and_call_original
+
+      channel.send(:encode_publish, "payload", exchange: "ex", routing_key: "rk", properties: { content_type: "text/plain", delivery_mode: 1, priority: 9 })
+    end
+  end
 end

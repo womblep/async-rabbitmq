@@ -37,6 +37,8 @@ module AsyncRabbitMQ
     # delivery the verbs are otherwise equivalent.
     ERROR_DISPOSITIONS = %i[dead_letter retry release leave].freeze
 
+    DEFAULT_CONTENT_TYPE = "application/octet-stream".freeze
+
     # A handler is application code and can raise anything. Catching only
     # StandardError let a handler raising outside that hierarchy escape and take
     # the channel's frame dispatch with it, so the catch below is deliberately
@@ -1493,16 +1495,18 @@ module AsyncRabbitMQ
 
     # Encode one basic.publish (method + header + body frames) into a single
     # byte string, so a message always hits the write queue in one piece.
-    def encode_publish(payload, exchange:, routing_key:, mandatory: false, persistent: false,
-                       content_type: nil, content_encoding: nil, headers: nil, priority: nil,
+    def encode_publish(payload, exchange:, routing_key:, mandatory: false, persistent: true,
+                       content_type: DEFAULT_CONTENT_TYPE, content_encoding: nil, headers: nil, priority: 0,
                        correlation_id: nil, reply_to: nil, expiration: nil, message_id: nil,
                        timestamp: nil, type: nil, user_id: nil, app_id: nil, properties: {})
       payload_bytes = payload.is_a?(String) ? payload.b : payload
-      props = { delivery_mode: persistent ? 2 : 1 }
-      props[:content_type]     = content_type     if content_type
+      props = {
+        delivery_mode: persistent ? 2 : 1,
+        content_type:  content_type || DEFAULT_CONTENT_TYPE,
+        priority:      priority || 0
+      }
       props[:content_encoding] = content_encoding if content_encoding
       props[:headers]          = headers          if headers
-      props[:priority]         = priority         if priority
       props[:correlation_id]   = correlation_id   if correlation_id
       props[:reply_to]         = reply_to         if reply_to
       props[:expiration]       = expiration       if expiration

@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-10-18
+
+### Added
+
+- `AsyncRabbitMQ::DEFAULT_CONTENT_TYPE` and `AsyncRabbitMQ::Channel::DEFAULT_CONTENT_TYPE` constants (`"application/octet-stream"`).
+
+### Changed
+
+- Default publish properties aligned with Bunny parity: `content_type` defaults to `"application/octet-stream"`, `persistent` defaults to `true` (`delivery_mode: 2`), and `priority` defaults to `0`.
+
 ## [0.7.0] - 2026-10-17
 
 ### Fixed
