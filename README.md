@@ -466,7 +466,39 @@ starts), `on_blocked` / `on_unblocked` (connection.blocked),
 `Channel#on_return` (mandatory messages the broker could not route),
 `on_cancel` (broker cancelled a consumer), `on_error` (broker closed the
 channel). A broker-closed channel can be reopened in place with
-`Channel#reopen`.
+`Channel#reopen`. Every one of these runs in a task of its own, so a callback
+may issue RPCs — re-consume, reopen, declare — and a callback that raises is
+logged rather than taken out on the channel.
+
+### A consumer the broker cancels
+
+RabbitMQ cancels a consumer when it can no longer serve the queue to it: the
+queue was deleted, the node holding it failed, a replicated queue's leader
+moved. The connection is untouched, so none of the recovery above runs — a
+`basic.cancel` frame is the only notice there is, and without `on_cancel` the
+worker goes on publishing and heartbeating while consuming nothing.
+
+Nothing is re-subscribed by default, which matches Bunny, the Java client and
+the .NET client. `recover_cancelled_consumers: true`, on the session or on one
+channel, re-subscribes under the same consumer tag, backing off from 1s to 30s
+for as long as the queue exists and the channel is open.
+
+**Recovery never declares anything.** One of the reasons a consumer gets
+cancelled is somebody deleting the queue, and a client that answered that by
+re-declaring would hand back a queue nobody could get rid of while a consumer
+was attached. So the client passively checks whether the queue is still there
+and re-consumes only if it is. If it has gone, the consumer stays gone and the
+queue is dropped from the topology registry too — otherwise the next connection
+recovery would re-declare it and the deletion would never stick. Only
+`NOT_FOUND` counts as gone; a replicated queue mid-election is unavailable, not
+deleted. Re-declaring is the application's call, and `on_cancel` is where to
+make it: declare the queue there and the re-subscribe that follows will find
+it.
+
+```ruby
+session = AsyncRabbitMQ::Session.new(..., recover_cancelled_consumers: true)
+channel.on_cancel { |tag| logger.warn("consumer #{tag} cancelled by the broker") }
+```
 
 ## Errors
 
@@ -520,6 +552,8 @@ logged and skipped; it never breaks the connection.
 | `channel.rpc` | `channel`, `method` (`"queue.declare-ok"`), `duration` |
 | `consumer.registered` | `channel`, `queue`, `consumer_tag`, `manual_ack` |
 | `consumer.cancelled` | `channel`, `consumer_tag`, `queue`, `reason` (`:client`, `:broker`) |
+| `consumer.recovered` | `channel`, `consumer_tag`, `queue`, `attempts` |
+| `consumer.recovery_failed` | `channel`, `consumer_tag`, `queue`, `reason` (`:queue_deleted`, `:error`), `error` |
 | `message.published` | `channel`, `exchange`, `routing_key`, `count`, `bytes`, `delivery_tag` |
 | `message.confirmed` | `channel`, `delivery_tag`, `multiple`, `acked` |
 | `message.returned` | `channel`, `exchange`, `routing_key`, `code`, `text`, `bytes` |

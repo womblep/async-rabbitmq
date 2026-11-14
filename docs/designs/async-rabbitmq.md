@@ -167,6 +167,18 @@ bindings were keeping alive. Consumers on other connections are invisible to
 it; the cost of guessing wrong there is only that recovery skips a queue that
 still exists, which is harmless.
 
+A durable queue is forgotten in one other case. When the broker cancels a
+consumer it does not say why, and one of the reasons is that somebody deleted
+the queue — from the management UI, say, where nothing on this connection sees
+it happen. Left in the registry, that queue is re-declared by the next
+connection recovery and the deletion never sticks: the queue cannot be got rid
+of while a client holds a record of it. So a broker-sent cancel is followed by
+a passive declare on a channel of its own, and a `NOT_FOUND` forgets the queue
+and its bindings. Only `NOT_FOUND`: a replicated queue whose leader is moving
+is the case consumer recovery exists for, and it answers something else.
+Forgetting a queue that does exist would be the worse error of the two, so
+anything inconclusive leaves the record alone.
+
 Channel ids come from `ChannelIdAllocator`, a bitset (`AMQ::BitSet`, the
 structure under Bunny's allocator) over `1..channel_max`. Ids are released when
 a channel closes, so a channel per unit of work does not exhaust the 16-bit id
@@ -288,6 +300,7 @@ over keeps its dashboards.
 | Write queue | 1024 entries |
 | Confirm tracking outstanding limit | 1000 |
 | Consumer handlers per channel | 1, or `prefetch_count` after `basic_qos` |
+| Cancelled-consumer recovery | Off; 1 s doubling to 30 s when enabled |
 
 ## Design decisions
 
@@ -302,10 +315,12 @@ over keeps its dashboards.
 | Unconfirmed on reconnect | Re-publish | At-least-once beats silent loss; documented as a duplicate risk |
 | Close with a backlog | Discard and log the count | Fire-and-forget publishing offers no guarantee, but the loss should be visible |
 | Test queues | Durable or exclusive | RabbitMQ 4.2+ refuses transient non-exclusive queues at connection level |
+| Application callbacks | A task of their own | They are the natural place for an RPC, and the dispatch fiber is the one that would deliver its reply; a raise there stopped the channel entirely |
+| Broker-cancelled consumers | Not re-subscribed by default, and never re-declared | Bunny recovers them only behind a flag and the Java and .NET clients not at all; re-declaring would hand back a queue nobody could delete |
 
 ## Tests
 
-361 examples, almost all integration tests against a real broker
+455 examples, almost all integration tests against a real broker
 (`rabbitmq:4-management-alpine` plus Toxiproxy, started by `spec/docker-compose.yml`
 or by `spec_helper` if nothing is listening). Each test gets its own vhost, so
 tests cannot contaminate each other. CI runs Ruby 3.4 and 4.0 over

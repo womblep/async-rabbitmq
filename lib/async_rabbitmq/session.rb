@@ -161,6 +161,7 @@ module AsyncRabbitMQ
       recovery_interval: RECOVERY_INITIAL,
       recovery_max_interval: RECOVERY_MAX,
       recover_topology: true,
+      recover_cancelled_consumers: false,
       topology_recovery_filter: nil,
       instrumenter: nil,
       notifier: nil,
@@ -194,6 +195,9 @@ module AsyncRabbitMQ
       @recovery_interval    = recovery_interval
       @recovery_max_interval = recovery_max_interval
       @recover_topology     = recover_topology
+      # The default every channel opened on this session takes; see
+      # Channel#recovers_cancelled_consumers? for why it is off.
+      @recover_cancelled_consumers = recover_cancelled_consumers
       @topology             = TopologyRegistry.new(filter: topology_recovery_filter)
       @logger               = logger
       @notifier             = notifier || Notifier.new(logger: logger)
@@ -354,12 +358,15 @@ module AsyncRabbitMQ
     # Open a new channel. Returns an AsyncRabbitMQ::Channel.
     # +pool_size+ bounds concurrent consumer-handler fibers on the channel
     # (Bunny-parity: default 1). basic_qos will auto-adjust it to prefetch_count.
-    def open_channel(pool_size: 1)
+    # +recover_cancelled_consumers+ defaults to the session's setting; see
+    # Channel#recovers_cancelled_consumers?.
+    def open_channel(pool_size: 1, recover_cancelled_consumers: @recover_cancelled_consumers)
       raise NotOpenError, "Session is not open" unless open?
       channel = @channel_mutex.acquire do
         channel_id = next_channel_id
         Channel.new(channel_id, self, @frame_io, frame_max: @negotiated_fm || @frame_max, logger: @logger,
-                    pool_size: pool_size, rpc_timeout: @rpc_timeout).tap { |ch| @channels[channel_id] = ch }
+                    pool_size: pool_size, rpc_timeout: @rpc_timeout,
+                    recover_cancelled_consumers: recover_cancelled_consumers).tap { |ch| @channels[channel_id] = ch }
       end
       channel.open
       channel
