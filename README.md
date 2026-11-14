@@ -1,7 +1,7 @@
 # async-rabbitmq
 
 A fiber-native RabbitMQ (AMQP 0-9-1) client for Ruby, built on the amazing work
-of [Bunny](https://github.com/ruby-amqp/bunny).
+of [Bunny](https://github.com/ruby-amqp/bunny) and [Async](https://github.com/socketry/async).
 
 ## Installing
 
