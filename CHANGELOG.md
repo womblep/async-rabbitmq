@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-11-14
+
+### Fixed
+
+- A server-sent `basic.cancel` no longer leaves the queue in the topology registry. The broker
+  cancels a consumer when it can no longer serve the queue, and one of the ways that happens is
+  somebody deleting the queue - after which the next connection recovery re-declared it and the
+  deletion never stuck. The client now checks, passively, whether the queue is really gone and
+  forgets it, with its bindings, if it is. Only `NOT_FOUND` counts as gone: a replicated queue
+  mid-election is unavailable, not deleted, and is left in the registry to be re-declared.
+- `on_cancel` and `on_error` no longer run on the channel's dispatch fiber. The obvious thing to
+  write in either is an RPC - re-consume, reopen - and an RPC on that fiber waits for a reply only
+  that fiber can deliver: fifteen seconds to `rpc_timeout`, then a channel resync. An exception out
+  of either escaped `dispatch_loop`, whose rescue sits outside its loop, so the channel stopped
+  delivering anything at all, confirms and RPC replies included. Both now run in a task of their
+  own and an exception is logged. Bunny dispatches cancel notifications to its consumer work pool
+  and the Java client to its work service, for the same reasons. `on_error` also runs after the
+  close has released the fibers it stranded, not before.
+- The log line for a broker-sent cancel names the queue, not just the consumer tag.
+
+### Added
+
+- `recover_cancelled_consumers:` on `Session.new` and `Session#open_channel`, with
+  `Channel#recover_cancelled_consumers=` and `Channel#recovers_cancelled_consumers?`. Off by
+  default, as it is in Bunny. When on, a consumer the broker cancels is re-subscribed under the
+  same tag, backing off from 1s to 30s for as long as the queue exists and the channel is open.
+  Recovery declares nothing: it passively checks that the queue is still there and re-consumes, so
+  a queue somebody deleted is never handed back. Re-declaring is the application's call.
+- `consumer.recovered` and `consumer.recovery_failed` events. `consumer.recovery_failed` carries
+  `reason: :queue_deleted` - emitted whether or not recovery is enabled, since that is the point
+  at which a consumer is known not to be coming back - or `reason: :error` with the exception, once
+  per episode rather than once per attempt.
+
 ## [0.7.1] - 2026-10-18
 
 ### Added

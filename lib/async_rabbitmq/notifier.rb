@@ -36,6 +36,8 @@ module AsyncRabbitMQ
       channel.rpc
       consumer.registered
       consumer.cancelled
+      consumer.recovered
+      consumer.recovery_failed
       message.published
       message.confirmed
       message.returned

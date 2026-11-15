@@ -78,12 +78,17 @@ RSpec.describe "recovery against a broker that lost the topology", :integration 
     end
   end
 
-  # A queue deleted under a live connection cancels its consumer, and a
-  # cancelled consumer is gone for good: recovery re-declares the queue but does
-  # not resurrect a subscription the broker explicitly ended. (A real broker
-  # restart takes the connection with it, so the cancel never arrives and the
-  # consumer IS re-registered — that path is covered by the recovery specs.)
-  it "does not resurrect a consumer the broker cancelled, but the queue comes back" do
+  # A queue deleted under a live connection cancels its consumer, and then both
+  # are gone for good: the consumer because the broker explicitly ended the
+  # subscription, and the queue because a client that re-declared it would be
+  # handing back something somebody had just deleted — and would go on handing
+  # it back at every reconnect, which is a queue nobody can get rid of.
+  #
+  # This is the one case where the registry forgets a durable queue. A real
+  # broker restart takes the connection with it, so no cancel arrives, the
+  # record survives and the queue IS re-declared — that is the amnesia the rest
+  # of this file is about, and it is untouched.
+  it "resurrects neither the consumer nor the queue the broker cancelled" do
     isolated_session do |session, vhost|
       suffix    = SecureRandom.hex(4)
       queue     = "test.amnesia.consumer.#{suffix}"
@@ -96,17 +101,26 @@ RSpec.describe "recovery against a broker that lost the topology", :integration 
       delete_queue(vhost, queue)
       50.times { break unless cancelled.empty?; sleep 0.1 }
       expect(cancelled).to eq([tag])
+      # The callback runs before the passive declare that works out the queue
+      # has gone, so wait for the record rather than for the callback.
+      50.times { break if session.topology.queues.none? { |rec| rec.name == queue }; sleep 0.1 }
 
       recover_connection!(session)
 
-      expect(channel.queue(queue, passive: true).consumer_count).to eq(0)
+      # A passive declare for a queue that is not there closes the channel, so
+      # this is the last thing done on it.
+      expect { channel.queue(queue, passive: true) }
+        .to raise_error(AsyncRabbitMQ::ChannelError) { |e| expect(e.code).to eq(404) }
 
-      # Subscribing again works on the re-declared queue.
+      # Putting it back is the application's call, and then everything works as
+      # it did before.
+      channel   = session.open_channel
       delivered = []
+      channel.durable_queue(queue)
       channel.basic_consume(queue, manual_ack: false) { |_d, _h, body| delivered << body }
-      channel.basic_publish("after the queue came back", routing_key: queue)
+      channel.basic_publish("after the application put it back", routing_key: queue)
       50.times { break unless delivered.empty?; sleep 0.1 }
-      expect(delivered).to eq(["after the queue came back"])
+      expect(delivered).to eq(["after the application put it back"])
     end
   end
 end
