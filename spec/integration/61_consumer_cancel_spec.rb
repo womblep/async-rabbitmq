@@ -13,10 +13,17 @@ require "spec_helper"
 # what must NOT be relied on. Somebody pressing Delete in the management UI is
 # the case that matters.
 #
-# On a single node every broker-sent cancel means the queue was deleted. The
-# other causes - a replicated queue's leader moving, the node holding it
-# failing - need a cluster, so the "queue is still there" path is reached here
-# by an application that re-declares the queue for itself.
+# On a single node every broker-sent cancel means the queue was deleted, so the
+# "queue is still there" path is reached here by an application that
+# re-declares the queue for itself. The other cause - the node holding the
+# queue stopping, which cancels the consumer and then answers the probe with a
+# 404 that says the queue is stopped rather than gone - needs a cluster; what
+# that 404 means is covered in spec/unit.
+#
+# Measured against a three-node RabbitMQ 4.4 cluster, and not otherwise
+# obvious: a quorum queue's leader moving does NOT cancel its consumers, nor
+# does the queue losing its majority, nor does its member on the consuming node
+# being removed. Deletion does.
 RSpec.describe "broker-cancelled consumers", :integration do
   def wait_until(timeout = 10)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
@@ -187,6 +194,69 @@ RSpec.describe "broker-cancelled consumers", :integration do
       end
     end
 
+    # Both of these are one event on a real broker: deleting a quorum queue
+    # answers the re-subscribe with a connection-level 541 INTERNAL_ERROR
+    # (".. noproc"), so the connection goes down a beat after the cancel
+    # arrives. Severing it from the cancel callback is that ordering on a
+    # single node.
+    it "does not put the queue back when the connection drops before it knows" do
+      isolated_session(recover_cancelled_consumers: true) do |session, vhost|
+        ch = session.open_channel
+        q  = qname("no.resurrection")
+        ch.durable_queue(q)
+        ch.on_cancel { sever_connection!(session) }
+        ch.basic_consume(q, manual_ack: true) { |_d, _h, _b| }
+
+        delete_queue_in_the_portal(vhost, q)
+
+        # A reconnect re-declares the whole registry, and at this point the
+        # client has not established what happened to the queue. Holding it
+        # back until it has is the only thing between a deleted queue and a
+        # queue that comes back with a consumer attached, which nobody can then
+        # delete at all.
+        wait_until(20) { session.open? && session.topology.queues.none? { |rec| rec.name == q } }
+        expect(queue_on_broker?(vhost, q)).to be(false)
+      end
+    end
+
+    it "waits out the reconnect instead of giving the consumer up" do
+      isolated_session(recover_cancelled_consumers: true) do |session, vhost|
+        ch        = session.open_channel
+        q         = qname("through.reconnect")
+        received  = []
+        failures  = []
+        recovered = false
+        session.on_event("consumer.recovered")       { recovered = true }
+        session.on_event("consumer.recovery_failed") { |_n, payload| failures << payload[:reason] }
+        ch.durable_queue(q)
+        # The connection goes with the cancel, which is what deleting a quorum
+        # queue does for real: the re-subscribe is answered with a
+        # connection-level 541 rather than a channel error. Severing the socket
+        # is synchronous, and notify_app spawns this before the task that goes
+        # asking about the queue, so by the time anything asks there is no
+        # connection to ask on — the ordering under test, with no race in it.
+        ch.on_cancel { sever_connection!(session) }
+        ch.basic_consume(q, manual_ack: true) { |_d, _h, body| received << body }
+
+        # Deleted and put straight back, both over HTTP so neither depends on
+        # the connection that is about to go. The consumer is no longer in the
+        # channel's registry, so the reconnect will not re-register it: the
+        # recovery loop is the only thing that will, and it used to stop at the
+        # first glimpse of a session that was not open.
+        delete_queue_in_the_portal(vhost, q)
+        expect(http_put("/api/queues/#{esc(vhost)}/#{esc(q)}", JSON.dump(durable: true)).code.to_i)
+          .to be_between(200, 299)
+
+        wait_until(30) { recovered }
+        ch.basic_publish("after the reconnect", exchange: "", routing_key: q)
+        wait_until { received == ["after the reconnect"] }
+        # The connection going is not a failure to re-subscribe. It has its own
+        # event and its own recovery, and an application alarming on this one
+        # would otherwise be told twice about one outage.
+        expect(failures).to be_empty
+      end
+    end
+
     it "re-subscribes when the application puts the queue back" do
       isolated_session(recover_cancelled_consumers: true) do |session, vhost|
         ch = session.open_channel
@@ -197,10 +267,12 @@ RSpec.describe "broker-cancelled consumers", :integration do
         # the application's call, never the client's, and recovery picks the
         # consumer back up if the queue is there when it looks.
         #
-        # The ordering is not a race. notify_app spawns this task before the
-        # task that goes looking, Async runs a new task up to its first yield
-        # straight away, so this declare is on the wire before the other task
-        # has even opened the channel it will ask on.
+        # The ordering is not a race, but only because the client runs this
+        # callback to completion before it goes asking. It used to spawn the
+        # two alongside each other and rely on Async running a new task up to
+        # its first yield, which held most of the time and not all of it: the
+        # declare yields at its RPC, and the reconcile could get its answer in
+        # first and conclude the queue was gone.
         ch.on_cancel { ch.durable_queue(q) }
         ch.basic_consume(q, manual_ack: true) { |_d, _h, body| received << body }
 

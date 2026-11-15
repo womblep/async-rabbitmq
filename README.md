@@ -472,28 +472,40 @@ logged rather than taken out on the channel.
 
 ### A consumer the broker cancels
 
-RabbitMQ cancels a consumer when it can no longer serve the queue to it: the
-queue was deleted, the node holding it failed, a replicated queue's leader
-moved. The connection is untouched, so none of the recovery above runs — a
-`basic.cancel` frame is the only notice there is, and without `on_cancel` the
-worker goes on publishing and heartbeating while consuming nothing.
+RabbitMQ cancels a consumer when it can no longer serve the queue to it. The
+connection is untouched, so none of the recovery above runs — a `basic.cancel`
+frame is the only notice there is, and without `on_cancel` the worker goes on
+publishing and heartbeating while consuming nothing.
 
 Nothing is re-subscribed by default, which matches Bunny, the Java client and
 the .NET client. `recover_cancelled_consumers: true`, on the session or on one
 channel, re-subscribes under the same consumer tag, backing off from 1s to 30s
-for as long as the queue exists and the channel is open.
+for as long as the queue exists, through however many reconnects that takes. It
+gives up only when the channel or the session is finished for good.
 
 **Recovery never declares anything.** One of the reasons a consumer gets
 cancelled is somebody deleting the queue, and a client that answered that by
 re-declaring would hand back a queue nobody could get rid of while a consumer
-was attached. So the client passively checks whether the queue is still there
-and re-consumes only if it is. If it has gone, the consumer stays gone and the
-queue is dropped from the topology registry too — otherwise the next connection
-recovery would re-declare it and the deletion would never stick. Only
-`NOT_FOUND` counts as gone; a replicated queue mid-election is unavailable, not
-deleted. Re-declaring is the application's call, and `on_cancel` is where to
-make it: declare the queue there and the re-subscribe that follows will find
-it.
+was attached. So the client asks the broker, on a channel of its own, whether
+the queue is still there, and re-consumes only if it is. Re-declaring is the
+application's call, and `on_cancel` is where to make it: that callback is run
+to completion before the client goes asking, so a queue declared there is
+there when it looks.
+
+Three things follow from that, and each of them is a bug in some client:
+
+- **The queue is held out of topology recovery until the client knows.**
+  Otherwise the two race — a reconnect re-declares the whole registry — and the
+  queue somebody deleted comes back. Deleting a quorum queue is exactly that
+  race arriving as one event: the cancel, and then a connection-level `541
+  INTERNAL_ERROR ... noproc` in answer to the re-subscribe.
+- **The question is asked before every attempt, never the attempt instead of
+  the question.** A `basic_consume` the broker answers `404` closes the
+  channel, and takes the consumers still working on it down with it.
+- **`NOT_FOUND` is two answers.** `no queue 'q' in vhost '/'` is a deletion;
+  `queue 'q' in vhost '/' process is stopped by supervisor`, which is what a
+  classic queue on a stopped node gives, is a queue that comes back with its
+  node. The second is waited for, not forgotten.
 
 ```ruby
 session = AsyncRabbitMQ::Session.new(..., recover_cancelled_consumers: true)

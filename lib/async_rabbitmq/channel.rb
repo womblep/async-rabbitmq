@@ -77,6 +77,15 @@ module AsyncRabbitMQ
     RECOVER_CONSUMER_DELAY     = 1
     RECOVER_CONSUMER_MAX_DELAY = 30
 
+    # A queue that is still declared and a queue that is gone both answer
+    # NOT_FOUND to a passive declare, and only the reply text tells them apart.
+    # Measured on RabbitMQ 4.4: a deleted queue gives "no queue 'q' in vhost
+    # '/'", while a classic queue whose node has been stopped gives "queue 'q'
+    # in vhost '/' process is stopped by supervisor" and comes back with its
+    # node. Older brokers say "home node ... is down or inaccessible" for the
+    # same thing. See #queue_missing?.
+    QUEUE_UNAVAILABLE = /process is stopped|is down or inaccessible/
+
     # Pushed onto the work queue to retire one handler worker. Compared by
     # identity, so it can never collide with a delivery.
     WORKER_STOP = Object.new.freeze
@@ -1407,20 +1416,30 @@ module AsyncRabbitMQ
     #
     # Bunny hands cancel notifications to its consumer work pool and the Java
     # client to its work service, for the same reason.
-    def notify_app(name)
-      @session.spawn_background do
-        yield
-      rescue *PROPAGATE_FROM_HANDLER
-        raise
-      rescue Exception => e # rubocop:disable Lint/RescueException
-        @logger.error("Channel #{@channel_id}: #{name} callback raised #{e.class}: #{e.message}")
-      end
+    def notify_app(name, &block)
+      @session.spawn_background { run_callback(name, &block) }
+    end
+
+    # The body of #notify_app, for a caller that is already off the dispatch
+    # fiber and has something to do after the callback.
+    def run_callback(name)
+      yield
+    rescue *PROPAGATE_FROM_HANDLER
+      raise
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      @logger.error("Channel #{@channel_id}: #{name} callback raised #{e.class}: #{e.message}")
     end
 
     # The broker cancels a consumer when it can no longer serve the queue to
-    # it: the queue was deleted, the node holding it failed, a replicated
-    # queue's leader moved. The connection is untouched, so connection
-    # recovery never runs - this frame is the only notice there is.
+    # it: the queue was deleted, or the node holding a classic queue stopped.
+    # On a three-node RabbitMQ 4.4.0 cluster, moving a quorum queue's
+    # leadership did not do it - not a graceful stop of the leader's node, not
+    # removing the member on the consuming node, not losing the majority, and
+    # not cutting the leader's node off the network until the queue re-elected.
+    # Other versions are reported to cancel on unavailability; it makes no
+    # difference here, since the handling is the same whatever the cause. The
+    # connection is untouched either way, so connection recovery never runs:
+    # this frame is the only notice there is.
     #
     # The consumer goes from @consumers first, so no delivery is dispatched to
     # a block that is no longer subscribed, and everything beyond that
@@ -1430,20 +1449,33 @@ module AsyncRabbitMQ
       topology&.delete_consumer(tag)
       return wake_each_waiters(tag) unless entry
 
+      # Held back from topology recovery from this moment, before anything can
+      # reconnect, because one of the reasons a consumer is cancelled is the
+      # queue being deleted and a reconnect re-declares the registry wholesale.
+      # Settled by #reconcile_cancelled_consumer, either way.
+      topology&.suspend_queue(entry[:queue_name])
       @logger.warn("Channel #{@channel_id}: broker cancelled consumer #{tag} on #{entry[:queue_name]}")
       instrument("consumer.cancelled") do
         { channel: @channel_id, consumer_tag: tag, queue: entry[:queue_name], reason: :broker }
       end
-      notify_app("on_cancel") { @on_cancel.call(tag) } if @on_cancel
-      @session.spawn_background { reconcile_cancelled_consumer(tag, entry) }
+      # The callback first and the reconcile after it, in one task rather than
+      # two. on_cancel is where an application re-declares a queue it wants
+      # back, and a reconcile running alongside it sometimes asked the broker
+      # before that declare had landed and concluded the queue was gone. Still
+      # off the dispatch fiber, so an RPC in the callback can get its reply and
+      # an exception in it cannot stop the channel.
+      @session.spawn_background do
+        run_callback("on_cancel") { @on_cancel.call(tag) } if @on_cancel
+        reconcile_cancelled_consumer(tag, entry)
+      end
     end
 
-    # Why the broker cancelled is not on the wire, and the two reasons want
-    # opposite handling: a queue that moved or was briefly unavailable should
-    # be consumed from again, while a queue somebody deleted must be left
-    # deleted. A passive declare is the only way to tell them apart. Spring
-    # AMQP's listener container probes the same way, and for the same reason
-    # declares nothing.
+    # Why the broker cancelled is not on the wire, and the reasons want
+    # opposite handling: a queue that is merely not being served should be
+    # consumed from again, while a queue somebody deleted must be left deleted.
+    # A passive declare is the only way to tell them apart. Spring AMQP's
+    # listener container probes the same way, and for the same reason declares
+    # nothing.
     #
     # Runs whether or not this channel recovers cancelled consumers, because
     # forgetting a deleted queue is not a recovery feature: a queue left in the
@@ -1451,10 +1483,52 @@ module AsyncRabbitMQ
     # then the deletion never sticks.
     def reconcile_cancelled_consumer(tag, entry)
       queue = entry[:queue_name]
-      return forget_deleted_queue(tag, queue) if queue_deleted?(queue)
-      return wake_each_waiters(tag) unless recovers_cancelled_consumers?
+      return recover_cancelled_consumer(tag, entry) if recovers_cancelled_consumers?
 
-      recover_cancelled_consumer(tag, entry)
+      # Not putting the consumer back, but a queue that has been deleted must
+      # still leave the registry or the next reconnect declares it again.
+      # Nothing is asked of a connection that is not there: a question put to a
+      # session that is down cannot be answered, and guessing here is what puts
+      # a deleted queue back.
+      return release_cancelled_consumer(tag, queue) unless wait_for_usable_channel
+
+      return forget_deleted_queue(tag, queue) if queue_status(queue) == :deleted
+
+      release_cancelled_consumer(tag, queue)
+    end
+
+    # Wait until this channel can carry a consumer again, through however many
+    # reconnects that takes. :ready if it already could, :reconnected if it had
+    # to wait for one, nil if it never will.
+    #
+    # Giving up on a connection loss instead would lose the consumer for good:
+    # it is no longer in @consumers, so the reconnect does not re-register it,
+    # and this loop is the only thing that would have brought it back. That is
+    # precisely the case a quorum queue produces - the re-subscribe is answered
+    # with a connection-level 541, not a channel error.
+    #
+    # Over for good when the channel is closed, which means the application
+    # closed it or recovery could not reopen it and its consumers belong to
+    # whoever does that, or when the session has stopped trying.
+    def wait_for_usable_channel
+      waited = false
+      loop do
+        return waited ? :reconnected : :ready if open? && @session.open?
+        return nil if closed? || @session.closed?
+
+        waited = true
+        sleep RECOVER_CONSUMER_DELAY
+      end
+    end
+
+    # Let the queue be recovered again and release anyone in #each. For a
+    # consumer that will not be followed up - this channel does not recover
+    # cancelled consumers, or there is nothing left to recover it onto - the
+    # queue must not stay held back: it was never established that it is gone,
+    # and a session opened again would not re-declare it.
+    def release_cancelled_consumer(tag, queue)
+      topology&.resume_queue(queue)
+      wake_each_waiters(tag)
     end
 
     # Re-consume under the same tag, for as long as the queue is there and this
@@ -1466,43 +1540,87 @@ module AsyncRabbitMQ
       failures = 0
 
       loop do
-        # The channel is gone, or the connection is: either way the consumers
-        # on it are somebody else's problem now (#reopen, or recovery).
-        return wake_each_waiters(tag) unless open? && @session.open?
+        # Every round starts with a connection that works and a fresh answer
+        # about the queue. A queue deleted while we were retrying has to stop
+        # the loop, and a basic_consume the broker answers with a 404 closes
+        # this channel and takes the consumers still working on it down too -
+        # so the question is asked on a channel of its own first, and only an
+        # answer of "it is there" is followed by an attempt to consume.
+        case wait_for_usable_channel
+        when nil then return release_cancelled_consumer(tag, queue)
+        when :reconnected
+          # The connection was what was wrong, and it is back: start the
+          # backoff again rather than sleeping out a delay earned by an outage
+          # that is over. A two-second blip should not leave a healthy queue
+          # unconsumed for the next thirty.
+          delay = RECOVER_CONSUMER_DELAY
+        end
 
-        begin
-          basic_consume(queue, consumer_tag: tag, manual_ack: entry[:manual_ack], exclusive: entry[:exclusive],
-                               arguments: entry[:arguments] || {}, on_error: entry[:on_error], &entry[:block])
-          @logger.info("Channel #{@channel_id}: re-subscribed consumer #{tag} to #{queue}")
-          instrument("consumer.recovered") do
-            { channel: @channel_id, consumer_tag: tag, queue: queue, attempts: failures + 1 }
-          end
-          return
-        rescue *PROPAGATE_FROM_HANDLER
-          raise
-        rescue => e
-          failures += 1
-          # One line per episode at warn, the rest at debug: a broker that is
-          # away for an hour would otherwise write a warning every attempt for
-          # the whole hour, and an application counting warnings would read
-          # one outage as hundreds.
-          if failures == 1
-            @logger.warn("Channel #{@channel_id}: could not re-subscribe #{tag} to #{queue}, " \
-                         "retrying: #{e.class}: #{e.message}")
-            instrument("consumer.recovery_failed") do
-              { channel: @channel_id, consumer_tag: tag, queue: queue, reason: :error, error: e }
+        case queue_status(queue)
+        when :deleted
+          return forget_deleted_queue(tag, queue)
+        when :unreachable
+          # No answer rather than an answer: the connection is what is wrong,
+          # not the queue, so the backoff a queue earns does not apply. Go back
+          # and wait for the connection instead of sleeping out a delay that
+          # doubles every time the broker cannot be reached.
+          delay = RECOVER_CONSUMER_DELAY
+        when :available
+          begin
+            basic_consume(queue, consumer_tag: tag, manual_ack: entry[:manual_ack], exclusive: entry[:exclusive],
+                                 arguments: entry[:arguments] || {}, on_error: entry[:on_error], &entry[:block])
+            # Consuming again, so the queue is there and recovery can have it
+            # back (#handle_broker_cancel held it).
+            topology&.resume_queue(queue)
+            @logger.info("Channel #{@channel_id}: re-subscribed consumer #{tag} to #{queue}")
+            instrument("consumer.recovered") do
+              { channel: @channel_id, consumer_tag: tag, queue: queue, attempts: failures + 1 }
             end
-          else
-            @logger.debug("Channel #{@channel_id}: re-subscribe attempt #{failures} for #{tag} failed: #{e.message}")
+            return
+          rescue *PROPAGATE_FROM_HANDLER
+            raise
+          rescue ConnectionError, NotOpenError => e
+            # The connection went, not the subscription. That has its own
+            # reporting and its own recovery, both already running, so it is
+            # not counted as a failure to re-subscribe: an application alarming
+            # on consumer.recovery_failed would otherwise be told twice about
+            # one event, and told it in the words of the more serious of the
+            # two.
+            @logger.debug("Channel #{@channel_id}: re-subscribe of #{tag} interrupted by " \
+                          "#{e.class}; waiting for the connection")
+          rescue ChannelError => e
+            # The queue went between the question and the answer. The broker
+            # has closed this channel saying so, so there is nothing left to
+            # retry on.
+            return forget_deleted_queue(tag, queue) if queue_missing?(e)
+
+            failures += 1
+            note_recovery_failure(tag, queue, e, failures)
+          rescue => e
+            failures += 1
+            note_recovery_failure(tag, queue, e, failures)
           end
         end
+        # :unavailable falls through to the backoff and is asked again.
 
         sleep delay
         delay = [delay * 2, RECOVER_CONSUMER_MAX_DELAY].min
-        # Re-checked every round, not just once: a queue deleted while we were
-        # retrying has to stop the loop, and it is also what keeps an endless
-        # retry endless only while there is something to consume from.
-        return forget_deleted_queue(tag, queue) if queue_deleted?(queue)
+      end
+    end
+
+    # One line per episode at warn, the rest at debug: a broker that is away
+    # for an hour would otherwise write a warning every attempt for the whole
+    # hour, and an application counting warnings would read one outage as
+    # hundreds.
+    def note_recovery_failure(tag, queue, error, failures)
+      if failures == 1
+        @logger.warn("Channel #{@channel_id}: could not re-subscribe #{tag} to #{queue}, " \
+                     "retrying: #{error.class}: #{error.message}")
+        instrument("consumer.recovery_failed") do
+          { channel: @channel_id, consumer_tag: tag, queue: queue, reason: :error, error: error }
+        end
+      else
+        @logger.debug("Channel #{@channel_id}: re-subscribe attempt #{failures} for #{tag} failed: #{error.message}")
       end
     end
 
@@ -1519,26 +1637,38 @@ module AsyncRabbitMQ
       wake_each_waiters(tag)
     end
 
-    # Deleted, as opposed to merely unreachable. A passive declare, on a channel
-    # of its own because a passive declare that fails closes the channel it ran
-    # on - which would take the queue's fellow consumers down with it.
+    # Is the queue gone, there, or merely not being served right now? A passive
+    # declare answers it, on a channel of its own because a passive declare
+    # that fails closes the channel it ran on - which would take the queue's
+    # fellow consumers down with it.
     #
-    # Only NOT_FOUND counts. A replicated queue mid-election is the very case
-    # this whole path exists for and it does not answer 404, so treating every
-    # channel error as a deletion would forget a queue that is coming back and
-    # stop topology recovery ever re-declaring it. Anything inconclusive - a
-    # connection that went while we were asking, too - reads as "still there",
-    # which costs a retry and never costs a queue.
-    def queue_deleted?(name)
+    # Four answers, because conflating any two of them does harm. :deleted must
+    # be forgotten and :unavailable must be waited for, and telling those apart
+    # is the whole point. :unreachable - no answer at all, because the
+    # connection is in trouble - is separated from :unavailable so that the
+    # caller does not spend a backoff earned by a queue on a connection that is
+    # simply down, and is never taken for :available, because a basic_consume
+    # on a queue that is not there closes the channel.
+    def queue_status(name)
       @session.with_channel { |probe| probe.queue(name, passive: true) }
-      false
+      :available
     rescue ChannelError => e
-      e.code == 404
+      queue_missing?(e) ? :deleted : :unavailable
     rescue *PROPAGATE_FROM_HANDLER
       raise
     rescue => e
       @logger.debug("Channel #{@channel_id}: could not check whether #{name} still exists: #{e.class}: #{e.message}")
-      false
+      :unreachable
+    end
+
+    # Gone, rather than merely not being served. Taking a queue whose node is
+    # down for a deleted one forgets a queue that is coming back: its consumer
+    # is never restored, and it is never re-declared either. Any 404 the
+    # QUEUE_UNAVAILABLE wordings do not cover reads as a deletion, which is the
+    # safe way round - an unmatched wording costs only what forgetting it costs
+    # today.
+    def queue_missing?(error)
+      error.code == 404 && !QUEUE_UNAVAILABLE.match?(error.text.to_s)
     end
 
     # Release fibers blocked in #each for one consumer, or for all of them.
