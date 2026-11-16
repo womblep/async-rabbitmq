@@ -134,6 +134,52 @@ RSpec.describe "reliability fixes" do
     end
   end
 
+  # A cancelled consumer whose queue cannot be probed must leave the queue
+  # suspended. Releasing it hands it back to topology recovery, which re-declares
+  # it - and the queue may be one somebody has just deleted. The integration
+  # cover for this (46_broker_amnesia, 61_consumer_cancel) only fails when the
+  # timing is right, so it is pinned here deterministically.
+  describe "reconciling a cancelled consumer when recovery is off" do
+    def reconcile(*statuses)
+      channel = AsyncRabbitMQ::Channel.allocate
+      allow(channel).to receive(:recovers_cancelled_consumers?).and_return(false)
+      allow(channel).to receive(:wait_for_usable_channel).and_return(:ready)
+      allow(channel).to receive(:sleep)
+      allow(channel).to receive(:queue_status).and_return(*statuses)
+      yield channel
+      channel.send(:reconcile_cancelled_consumer, "ctag-1", { queue_name: "q" })
+    end
+
+    it "does not release the queue on a probe that could not be answered" do
+      reconcile(:unreachable, :unreachable, :deleted) do |channel|
+        expect(channel).not_to receive(:release_cancelled_consumer)
+        expect(channel).to receive(:forget_deleted_queue).with("ctag-1", "q")
+      end
+    end
+
+    it "does not release the queue while the broker says it is not being served" do
+      reconcile(:unavailable, :deleted) do |channel|
+        expect(channel).not_to receive(:release_cancelled_consumer)
+        expect(channel).to receive(:forget_deleted_queue).with("ctag-1", "q")
+      end
+    end
+
+    it "releases the queue once the broker says it is there" do
+      reconcile(:unreachable, :available) do |channel|
+        expect(channel).to receive(:release_cancelled_consumer).with("ctag-1", "q")
+        expect(channel).not_to receive(:forget_deleted_queue)
+      end
+    end
+
+    it "releases the queue when the session is finished for good" do
+      channel = AsyncRabbitMQ::Channel.allocate
+      allow(channel).to receive(:recovers_cancelled_consumers?).and_return(false)
+      allow(channel).to receive(:wait_for_usable_channel).and_return(nil)
+      expect(channel).to receive(:release_cancelled_consumer).with("ctag-1", "q")
+      channel.send(:reconcile_cancelled_consumer, "ctag-1", { queue_name: "q" })
+    end
+  end
+
   describe AsyncRabbitMQ::Notifier do
     it "does not skip a subscriber when another unsubscribes mid-publish" do
       notifier = described_class.new

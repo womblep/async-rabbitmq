@@ -1490,11 +1490,31 @@ module AsyncRabbitMQ
       # Nothing is asked of a connection that is not there: a question put to a
       # session that is down cannot be answered, and guessing here is what puts
       # a deleted queue back.
-      return release_cancelled_consumer(tag, queue) unless wait_for_usable_channel
+      #
+      # So the queue stays suspended until the broker gives a definite answer,
+      # and only :available releases it. Releasing on a probe that could not be
+      # answered is how a deleted queue comes back - it is not evidence the
+      # queue is there, and 46_broker_amnesia_spec is the case that proves it.
+      delay = RECOVER_CONSUMER_DELAY
 
-      return forget_deleted_queue(tag, queue) if queue_status(queue) == :deleted
+      loop do
+        case wait_for_usable_channel
+        when nil          then return release_cancelled_consumer(tag, queue)
+        when :reconnected then delay = RECOVER_CONSUMER_DELAY
+        end
 
-      release_cancelled_consumer(tag, queue)
+        case queue_status(queue)
+        when :deleted   then return forget_deleted_queue(tag, queue)
+        when :available then return release_cancelled_consumer(tag, queue)
+        end
+
+        # :unavailable - the broker says the queue is not being served - and
+        # :unreachable - no answer at all - both mean ask again, never "the
+        # queue is there". Sleeping on either is also what keeps this from
+        # spinning when the probe cannot be answered.
+        sleep delay
+        delay = [delay * 2, RECOVER_CONSUMER_MAX_DELAY].min
+      end
     end
 
     # Wait until this channel can carry a consumer again, through however many

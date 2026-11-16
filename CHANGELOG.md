@@ -33,6 +33,11 @@ All notable changes to this project will be documented in this file.
   is an RPC that yields, so the probe sometimes got its answer in first and concluded the queue
   was deleted. The callback is still off the dispatch fiber, so an RPC in it still gets its reply
   and an exception in it still cannot stop the channel.
+- A cancelled queue is released back to topology recovery only on a definite answer that it
+  still exists. A probe the broker could not answer is not evidence the queue is there, and
+  treating it as such re-declared a queue that had just been deleted - the one thing this
+  handling exists to prevent. The queue now stays held back until the broker says `:deleted`
+  or `:available`, retrying with the same backoff the recovering path uses.
 - The retry backoff no longer grows for a failure that was the connection's rather than the
   queue's, and resets once the connection is back. A two-second blip could otherwise leave a
   healthy queue unconsumed for the next thirty seconds, since each unanswerable probe doubled the
