@@ -38,6 +38,7 @@ module AsyncRabbitMQ
       @queue_bindings    = []
       @exchange_bindings = []
       @consumers         = {}   # consumer tag => queue name
+      @suspended         = Set.new # queue names held back from recovery
     end
 
     # --- recording -----------------------------------------------------------
@@ -59,6 +60,9 @@ module AsyncRabbitMQ
 
     def record_queue(channel_id, name, durable:, exclusive:, auto_delete:, arguments:, server_named:, object: nil)
       existing = @queues[name]
+      # Declared again by the application, so whatever doubt a cancelled
+      # consumer raised about it is settled.
+      @suspended.delete(name)
       rec = RecordedQueue.new(channel_id: channel_id, name: name, durable: durable, exclusive: exclusive,
                               auto_delete: auto_delete, arguments: arguments.dup, server_named: server_named,
                               objects: existing ? existing.objects : [])
@@ -68,8 +72,37 @@ module AsyncRabbitMQ
 
     def delete_queue(name)
       @queues.delete(name)
+      @suspended.delete(name)
       gone, @queue_bindings = @queue_bindings.partition { |b| b.queue == name }
       gone.each { |b| prune_auto_delete_exchange(b.exchange) }
+    end
+
+    # --- suspension ----------------------------------------------------------
+    #
+    # A queue is suspended while the client is working out whether it is still
+    # there, which is what a consumer the broker cancelled leaves it not
+    # knowing. Recovery skips a suspended queue and its bindings.
+    #
+    # The alternative - keep recovering it until the client is sure - puts a
+    # deleted queue back, because the deletion and the reconnect race: the node
+    # that was serving the queue is often the one that just went, and a
+    # reconnect re-declares the whole registry before anything can ask the new
+    # connection whether the queue survived. A queue the broker then hands back
+    # with a consumer attached cannot be deleted at all. Holding it back costs
+    # nothing by comparison: the worst case is a queue that was fine and is not
+    # re-declared for the few seconds it takes to establish that.
+
+    def suspend_queue(name)
+      @suspended << name if @queues.key?(name)
+    end
+
+    def resume_queue(name)
+      @suspended.delete(name)
+    end
+
+    # Queue names currently held back, for inspection.
+    def suspended_queues
+      @suspended.dup
     end
 
     # A server-named queue was re-declared under a different name.
@@ -77,6 +110,7 @@ module AsyncRabbitMQ
       rec = @queues.delete(old_name) or return
       rec.name = new_name
       @queues[new_name] = rec
+      @suspended << new_name if @suspended.delete?(old_name)
       @queue_bindings.each { |b| b.queue = new_name if b.queue == old_name }
       @consumers.transform_values! { |queue| queue == old_name ? new_name : queue }
       rec.objects.each { |q| q.update_name_to(new_name) }
@@ -135,11 +169,11 @@ module AsyncRabbitMQ
     end
 
     def queues
-      apply(:filter_queues, @queues.values)
+      apply(:filter_queues, @queues.each_value.reject { |q| @suspended.include?(q.name) })
     end
 
     def queue_bindings
-      apply(:filter_queue_bindings, @queue_bindings.dup)
+      apply(:filter_queue_bindings, @queue_bindings.reject { |b| @suspended.include?(b.queue) })
     end
 
     def exchange_bindings
@@ -159,6 +193,7 @@ module AsyncRabbitMQ
       @queue_bindings.clear
       @exchange_bindings.clear
       @consumers.clear
+      @suspended.clear
     end
 
     # Forget only what was tied to the connection that just went: exclusive
@@ -174,6 +209,7 @@ module AsyncRabbitMQ
 
       dropped_queues.each    { |name| @queues.delete(name) }
       dropped_exchanges.each { |name| @exchanges.delete(name) }
+      @suspended.subtract(dropped_queues)
 
       @queue_bindings.reject! do |b|
         dropped_queues.include?(b.queue) || dropped_exchanges.include?(b.exchange)

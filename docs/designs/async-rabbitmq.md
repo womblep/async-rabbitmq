@@ -173,11 +173,20 @@ the queue — from the management UI, say, where nothing on this connection sees
 it happen. Left in the registry, that queue is re-declared by the next
 connection recovery and the deletion never sticks: the queue cannot be got rid
 of while a client holds a record of it. So a broker-sent cancel is followed by
-a passive declare on a channel of its own, and a `NOT_FOUND` forgets the queue
-and its bindings. Only `NOT_FOUND`: a replicated queue whose leader is moving
-is the case consumer recovery exists for, and it answers something else.
-Forgetting a queue that does exist would be the worse error of the two, so
-anything inconclusive leaves the record alone.
+a passive declare on a channel of its own, and a `NOT_FOUND` that says there is
+no such queue forgets the queue and its bindings. Not every `NOT_FOUND`: a
+classic queue on a stopped node answers one too (`process is stopped by
+supervisor`) and comes back with its node. Forgetting a queue that does exist
+is the worse error of the two — its consumer is never restored and it is never
+re-declared either — so anything inconclusive leaves the record alone.
+
+Until the answer is in, the queue is **held out of recovery** rather than
+recovered as usual. Otherwise the deletion and a reconnect race, and the
+reconnect wins: it re-declares the whole registry before anything has asked the
+new connection whether the queue survived. Deleting a quorum queue is that race
+arriving as a single event — the cancel, then a connection-level `541
+INTERNAL_ERROR ... noproc` in answer to the re-subscribe — and it put the queue
+back, with a consumer attached, which is the state nobody can delete.
 
 Channel ids come from `ChannelIdAllocator`, a bitset (`AMQ::BitSet`, the
 structure under Bunny's allocator) over `1..channel_max`. Ids are released when
@@ -317,6 +326,9 @@ over keeps its dashboards.
 | Test queues | Durable or exclusive | RabbitMQ 4.2+ refuses transient non-exclusive queues at connection level |
 | Application callbacks | A task of their own | They are the natural place for an RPC, and the dispatch fiber is the one that would deliver its reply; a raise there stopped the channel entirely |
 | Broker-cancelled consumers | Not re-subscribed by default, and never re-declared | Bunny recovers them only behind a flag and the Java and .NET clients not at all; re-declaring would hand back a queue nobody could delete |
+| A cancelled consumer's queue | Held out of topology recovery until the client knows whether it still exists | A reconnect re-declares the registry wholesale, so without this a queue deleted a moment earlier comes back — with a consumer on it, which nobody can then delete. Deleting a quorum queue is that race arriving as one event (`541 INTERNAL_ERROR ... noproc`) |
+| A cancelled consumer during a reconnect | Waited for, not given up on | It is no longer in the channel's consumer registry, so the reconnect will not re-register it: this loop is the only thing that brings it back |
+| `NOT_FOUND` on the probe | A deletion only when the text says there is no such queue | A classic queue on a stopped node also answers 404, and comes back with its node; reading that as a deletion loses the consumer and the queue record both |
 
 ## Tests
 

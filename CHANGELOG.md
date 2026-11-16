@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.1] - 2026-11-15
+
+### Fixed
+
+- A consumer the broker cancelled is no longer given up on when the connection goes at the same
+  moment. Deleting a quorum queue is both events at once: the consumer is cancelled, and the
+  re-subscribe is answered with a connection-level `541 INTERNAL_ERROR ... noproc` that takes the
+  connection down. 0.8.0's recovery loop stopped at the first sight of a session that was not
+  open, and nothing else would have brought that consumer back - it is no longer in the channel's
+  registry, so the reconnect does not re-register it either. It now waits through however many
+  reconnects it takes, and gives up only when the channel or the session is finished for good.
+- A queue whose consumer the broker cancelled is held out of topology recovery until the client
+  has established whether it still exists. Without that the two race: a reconnect re-declares the
+  whole registry, so a queue deleted a moment earlier came back - and a queue the broker hands
+  back with a consumer attached cannot be deleted at all, which is the bug 0.8.0 set out to fix.
+  Measured against RabbitMQ 4.4, deleting a quorum queue reached exactly that state.
+- A connection lost mid-re-subscribe is no longer reported as `consumer.recovery_failed`. It has
+  its own event and its own recovery, both already running, and an application alarming on
+  recovery failures was told twice about one outage, in the words of the more serious of the two.
+- A `404` that says the queue's process is stopped, rather than that there is no such queue, is no
+  longer read as a deletion. A classic queue on a stopped node answers `NOT_FOUND - queue 'q' in
+  vhost '/' process is stopped by supervisor` and comes back with its node; the client forgot it,
+  so the consumer was never restored and the queue was never re-declared either. The probe now
+  answers `:deleted`, `:available`, `:unavailable` or `:unreachable`, and only `:available` is followed by an
+  attempt to consume - a `basic_consume` the broker answers with a 404 closes the channel and
+  takes the consumers still working on it down with it.
+- `on_cancel` now runs to completion before the client decides what became of the queue. The two
+  ran alongside each other, and the documented way to keep a queue - re-declare it in `on_cancel` -
+  is an RPC that yields, so the probe sometimes got its answer in first and concluded the queue
+  was deleted. The callback is still off the dispatch fiber, so an RPC in it still gets its reply
+  and an exception in it still cannot stop the channel.
+- A cancelled queue is released back to topology recovery only on a definite answer that it
+  still exists. A probe the broker could not answer is not evidence the queue is there, and
+  treating it as such re-declared a queue that had just been deleted - the one thing this
+  handling exists to prevent. The queue now stays held back until the broker says `:deleted`
+  or `:available`, retrying with the same backoff the recovering path uses.
+- The retry backoff no longer grows for a failure that was the connection's rather than the
+  queue's, and resets once the connection is back. A two-second blip could otherwise leave a
+  healthy queue unconsumed for the next thirty seconds, since each unanswerable probe doubled the
+  delay. The queue probe now answers `:unreachable` - no answer at all - separately from
+  `:unavailable`, which is the broker saying the queue is not being served.
+
 ## [0.8.0] - 2026-11-14
 
 ### Fixed
