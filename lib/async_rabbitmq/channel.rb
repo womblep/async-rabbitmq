@@ -117,7 +117,7 @@ module AsyncRabbitMQ
       @notifier     = session.respond_to?(:notifier) ? session.notifier : nil
       @frame_io     = frame_io
       @frame_max    = frame_max
-      @logger       = logger
+      @logger       = Logging.resolve(logger)
       @rpc_timeout  = rpc_timeout   # seconds a synchronous operation waits for its reply; nil = forever
 
       @state             = :closed
@@ -226,7 +226,7 @@ module AsyncRabbitMQ
       begin
         wait_for_recovery! while resyncing?
       rescue => e
-        @logger.debug("Channel #{@channel_id}: close saw recovery end while resyncing: #{e.class}")
+        @logger.debug(self, "Channel #{@channel_id}: close saw recovery end while resyncing: #{e.class}")
         return
       end
       if recovering?
@@ -1108,7 +1108,7 @@ module AsyncRabbitMQ
       return false unless delivery_tag.is_a?(VersionedDeliveryTag)
       return false unless delivery_tag.stale?(@delivery_generation)
 
-      @logger.warn(
+      @logger.warn(self, 
         "Channel #{@channel_id}: dropped #{action} for delivery tag #{delivery_tag.to_i} from " \
         "generation #{delivery_tag.generation} (now #{@delivery_generation}) — the message was " \
         "redelivered on the new connection"
@@ -1135,7 +1135,7 @@ module AsyncRabbitMQ
       return if manual_ack && @prefetch && @prefetch[:count].to_i > 0
 
       @qos_warned = true
-      @logger.warn(
+      @logger.warn(self, 
         if manual_ack
           "Channel #{@channel_id}: consuming from #{queue_name} without basic_qos. " \
           "The broker will send the whole queue as fast as it can and the backlog is " \
@@ -1171,7 +1171,7 @@ module AsyncRabbitMQ
     # life of the connection and, once prefetch messages are stuck that way,
     # the consumer stops receiving anything at all.
     def handle_consumer_error(error, method, entry)
-      @logger.error(
+      @logger.error(self, 
         "Channel #{@channel_id}: consumer #{method.consumer_tag} raised "         "#{error.class}: #{error.message}"
       )
       instrument("consumer.error") do
@@ -1204,7 +1204,7 @@ module AsyncRabbitMQ
       rescue *PROPAGATE_FROM_HANDLER
         raise
       rescue Exception => e # rubocop:disable Lint/RescueException
-        @logger.error("Channel #{@channel_id}: could not settle after consumer error: #{e.class}: #{e.message}")
+        @logger.error(self, "Channel #{@channel_id}: could not settle after consumer error: #{e.class}: #{e.message}")
       end
     end
 
@@ -1220,7 +1220,7 @@ module AsyncRabbitMQ
       # The hook is the caller's code as much as the handler is, and it runs
       # while a delivery is still unsettled: letting it escape would strand the
       # message and kill the worker.
-      @logger.error("Channel #{@channel_id}: on_handler_error hook raised #{e.class}: #{e.message}")
+      @logger.error(self, "Channel #{@channel_id}: on_handler_error hook raised #{e.class}: #{e.message}")
       nil
     end
 
@@ -1355,13 +1355,13 @@ module AsyncRabbitMQ
     rescue *PROPAGATE_FROM_HANDLER
       raise
     rescue => e
-      @logger.error("Channel #{@channel_id} dispatch error: #{e.class}: #{e.message}")
+      @logger.error(self, "Channel #{@channel_id} dispatch error: #{e.class}: #{e.message}")
     rescue Exception => e # rubocop:disable Lint/RescueException
       # Handlers are contained now, so nothing should reach here. If something
       # does, this channel is about to stop delivering anything at all - no
       # confirms, no RPC replies, no close-ok - and the one thing that must not
       # happen is for it to go quiet without saying so.
-      @logger.error(
+      @logger.error(self, 
         "Channel #{@channel_id} dispatch died on #{e.class}: #{e.message}. " \
         "The channel will not deliver anything further."
       )
@@ -1413,9 +1413,9 @@ module AsyncRabbitMQ
           # Content frames follow on this channel; take them off with the
           # method so the stream does not skew.
           @queue.pop
-          @logger.debug("Channel #{@channel_id}: discarded #{method.class} while resynchronising")
+          @logger.debug(self, "Channel #{@channel_id}: discarded #{method.class} while resynchronising")
         else
-          @logger.warn("Channel #{@channel_id}: discarded #{method.class} while resynchronising")
+          @logger.warn(self, "Channel #{@channel_id}: discarded #{method.class} while resynchronising")
         end
         return
       end
@@ -1443,7 +1443,7 @@ module AsyncRabbitMQ
             ensure_worker(queue)
           end
         else
-          @logger.warn("Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
+          @logger.warn(self, "Delivery on channel #{@channel_id} for unknown consumer #{method.consumer_tag}")
         end
 
       when AMQ::Protocol::Basic::Return
@@ -1457,7 +1457,7 @@ module AsyncRabbitMQ
         if @return_handler
           Async { @return_handler.call(method, header, body) }
         else
-          @logger.warn("Unhandled basic.return on channel #{@channel_id} — register on_return to handle")
+          @logger.warn(self, "Unhandled basic.return on channel #{@channel_id} — register on_return to handle")
         end
 
       when AMQ::Protocol::Basic::Ack
@@ -1482,7 +1482,7 @@ module AsyncRabbitMQ
            AMQ::Protocol::Connection::Unblocked
         # These arrive on channel 0 and are handled by the Session channel-0 monitor.
         # They should never reach a Channel object — log and ignore defensively.
-        @logger.debug("Channel #{@channel_id}: ignoring connection-level #{method.class} frame")
+        @logger.debug(self, "Channel #{@channel_id}: ignoring connection-level #{method.class} frame")
 
       else
         # Resolve the registered reply slot. The promise latches, so a reply
@@ -1591,7 +1591,7 @@ module AsyncRabbitMQ
     rescue *PROPAGATE_FROM_HANDLER
       raise
     rescue Exception => e # rubocop:disable Lint/RescueException
-      @logger.error("Channel #{@channel_id}: #{name} callback raised #{e.class}: #{e.message}")
+      @logger.error(self, "Channel #{@channel_id}: #{name} callback raised #{e.class}: #{e.message}")
     end
 
     # The broker cancels a consumer when it can no longer serve the queue to
@@ -1618,7 +1618,7 @@ module AsyncRabbitMQ
       # queue being deleted and a reconnect re-declares the registry wholesale.
       # Settled by #reconcile_cancelled_consumer, either way.
       topology&.suspend_queue(entry[:queue_name])
-      @logger.warn("Channel #{@channel_id}: broker cancelled consumer #{tag} on #{entry[:queue_name]}")
+      @logger.warn(self, "Channel #{@channel_id}: broker cancelled consumer #{tag} on #{entry[:queue_name]}")
       instrument("consumer.cancelled") do
         { channel: @channel_id, consumer_tag: tag, queue: entry[:queue_name], reason: :broker }
       end
@@ -1756,7 +1756,7 @@ module AsyncRabbitMQ
             # Consuming again, so the queue is there and recovery can have it
             # back (#handle_broker_cancel held it).
             topology&.resume_queue(queue)
-            @logger.info("Channel #{@channel_id}: re-subscribed consumer #{tag} to #{queue}")
+            @logger.info(self, "Channel #{@channel_id}: re-subscribed consumer #{tag} to #{queue}")
             instrument("consumer.recovered") do
               { channel: @channel_id, consumer_tag: tag, queue: queue, attempts: failures + 1 }
             end
@@ -1770,7 +1770,7 @@ module AsyncRabbitMQ
             # on consumer.recovery_failed would otherwise be told twice about
             # one event, and told it in the words of the more serious of the
             # two.
-            @logger.debug("Channel #{@channel_id}: re-subscribe of #{tag} interrupted by " \
+            @logger.debug(self, "Channel #{@channel_id}: re-subscribe of #{tag} interrupted by " \
                           "#{e.class}; waiting for the connection")
           rescue ChannelError => e
             # The queue went between the question and the answer. The broker
@@ -1798,13 +1798,13 @@ module AsyncRabbitMQ
     # hundreds.
     def note_recovery_failure(tag, queue, error, failures)
       if failures == 1
-        @logger.warn("Channel #{@channel_id}: could not re-subscribe #{tag} to #{queue}, " \
+        @logger.warn(self, "Channel #{@channel_id}: could not re-subscribe #{tag} to #{queue}, " \
                      "retrying: #{error.class}: #{error.message}")
         instrument("consumer.recovery_failed") do
           { channel: @channel_id, consumer_tag: tag, queue: queue, reason: :error, error: error }
         end
       else
-        @logger.debug("Channel #{@channel_id}: re-subscribe attempt #{failures} for #{tag} failed: #{error.message}")
+        @logger.debug(self, "Channel #{@channel_id}: re-subscribe attempt #{failures} for #{tag} failed: #{error.message}")
       end
     end
 
@@ -1814,7 +1814,7 @@ module AsyncRabbitMQ
     # back" bug the Java client has been fixing instances of for years.
     def forget_deleted_queue(tag, queue)
       topology&.delete_queue(queue)
-      @logger.warn("Channel #{@channel_id}: queue #{queue} no longer exists; consumer #{tag} will not be recovered")
+      @logger.warn(self, "Channel #{@channel_id}: queue #{queue} no longer exists; consumer #{tag} will not be recovered")
       instrument("consumer.recovery_failed") do
         { channel: @channel_id, consumer_tag: tag, queue: queue, reason: :queue_deleted }
       end
@@ -1841,7 +1841,7 @@ module AsyncRabbitMQ
     rescue *PROPAGATE_FROM_HANDLER
       raise
     rescue => e
-      @logger.debug("Channel #{@channel_id}: could not check whether #{name} still exists: #{e.class}: #{e.message}")
+      @logger.debug(self, "Channel #{@channel_id}: could not check whether #{name} still exists: #{e.class}: #{e.message}")
       :unreachable
     end
 
@@ -1918,7 +1918,7 @@ module AsyncRabbitMQ
       # away as the late one we are shedding.
       begin_recovery_wait!
       @state = :resyncing
-      @logger.warn(
+      @logger.warn(self, 
         "Channel #{@channel_id}: reopening after an RPC timeout. A late reply carries nothing " \
         "to match it to its request, so it would be handed to the next caller on this channel."
       )
@@ -1937,7 +1937,7 @@ module AsyncRabbitMQ
       begin
         outcome = Async::Task.current.with_timeout(@rpc_timeout || RESYNC_TIMEOUT) { promise.wait }
       rescue Async::TimeoutError
-        @logger.error("Channel #{@channel_id}: no channel.close-ok while resynchronising")
+        @logger.error(self, "Channel #{@channel_id}: no channel.close-ok while resynchronising")
         # Deliberately NOT clearing @resync_promise here: the dispatch filter
         # keys on it, and it must keep discarding frames — a very late
         # close-ok above all — until just before the reopen below. Cleared
@@ -1954,7 +1954,7 @@ module AsyncRabbitMQ
       # still restore them). Leave it be. @consumers is untouched; the dup is
       # moot on this path.
       if recovering? || outcome.is_a?(Exception)
-        @logger.info("Channel #{@channel_id}: connection lost during resync; recovery will reopen it")
+        @logger.info(self, "Channel #{@channel_id}: connection lost during resync; recovery will reopen it")
         return
       end
 
@@ -1991,10 +1991,10 @@ module AsyncRabbitMQ
       # dropping it, which would strand the consumers for good.
       if recovering? || !@session.open?
         @consumers.replace(consumers) if @consumers.empty?
-        @logger.info("Channel #{@channel_id}: connection lost during resync reopen; recovery will handle it")
+        @logger.info(self, "Channel #{@channel_id}: connection lost during resync reopen; recovery will handle it")
         return
       end
-      @logger.error("Channel #{@channel_id}: could not resynchronise after an RPC timeout: #{e.class}: #{e.message}")
+      @logger.error(self, "Channel #{@channel_id}: could not resynchronise after an RPC timeout: #{e.class}: #{e.message}")
       mark_closed!(ChannelError.new("Channel could not be resynchronised after an RPC timeout: #{e.message}",
                                     channel_id: @channel_id))
       @session.channel_closed(@channel_id) rescue nil
@@ -2019,7 +2019,7 @@ module AsyncRabbitMQ
     def recover_entity(what)
       yield
     rescue ChannelError => e
-      @logger.error("Channel #{@channel_id}: could not recover #{what}: #{e.message}")
+      @logger.error(self, "Channel #{@channel_id}: could not recover #{what}: #{e.message}")
       # The broker closed this channel; put it back so the rest can continue.
       @session.reopen_channel(self)
     end
@@ -2137,7 +2137,7 @@ module AsyncRabbitMQ
         @delivery_tag += 1
         @pending_confirms[@delivery_tag] = [bytes, entry[1], entry[2]]
       end
-      @logger.info("Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
+      @logger.info(self, "Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
     end
 
     # Park until the current episode resolves. The promise is a latch: a waiter
@@ -2240,7 +2240,7 @@ module AsyncRabbitMQ
                             on_error: entry[:on_error], &entry[:block])
             rescue ChannelError => e
               dropped[tag] = e
-              @logger.error("Channel #{@channel_id}: consumer #{tag} on #{entry[:queue_name]} rejected (#{e.message}); dropping it")
+              @logger.error(self, "Channel #{@channel_id}: consumer #{tag} on #{entry[:queue_name]} rejected (#{e.message}); dropping it")
               # The broker closed the channel rejecting this one, cancelling the
               # consumers already restored on it. Restart to re-subscribe them.
               # If it is somehow still open, the earlier subscriptions stand, so
@@ -2250,7 +2250,7 @@ module AsyncRabbitMQ
                 break
               end
             rescue => e
-              @logger.warn("Channel #{@channel_id}: consumer re-registration interrupted (#{e.class}: #{e.message}); leaving consumers for the next recovery")
+              @logger.warn(self, "Channel #{@channel_id}: consumer re-registration interrupted (#{e.class}: #{e.message}); leaving consumers for the next recovery")
               throw :abort_reregister, true
             end
           end

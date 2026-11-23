@@ -1,3 +1,10 @@
+# The client logs through Console by default, and RSpec's warnings mode sets
+# $VERBOSE, which raises Console's default level to info. Keep the suite's
+# output at warnings, as it was under the old Log default; CONSOLE_LEVEL=debug
+# on the command line still overrides. Set before anything logs, since
+# Console builds its default logger from the environment on first use.
+ENV["CONSOLE_LEVEL"] ||= "warn"
+
 # Load .env file from project root if present (no dotenv dependency required).
 env_file = File.expand_path("../../.env", __FILE__)
 if File.exist?(env_file)

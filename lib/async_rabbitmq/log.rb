@@ -1,7 +1,10 @@
 # frozen_string_literal: true
 
 module AsyncRabbitMQ
-  # The default logger: warnings and errors, one line each, to $stderr.
+  # A minimal logger: warnings and errors, one line each, to $stderr. Not the
+  # default - the client logs through Console unless given +logger:+ (see
+  # AsyncRabbitMQ::Logging) - but a plain destination for when you want one
+  # without the logger gem.
   #
   # Anything that responds to +debug+, +info+, +warn+ and +error+ can be passed
   # as +logger:+ instead, and that is the expected thing to do in an

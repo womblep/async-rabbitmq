@@ -31,6 +31,9 @@ Gem::Specification.new do |spec|
   # introduced Queue#close, which FrameIO#stop relies on.
   spec.add_dependency "async",        "~> 2.29"
   spec.add_dependency "amq-protocol", "~> 2.9"
+  # The default logger (see AsyncRabbitMQ::Logging). async depends on it
+  # already; declared because this gem calls it directly.
+  spec.add_dependency "console",      "~> 1.29"
   # Connection establishment (TCP, TLS, address resolution) - the same layer
   # async-http and the rest of the socketry stack build on.
   spec.add_dependency "io-endpoint",  "~> 0.19"

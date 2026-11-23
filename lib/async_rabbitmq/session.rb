@@ -197,7 +197,7 @@ module AsyncRabbitMQ
       topology_recovery_filter: nil,
       instrumenter: nil,
       notifier: nil,
-      logger: Log.new
+      logger: Console
     )
       @addresses = self.class.address_list(host: host, port: port, hosts: hosts, addresses: addresses)
       @host                 = @addresses.first[0]
@@ -231,8 +231,8 @@ module AsyncRabbitMQ
       # Channel#recovers_cancelled_consumers? for why it is off.
       @recover_cancelled_consumers = recover_cancelled_consumers
       @topology             = TopologyRegistry.new(filter: topology_recovery_filter)
-      @logger               = logger
-      @notifier             = notifier || Notifier.new(logger: logger)
+      @logger               = Logging.resolve(logger)
+      @notifier             = notifier || Notifier.new(logger: @logger)
       @notifier.subscribe { |name, payload| instrumenter.call(name, payload) } if instrumenter
 
       @state             = :closed
@@ -400,7 +400,7 @@ module AsyncRabbitMQ
       # gated today, but the guarantee belongs here, not in each of them.
       # Callers tolerate nil (their task handles are all used through &.).
       if @closed_by_user
-        @logger.debug("Session closed: background task not started")
+        @logger.debug(self, "Session closed: background task not started")
         return nil
       end
       barrier = (@background ||= Async::Barrier.new)
@@ -517,7 +517,7 @@ module AsyncRabbitMQ
           # with it would strand the session. Keep the new secret for
           # reconnects and say so.
           @password = new_secret
-          @logger.warn("connection.update-secret got no reply in #{@rpc_timeout || RPC_TIMEOUT}s; " \
+          @logger.warn(self, "connection.update-secret got no reply in #{@rpc_timeout || RPC_TIMEOUT}s; " \
                        "the new secret will be used for reconnects, its acceptance unconfirmed")
           raise RpcTimeoutError, "No reply to connection.update-secret within #{@rpc_timeout || RPC_TIMEOUT}s"
         ensure
@@ -635,7 +635,7 @@ module AsyncRabbitMQ
     # Called by a channel when topology recovery re-declared a server-named
     # queue under a new name: update the registry and every consumer of it.
     def queue_renamed(old_name, new_name)
-      @logger.info("Server-named queue #{old_name} recovered as #{new_name}")
+      @logger.info(self, "Server-named queue #{old_name} recovered as #{new_name}")
       @topology.rename_queue(old_name, new_name)
       @channels.values.each do |ch|
         ch.rename_consumer_queue(old_name, new_name)
@@ -697,7 +697,7 @@ module AsyncRabbitMQ
         return
       end
 
-      @logger.warn("Connection lost (#{error.class}: #{error.message}). Starting recovery...")
+      @logger.warn(self, "Connection lost (#{error.class}: #{error.message}). Starting recovery...")
 
       if @recovery_in_progress
         # Connection died again while a recovery attempt is in progress.
@@ -758,7 +758,7 @@ module AsyncRabbitMQ
     def connection_lost(error)
       @on_connection_lost&.call(self, error)
     rescue => e
-      @logger.error("on_connection_lost callback failed: #{e.class}: #{e.message}")
+      @logger.error(self, "on_connection_lost callback failed: #{e.class}: #{e.message}")
     end
 
     # Return the address list in the order they should be tried for this
@@ -864,7 +864,7 @@ module AsyncRabbitMQ
       sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_USER_TIMEOUT, millis)
     rescue StandardError => e
       # Unsupported on this platform or socket type; the heartbeat still covers us.
-      @logger.debug("Could not set TCP_USER_TIMEOUT: #{e.class}: #{e.message}")
+      @logger.debug(self, "Could not set TCP_USER_TIMEOUT: #{e.class}: #{e.message}")
     end
 
     def build_tls_context
@@ -907,7 +907,7 @@ module AsyncRabbitMQ
       # connection.tune (broker may send connection.secure challenges first)
       msg = wait_channel0_method(AMQ::Protocol::Connection::Tune, AMQ::Protocol::Connection::Secure)
       while msg.is_a?(AMQ::Protocol::Connection::Secure)
-        @logger.debug("Received connection.secure SASL challenge for #{sasl.mechanism_name}")
+        @logger.debug(self, "Received connection.secure SASL challenge for #{sasl.mechanism_name}")
         @frame_io.write_frame(AMQ::Protocol::Connection::SecureOk.encode(sasl.challenge_response(msg.challenge)).encode)
         msg = wait_channel0_method(AMQ::Protocol::Connection::Tune, AMQ::Protocol::Connection::Secure)
       end
@@ -1009,7 +1009,7 @@ module AsyncRabbitMQ
       unwritten = @frame_io&.pending_writes.to_i
       return unless unwritten.positive?
 
-      @logger.warn("Close discarded #{unwritten} queued write(s) (#{e.class})")
+      @logger.warn(self, "Close discarded #{unwritten} queued write(s) (#{e.class})")
     end
 
     def negotiate_heartbeat(broker_hb)
@@ -1116,7 +1116,7 @@ module AsyncRabbitMQ
 
         # Check retry limit (nil = unlimited)
         if @recovery_attempts && attempts > @recovery_attempts
-          @logger.warn("Recovery exhausted after #{@recovery_attempts} attempt(s)")
+          @logger.warn(self, "Recovery exhausted after #{@recovery_attempts} attempt(s)")
           @state = :closed
           @recovery_in_progress = false
           exhausted = ConnectionError.new(code: 0, text: "Recovery exhausted after #{@recovery_attempts} attempt(s)")
@@ -1140,7 +1140,7 @@ module AsyncRabbitMQ
 
         break if @closed_by_user
 
-        @logger.info("Recovery attempt #{attempts} (delay was #{delay.round(1)}s)...")
+        @logger.info(self, "Recovery attempt #{attempts} (delay was #{delay.round(1)}s)...")
         instrument("recovery.attempt") { { attempt: attempts, delay: wait_secs } }
         @on_recovery_attempt&.call(attempts)
 
@@ -1163,7 +1163,7 @@ module AsyncRabbitMQ
             # The credentials no longer work; retrying cannot help.
             @frame_io&.stop rescue nil
             @frame_io = nil
-            @logger.error("Recovery abandoned: #{e.message}")
+            @logger.error(self, "Recovery abandoned: #{e.message}")
             @state = :closed
             @recovery_in_progress = false
             @channels.values.each { |ch| ch.mark_closed!(e) rescue nil }
@@ -1173,7 +1173,7 @@ module AsyncRabbitMQ
             return
           rescue => e
             @frame_io&.stop rescue nil
-            @logger.debug("Recovery: #{target_host}:#{target_port} failed — #{e.class}: #{e.message}")
+            @logger.debug(self, "Recovery: #{target_host}:#{target_port} failed — #{e.class}: #{e.message}")
           end
         end
 
@@ -1191,7 +1191,7 @@ module AsyncRabbitMQ
           # that session.close can still cancel this task (and therefore interrupt
           # any wait_for calls inside reopen_after_recovery) if the user closes
           # the session while channels are being reopened.
-          @logger.info("Recovery successful after #{attempts} attempt(s)")
+          @logger.info(self, "Recovery successful after #{attempts} attempt(s)")
 
           # Re-open channels and re-register consumers. @recovery_in_progress
           # stays true across this: clearing it first leaves a window where a
@@ -1204,7 +1204,7 @@ module AsyncRabbitMQ
             # this half-built connection down first. Leaving it up reported the
             # session as open (so a Cluster would place new channels on a dead
             # node), held the socket, and leaked a channel-0 monitor per flap.
-            @logger.warn("Connection lost while reopening channels; retrying recovery")
+            @logger.warn(self, "Connection lost while reopening channels; retrying recovery")
             @state = :recovering
             @heartbeat_task&.cancel rescue nil
             @heartbeat_task = nil
@@ -1227,7 +1227,7 @@ module AsyncRabbitMQ
           @recovery_task = nil
           return
         else
-          @logger.warn("Recovery attempt #{attempts} failed: no reachable host")
+          @logger.warn(self, "Recovery attempt #{attempts} failed: no reachable host")
           delay = [delay * 2, @recovery_max_interval].min
           break if @closed_by_user
         end
@@ -1255,7 +1255,7 @@ module AsyncRabbitMQ
           return false if @recovery_interrupted
 
           # Fail the channel loudly rather than leave its parked callers hanging.
-          @logger.error("Channel #{channel.channel_id} could not be reopened after recovery: #{e.class}: #{e.message}")
+          @logger.error(self, "Channel #{channel.channel_id} could not be reopened after recovery: #{e.class}: #{e.message}")
           channel.mark_closed!(ChannelError.new("Channel could not be reopened after recovery: #{e.message}",
                                                 channel_id: channel.channel_id))
           channel_closed(channel.channel_id)
@@ -1314,7 +1314,7 @@ module AsyncRabbitMQ
           failure = { kind: kind, entity: describe_entity(kind, entity),
                       error: e.class.name, message: e.message,
                       replayed: index, skipped: skipped }
-          @logger.error("Topology replay stopped at #{kind} #{failure[:entity]} " \
+          @logger.error(self, "Topology replay stopped at #{kind} #{failure[:entity]} " \
                         "(#{e.class}: #{e.message}); #{index} replayed, #{skipped} skipped")
           instrument("recovery.topology_incomplete") { failure }
           return failure
@@ -1372,7 +1372,7 @@ module AsyncRabbitMQ
         # ignored; the handshake uses wait_channel0_method, not this loop.
       end
     rescue => e
-      @logger.debug("Channel-0 monitor exited: #{e.class}: #{e.message}")
+      @logger.debug(self, "Channel-0 monitor exited: #{e.class}: #{e.message}")
     end
   end
 end

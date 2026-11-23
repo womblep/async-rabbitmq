@@ -18,6 +18,7 @@ end
 
 require_relative "async_rabbitmq/version"
 require_relative "async_rabbitmq/log"
+require_relative "async_rabbitmq/logging"
 require_relative "async_rabbitmq/errors"
 require_relative "async_rabbitmq/tls"
 require_relative "async_rabbitmq/channel_id_allocator"

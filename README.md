@@ -97,7 +97,7 @@ AsyncRabbitMQ::Session.new(
   recover_topology: true, topology_recovery_filter: nil,
   instrumenter: nil,                        # ->(event_name, payload) { ... }
   notifier: nil,                            # or one Notifier shared between sessions
-  logger: AsyncRabbitMQ::Log.new            # anything with debug/info/warn/error
+  logger: Console                           # or Rails.logger, a Logger, or nil to discard
 )
 ```
 
@@ -135,20 +135,41 @@ this does not cover, pass `tls_context:` and it is used as given.
 
 ### Logging
 
-`logger:` takes anything that responds to `debug`, `info`, `warn` and `error`,
-so pass whatever your application already uses. The gem does not depend on the
-`logger` gem, which stopped being a default gem in Ruby 4.0.
+By default the client logs through [Console](https://github.com/socketry/console),
+like the rest of the async stack. Every message names the object that logged it
+(the `Session`, a `Channel`, the `FrameIO` connection layer, a `Cluster`), so
+Console's controls work per component:
+
+```bash
+CONSOLE_LEVEL=debug bundle exec ruby worker.rb      # everything, from everyone
+```
+
+```ruby
+Console.logger.filter(AsyncRabbitMQ::Channel, Console::Logger::DEBUG)  # just channels
+```
+
+Console's logger is per fiber, so a `Console.logger = ...` set before `connect`
+also reaches every background task the session starts (the reader, heartbeat,
+recovery loop and channel dispatchers).
+
+To send this client's messages somewhere else, pass `logger:`. It takes anything
+that responds to `debug`, `info`, `warn` and `error`, so use whatever your
+application already has. Unlike reassigning `Console.logger`, this applies to one
+session only, not to every Console user in the process. `nil` discards
+everything.
 
 ```ruby
 AsyncRabbitMQ::Session.new(logger: Rails.logger)
 AsyncRabbitMQ::Session.new(logger: Logger.new($stdout, level: Logger::INFO))
-AsyncRabbitMQ::Session.new(logger: AsyncRabbitMQ::Log.silent)          # say nothing
 AsyncRabbitMQ::Session.new(logger: AsyncRabbitMQ::Log.new($stdout, level: :debug))
+AsyncRabbitMQ::Session.new(logger: nil)                                # say nothing
 ```
 
-The default is `AsyncRabbitMQ::Log`, which writes warnings and errors, one line
-each, to `$stderr`. Structured events (see below) are the better hook for
-metrics and tracing; the log is for the things a human should read.
+`AsyncRabbitMQ::Log` is a minimal logger of that kind (warnings and errors, one
+line each, to `$stderr`), for when you want a plain destination without the
+`logger` gem, which stopped being a default gem in Ruby 4.0. Structured events
+(see below) are the better hook for metrics and tracing; the log is for the
+things a human should read.
 
 ## Channels
 

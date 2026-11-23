@@ -63,11 +63,16 @@ RSpec.describe "reliability gaps", :integration do
       AsyncRabbitMQ.warn_unbounded_consumers = previous
     end
 
-    # Collect what the channel logs as warnings.
+    # Collect what the channel logs as warnings, through a logger of its own.
+    # Never patch the logger the channel already holds: by default that is
+    # the Console module, shared by the whole process, and redefining its
+    # warn breaks every log call in every later example.
     def warnings_from(channel)
       [].tap do |collected|
-        logger = channel.instance_variable_get(:@logger)
-        logger.define_singleton_method(:warn) { |msg| collected << msg.to_s }
+        collector = Object.new
+        %i[debug info error].each { |level| collector.define_singleton_method(level) { |_msg| nil } }
+        collector.define_singleton_method(:warn) { |msg| collected << msg.to_s }
+        channel.instance_variable_set(:@logger, AsyncRabbitMQ::Logging.resolve(collector))
       end
     end
 

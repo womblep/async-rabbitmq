@@ -186,6 +186,25 @@ All notable changes to this project will be documented in this file.
   handshake cut short by cancellation (`close` stopping a recovery mid-handshake) would leak
   the TCP socket. Here any exit but success closes it. `TCP_USER_TIMEOUT` is still applied to
   the TCP socket underneath, TLS included. New runtime dependency: `io-endpoint ~> 0.19`.
+- The client logs through [Console](https://github.com/socketry/console) by default, like the
+  rest of the async stack, instead of `AsyncRabbitMQ::Log`. Every log call now names the object
+  that logged it - `@logger.warn(self, message)`, Console's own shape - so Console's controls
+  work per component: `CONSOLE_LEVEL=debug` for everything, or
+  `Console.logger.filter(AsyncRabbitMQ::Channel, Console::Logger::DEBUG)` for channels alone.
+  Console's logger is per fiber; one set with `Console.logger =` before `connect` reaches every
+  background task the session starts. **Visible change:** Console's default level is info
+  (the old default was warnings and errors), so messages such as "Recovery successful after N
+  attempt(s)" now appear; `CONSOLE_LEVEL=warn` restores the old volume.
+- `logger:` still takes anything with `debug`/`info`/`warn`/`error` - `Rails.logger`, a stdlib
+  `Logger`, `AsyncRabbitMQ::Log` - and still sends that session's messages there alone; such a
+  logger is wrapped in a small adapter that drops the subject. New: `logger: nil` discards
+  everything, and `logger: Console.logger` (or any `Console::Logger`) is used as given. A value
+  that is not a logger is refused with an `ArgumentError` saying what is accepted. `console` is
+  now a declared dependency; `async` already required it.
+- **`Cluster.new(logger: nil)` now means silent.** It used to fall back to the default logger,
+  which printed node failures such as refused credentials and unreachable nodes; it now
+  discards everything, the same as `nil` on a `Session`. An application that passed `nil` to
+  mean "default" should leave `logger:` out instead.
 - Sockets are opened with `TCP_NODELAY`, io-endpoint's default and the usual choice for messaging
   clients (the RabbitMQ Java client sets it too): an ack or a publisher confirm is a few bytes
   and should go out at once, not wait on Nagle's algorithm for a delayed ACK. Previously Nagle

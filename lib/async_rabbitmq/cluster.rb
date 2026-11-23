@@ -73,7 +73,9 @@ module AsyncRabbitMQ
 
       @on_node_down_policy    = on_node_down
       @clear_topology_on_drop = clear_topology_on_drop
-      @logger   = session_opts[:logger] || Log.new
+      # Resolved once; Sessions resolve it again, which is a no-op on an
+      # already-adapted logger. A key present with nil means discard.
+      @logger   = Logging.resolve(session_opts.fetch(:logger, Console))
       @notifier = session_opts[:notifier] || Notifier.new(logger: @logger)
       if (instrumenter = session_opts[:instrumenter])
         @notifier.subscribe { |name, payload| instrumenter.call(name, payload) }
@@ -374,7 +376,7 @@ module AsyncRabbitMQ
         end
         return if error.is_a?(AuthenticationError)
 
-        @logger.warn("Node #{session.host}:#{session.port} unreachable (#{error.class}: #{error.message}); " \
+        @logger.warn(self, "Node #{session.host}:#{session.port} unreachable (#{error.class}: #{error.message}); " \
                      "next attempt in #{delay.round(1)}s")
         wait_for(session, delay)
         delay = [delay * 2, @retry_max_interval].min
@@ -385,7 +387,7 @@ module AsyncRabbitMQ
       session.connect
       nil
     rescue AuthenticationError => e
-      @logger.error("Node #{session.host}:#{session.port} refused the credentials: #{e.message}")
+      @logger.error(self, "Node #{session.host}:#{session.port} refused the credentials: #{e.message}")
       e
     rescue Error, SystemCallError, IOError => e
       e
@@ -415,7 +417,7 @@ module AsyncRabbitMQ
         else @on_node_down_policy.call(session, channels, error)
         end
       rescue => e
-        @logger.error("on_node_down failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
+        @logger.error(self, "on_node_down failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
       end
       # Each callback is isolated: a raising on_connection_lost must not skip
       # notify_node_down, which under :drop is the only chance to see the
@@ -423,12 +425,12 @@ module AsyncRabbitMQ
       begin
         @on_connection_lost&.call(session, error)
       rescue => e
-        @logger.error("on_connection_lost failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
+        @logger.error(self, "on_connection_lost failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
       end
       begin
         notify_node_down(session, channels, error, unconfirmed)
       rescue => e
-        @logger.error("on_node_down callback failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
+        @logger.error(self, "on_node_down callback failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
       end
     end
 
@@ -451,14 +453,14 @@ module AsyncRabbitMQ
       # bindings stay recorded: if this node comes back from an empty data
       # directory they still need re-declaring.
       session.topology.clear_transient if @clear_topology_on_drop
-      @logger.info("Dropped #{channels.size} channel(s) on #{session.host}:#{session.port}")
+      @logger.info(self, "Dropped #{channels.size} channel(s) on #{session.host}:#{session.port}")
     end
 
     def node_up(session)
-      @logger.info("Node #{session.host}:#{session.port} connected")
+      @logger.info(self, "Node #{session.host}:#{session.port} connected")
       @on_node_up&.call(session)
     rescue => e
-      @logger.error("on_node_up failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
+      @logger.error(self, "on_node_up failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
     end
   end
 end
