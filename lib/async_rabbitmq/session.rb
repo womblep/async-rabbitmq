@@ -236,6 +236,16 @@ module AsyncRabbitMQ
     # Raises NotOpenError if already connected.
     def connect
       raise NotOpenError, "Session is already connected" if open?
+      # :recovering (and a concurrent connect) must be refused too, not just
+      # :open. A connect racing the recovery loop would fight it for @frame_io
+      # and the background tasks — and when that connect failed (the broker
+      # being down is why recovery is running), cleanup_after_failed_connect
+      # would cancel the recovery task and mark the session closed, stranding
+      # every :recovering channel's parked fibers with nothing left that could
+      # ever release them. Close the session first to connect it afresh.
+      if @connecting || @recovery_in_progress || !closed?
+        raise NotOpenError, "Session is #{@connecting ? 'connecting' : 'recovering'}; close it first to force a fresh connection"
+      end
       @connecting        = true
       @closed_by_user    = false   # a previous failed connect must not disable recovery
       @session_root_task = Async::Task.current
