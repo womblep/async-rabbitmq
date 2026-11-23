@@ -317,6 +317,71 @@ RSpec.describe AsyncRabbitMQ::Cluster, :integration do
     end
   end
 
+  it "hands the lost node's unconfirmed messages to a four-argument on_node_down" do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+    with_cluster(on_node_down: :drop) do |cluster, _|
+      # Three channels spread one per node; take the one on the proxied node.
+      channels = 3.times.map { cluster.open_channel }
+      node     = proxied(cluster)
+      ch       = node.channels.first
+      expect(ch).not_to be_nil
+
+      q = ch.queue("test.unconfirmed.handoff", durable: true)
+      ch.confirm_select
+
+      # Swallow broker acks on this channel so the publishes stay genuinely
+      # unconfirmed when the node goes down — the state :drop's fourth
+      # argument exists to rescue.
+      original = ch.method(:handle_method)
+      ch.define_singleton_method(:handle_method) do |method|
+        next nil if method.is_a?(AMQ::Protocol::Basic::Ack)
+        original.call(method)
+      end
+
+      3.times { |i| ch.basic_publish("rescue-me-#{i}", routing_key: q.name, headers: { "n" => i }) }
+      wait_until("the publishes to be outstanding") { ch.unconfirmed_messages.size == 3 }
+
+      handed = nil
+      cluster.on_node_down { |_session, _channels, _error, unconfirmed| handed = unconfirmed }
+
+      toxiproxy_rabbitmq.down do
+        wait_until("the four-argument callback") { handed }
+      end
+
+      # The records carry everything needed to republish on another node.
+      expect(handed.size).to eq(3)
+      expect(handed.map(&:payload)).to match_array(%w[rescue-me-0 rescue-me-1 rescue-me-2])
+      expect(handed.map(&:routing_key).uniq).to eq([q.name])
+      expect(handed.map { |m| m.options[:headers]["n"] }).to match_array([0, 1, 2])
+
+      survivor = direct(cluster).first.channels.first || cluster.open_channel
+      handed.each { |m| survivor.basic_publish(m.payload, routing_key: m.routing_key, **m.options) }
+      wait_until("the node to recover") { node.open? }
+      # At-least-once is the contract: an unconfirmed message may or may not
+      # have reached the broker before the node went (locally the acks were
+      # withheld, but each publish also races the outage through the proxy),
+      # so after republishing the handed records every payload is present at
+      # least once and at most twice. Asserting an exact count over-pins that
+      # race — it flaked on CI, where the originals sometimes die in transit.
+      wait_until("the republished messages to land") { ready_count_on(cluster, q.name) >= 3 }
+      drained = []
+      cluster.with_channel do |c|
+        while (got = c.basic_get(q.name, manual_ack: false))
+          _di, _h, body = got
+          break if body.nil?
+          drained << body
+        end
+      end
+      expect(drained.uniq).to match_array(%w[rescue-me-0 rescue-me-1 rescue-me-2])
+      expect(drained.size).to be_between(3, 6)
+      channels # keep the reference alive
+    end
+  end
+
+  def ready_count_on(cluster, name)
+    cluster.with_channel { |c| c.queue(name, passive: true).message_count }
+  end
+
   it "still runs on_node_down when on_connection_lost raises" do
     skip "Toxiproxy not available" unless toxiproxy_available?
     with_cluster(on_node_down: :drop) do |cluster, _|
@@ -331,6 +396,115 @@ RSpec.describe AsyncRabbitMQ::Cluster, :integration do
       toxiproxy_rabbitmq.down do
         wait_until("on_node_down to run despite the raising callback") { downs == [node] }
       end
+      wait_until("the node to recover") { node.open? }
+    end
+  end
+
+  it "contains a raising on_node_down policy: the node still recovers and the callback still fires" do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+    policy = ->(_session, _channels, _error) { raise "buggy user policy" }
+    with_cluster(on_node_down: policy) do |cluster, _|
+      node = proxied(cluster)
+      ch   = node.open_channel
+      q    = ch.queue("test.buggy.policy", durable: true)
+      received = []
+      ch.basic_consume(q.name, manual_ack: false) { |_di, _h, body| received << body }
+
+      downs = []
+      cluster.on_node_down { |session, _channels, _error| downs << session }
+
+      toxiproxy_rabbitmq.down do
+        wait_until("on_node_down despite the raising policy") { downs == [node] }
+      end
+
+      # The policy raised and did nothing with the channels, so they behave as
+      # :park — and the exception must not wedge the node's recovery.
+      wait_until("the node to recover") { node.open? && ch.open? }
+      ch.basic_publish("after the buggy policy", routing_key: q.name)
+      wait_until("the parked channel to work again") { received.include?("after the buggy policy") }
+    end
+  end
+
+  it "is neither open nor closed when every node is down, and refuses new channels until one returns" do
+    with_cluster do |cluster, _|
+      cluster.open_channel # prove it works first
+      expect(cluster.open?).to be true
+
+      # Sever every node at once — a whole-cluster partition or a rolling
+      # restart gone wrong. They all enter recovery together.
+      cluster.sessions.each { |s| sever_connection!(s) }
+      wait_until("all nodes to drop") { cluster.sessions.none?(&:open?) }
+
+      # Like a recovering Session: neither open (no node serving) nor closed
+      # (not shut down), and open_channel must raise rather than crash on the
+      # empty set.
+      expect(cluster.open?).to be false
+      expect(cluster.closed?).to be false
+      expect { cluster.open_channel }.to raise_error(AsyncRabbitMQ::NotOpenError)
+
+      # The direct nodes reconnect on their own (the broker is up); once any
+      # node is back the cluster serves channels again.
+      wait_until("at least one node to return", timeout: 15) { cluster.sessions.any?(&:open?) }
+      expect(cluster.open?).to be true
+      expect { cluster.open_channel }.not_to raise_error
+    end
+  end
+
+  it "recovers a node through two outage cycles in a row" do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+    with_cluster do |cluster, _|
+      node = proxied(cluster)
+      ch   = node.open_channel
+      q    = ch.queue("test.node.flap", durable: true)
+      received = []
+      ch.basic_consume(q.name, manual_ack: false) { |_di, _h, body| received << body }
+
+      2.times do |cycle|
+        ups = []
+        cluster.on_node_up { |s| ups << s }
+        toxiproxy_rabbitmq.down do
+          wait_until("cycle #{cycle}: node down") { !node.open? }
+        end
+        wait_until("cycle #{cycle}: node up") { node.open? && ups.include?(node) }
+
+        ch.basic_publish("cycle-#{cycle}", routing_key: q.name)
+        wait_until("cycle #{cycle}: delivery") { received.include?("cycle-#{cycle}") }
+      end
+
+      expect(received).to match_array(%w[cycle-0 cycle-1])
+      expect(ch.instance_variable_get(:@consumers).size).to eq(1)
+    end
+  end
+
+  it "under :drop keeps durable topology recorded while forgetting transient, on a node with both" do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+    with_cluster(on_node_down: :drop) do |cluster, _|
+      # Pin a channel to the proxied node (open channels until one lands there;
+      # placement is least-loaded, so a few tries settle it) and declare a
+      # durable queue plus a transient (exclusive, server-named) one on it.
+      node = proxied(cluster)
+      ch = nil
+      10.times do
+        c = cluster.open_channel
+        if node.channels.include?(c)
+          ch = c
+          break
+        end
+      end
+      raise "could not place a channel on the proxied node" unless ch
+      durable = ch.queue("test.mixed.durable", durable: true)
+      transient = ch.temporary_queue # exclusive + server-named
+
+      wait_until("both queues recorded") { node.topology.queues.map(&:name).sort == [durable.name, transient.name].sort }
+
+      toxiproxy_rabbitmq.down do
+        wait_until("the node to drop its channels") { node.topology.queues.map(&:name) == [durable.name] }
+      end
+
+      # clear_transient keeps the durable queue recorded (so a node returning
+      # from an empty data dir has it re-declared) and forgets the transient
+      # one (it belonged to the lost connection and must not be resurrected).
+      expect(node.topology.queues.map(&:name)).to eq([durable.name])
       wait_until("the node to recover") { node.open? }
     end
   end

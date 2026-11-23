@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Tests
+
+- Recovery coverage broadened beyond the clean-FIN disconnect the suite had tested almost
+  exclusively. New toxiproxy helpers (`blackhole` for a silent half-open connection via the
+  timeout toxic, `force_close_connection!` via the management API) and coverage for: the
+  heartbeat watchdog detecting a black-holed peer with no FIN/RST (the 15-minute-hang case the
+  watchdog exists for, previously never the detector in any test); broker-initiated
+  `connection.close` from an operator force-close and from a vhost deleted under a live session
+  (handshake refused on every retry); recovery over TLS (the `rabbitmq_tls` toxiproxy proxy was
+  provisioned but unused); exchange-to-exchange binding recovery; transactional-mode re-selection
+  across a drop; the cluster `:drop` policy handing a lost node's unconfirmed messages to a
+  four-argument `on_node_down`; four flaps in a row leaving exactly one consumer and no
+  duplicates; a publisher parked on the `connection.blocked` gate when the broker dies; a broker
+  that accepts TCP but never answers; `close` racing an outage; reconnecting a session after
+  recovery exhausts its attempts; credentials revoked during an outage abandoning recovery with
+  `reason: :authentication_failed`; and `recovery.succeeded` carrying `topology_complete: true`.
+- Degraded-transport coverage: a multi-frame message delivered in tiny TCP fragments (slicer
+  toxic) reassembles intact, and a connection cut mid-body (limit_data toxic) never hands a
+  truncated body to a handler and is redelivered whole after recovery. The incomplete-replay
+  reporting path is now also covered end to end — real drop, reopen and replay loop, with one
+  declare timing out — asserting `recovery.topology_incomplete` and `topology_complete: false`.
+- Cluster recovery edges: all nodes down at once leaving the cluster neither open nor closed and
+  `open_channel` raising until one returns; a node recovered through two outage cycles in a row;
+  `:drop` keeping a node's durable topology recorded while forgetting its transient queues; and a
+  raising `on_node_down` policy contained so the node still recovers and the callback still fires.
+- RST-vs-FIN coverage (new `69_rst_and_teardown`, `reset_peer` / `slow_close` toxics): a peer
+  RESET mid-session recovered and detected as a transport error rather than by the watchdog, a
+  RESET during the handshake failing the connect promptly, and `close` staying bounded against a
+  peer lingering in half-close.
+- Multi-channel recovery: three channels with distinct state (confirm-tracking + prefetch, tx,
+  plain) restored in one pass with no cross-talk.
+- A pending test documents a known bug: `republish_unconfirmed` re-sends the pre-encoded frames,
+  so a publish left unconfirmed when the connection dropped is replayed to a server-named queue's
+  OLD name after recovery renames it — unroutable, silently lost under confirms. Fix pending.
+
 ### Fixed
 
 - A topology replay that stops early is reported instead of being mistaken for success. A hard

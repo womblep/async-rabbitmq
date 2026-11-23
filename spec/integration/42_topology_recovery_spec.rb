@@ -125,4 +125,121 @@ RSpec.describe "topology recovery", :integration do
       ch2.close
     end
   end
+
+  it "recovers an exchange-to-exchange binding, in dependency order" do
+    isolated_session do |session, _|
+      ch  = session.open_channel
+      tag = SecureRandom.hex(4)
+      src  = ch.topic("test.e2e.src.#{tag}", durable: true)
+      dest = ch.fanout("test.e2e.dest.#{tag}", durable: true)
+      ch.exchange_bind(destination: dest.name, source: src.name, routing_key: "audit.#")
+      q = ch.queue("test.e2e.q.#{tag}", durable: true)
+      q.bind(exchange: dest.name)
+
+      # Wipe the broker-side graph so only the client's replay can rebuild it.
+      # Through the management API, not the client: a client-side delete would
+      # (correctly) cascade through the topology registry and forget the
+      # binding, leaving nothing to replay. The broker losing state behind the
+      # client's back is the case recovery exists for.
+      session.with_channel { |_c| nil } # ensure declarations have settled
+      http_delete("/api/exchanges/#{URI.encode_uri_component(session.vhost)}/#{URI.encode_uri_component(dest.name)}")
+
+      recover!(session, ch)
+
+      # The full route must be back: src -> (e2e binding) -> dest -> q. If the
+      # exchange binding were replayed before both exchanges exist, or not at
+      # all, this publish is silently unroutable.
+      ch.basic_publish("routed through two exchanges", exchange: src.name, routing_key: "audit.login")
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+      body = nil
+      while body.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        _di, _h, body = ch.basic_get(q.name, manual_ack: false)
+        sleep 0.1 if body.nil?
+      end
+      expect(body).to eq("routed through two exchanges")
+    end
+  end
+
+  it "republishes an unconfirmed publish to a renamed server-named queue under its NEW name" do
+    # KNOWN BUG (pending until fixed): republish_unconfirmed re-sends the
+    # pre-encoded frames, which carry the OLD routing key in the Basic::Publish
+    # method frame. queue_renamed updates the topology and consumer names but
+    # not @pending_confirms, so after a server-named queue is renamed on
+    # recovery the replayed publish goes to the old name via the default
+    # exchange, is unroutable, and is silently lost despite confirms. The fix
+    # is to rewrite the affected pending entries (re-encode from the kept
+    # PublishContext) when queue_renamed fires. When that lands, this test
+    # passes and RSpec flags the stale `pending`.
+    pending "republish does not follow a server-named queue rename (silent loss under confirms)"
+    isolated_session do |session, _|
+      ch = session.open_channel
+      q  = ch.temporary_queue # server-named: recovery re-declares it under a new name
+      ch.confirm_select
+
+      # Keep the publish unconfirmed across the drop by withholding its ack.
+      original = ch.method(:handle_method)
+      ch.define_singleton_method(:handle_method) do |method|
+        next nil if method.is_a?(AMQ::Protocol::Basic::Ack)
+        original.call(method)
+      end
+
+      ch.basic_publish("follow the rename", routing_key: q.name)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      sleep 0.05 while ch.unconfirmed_messages.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      expect(ch.unconfirmed_messages.size).to eq(1)
+
+      old_name = q.name
+      recover_connection!(session)
+      expect(q.name).not_to eq(old_name) # the broker handed out a new name
+
+      # The replayed publish was addressed to the OLD name via the default
+      # exchange. If the replay does not follow the rename, it is silently
+      # unroutable and the message is lost despite confirms.
+      body = nil
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+      while body.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        _di, _h, body = ch.basic_get(q.name, manual_ack: false)
+        sleep 0.1 if body.nil?
+      end
+      expect(body).to eq("follow the rename")
+    end
+  end
+
+  it "reports an incomplete topology replay end to end when a declare times out during recovery" do
+    isolated_session do |session, _|
+      ch  = session.open_channel
+      tag = SecureRandom.hex(4)
+      ch.queue("test.incomplete.a.#{tag}", durable: true)
+      doomed = ch.queue("test.incomplete.b.#{tag}", durable: true)
+      ch.queue("test.incomplete.c.#{tag}", durable: true)
+
+      incomplete = nil
+      succeeded  = nil
+      session.on_event("recovery.topology_incomplete") { |_n, p| incomplete ||= p }
+      session.on_event("recovery.succeeded")           { |_n, p| succeeded ||= p }
+
+      # Everything is real — the drop, the channel reopen, the replay loop, the
+      # event plumbing — except that one queue's re-declare stands in for a
+      # broker that went slow: it raises the RpcTimeoutError such a declare
+      # would. That is the one thing toxiproxy cannot target precisely (a
+      # blanket latency toxic fails channel.open first), so it is synthesised
+      # here while the rest of the path stays end to end.
+      original = ch.method(:recover_queue)
+      ch.define_singleton_method(:recover_queue) do |q|
+        raise AsyncRabbitMQ::RpcTimeoutError, "synthetic slow declare" if q.name == doomed.name
+        original.call(q)
+      end
+
+      recover_connection!(session)
+
+      expect(incomplete).not_to be_nil
+      expect(incomplete[:kind]).to eq(:queue)
+      expect(incomplete[:entity]).to eq(doomed.name)
+      expect(incomplete[:error]).to eq("AsyncRabbitMQ::RpcTimeoutError")
+      # recovery still SUCCEEDS (the channels are back), but says so honestly.
+      expect(succeeded).not_to be_nil
+      expect(succeeded[:topology_complete]).to be(false)
+      expect(session.open?).to be true
+    end
+  end
 end
