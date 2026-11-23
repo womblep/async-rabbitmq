@@ -84,6 +84,13 @@ module AsyncRabbitMQ
       # Publishers parked on the connection.blocked gate can never proceed now.
       @blocked = false
       release_blocked_writers(ConnectionError.new(code: 0, text: "Connection closed while blocked by the broker"))
+      # Close the write queue. A publisher parked on a full queue is woken only
+      # by a pop, a close, or nothing at all: the writer that pops is about to
+      # be cancelled, so without this the publisher stays parked forever — and
+      # it is holding its channel's publish semaphore, which bricks the channel
+      # for every publish after recovery. Closing wakes it; write_frame turns
+      # the ClosedError into the no-op these writes already were (see there).
+      @write_queue.close rescue nil
       # Push nil sentinel to every channel queue FIRST so blocked poppers
       # (e.g. wait_channel0_method) are unblocked before we cancel tasks.
       # Cancelling the CURRENT task raises Async::Cancel (< Exception, not
@@ -109,6 +116,16 @@ module AsyncRabbitMQ
         end
       end
       @write_queue.push(data)
+    rescue Async::Queue::ClosedError
+      # The connection was stopped while this write was parked on (or racing)
+      # the queue. Writing to a stopped connection has always been a silent
+      # no-op — the bytes were enqueued to a queue nobody would ever drain —
+      # so a write that loses that race stays one: a publish under confirms is
+      # already recorded for replay on the recovered channel, and a publish
+      # without confirms is fire-and-forget by contract. The point of the
+      # close is to get here at all instead of parking forever.
+      @logger.debug("FrameIO: write after stop discarded (#{data.bytesize} bytes)")
+      nil
     end
 
     # Called by the Session channel-0 monitor when connection.blocked is received.
@@ -159,6 +176,7 @@ module AsyncRabbitMQ
     def writer_loop
       while @running
         data = @write_queue.pop
+        break if data.nil? # queue closed by #stop
         @socket_sem.acquire { @socket.write(data) }
       end
     rescue IOError, Errno::EPIPE, Errno::EBADF, Errno::ECONNRESET
