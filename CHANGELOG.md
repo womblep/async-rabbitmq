@@ -35,12 +35,21 @@ All notable changes to this project will be documented in this file.
   peer lingering in half-close.
 - Multi-channel recovery: three channels with distinct state (confirm-tracking + prefetch, tx,
   plain) restored in one pass with no cross-talk.
-- A pending test documents a known bug: `republish_unconfirmed` re-sends the pre-encoded frames,
-  so a publish left unconfirmed when the connection dropped is replayed to a server-named queue's
-  OLD name after recovery renames it — unroutable, silently lost under confirms. Fix pending.
+- The server-named-rename replay test (added pending in this cycle when it exposed the bug) now
+  runs active against the fix below.
 
 ### Fixed
 
+- An unconfirmed publish follows a server-named queue's rename into the replay. Recovery
+  re-declares a server-named queue under a new broker-generated name and renamed the registry,
+  the bindings and the consumers - but not the pending confirms, whose kept pre-encoded frames
+  carry the routing key inside the Basic::Publish method frame. A publish left unconfirmed at
+  the drop was therefore replayed to the OLD name through the default exchange: unroutable,
+  silently dropped, the exact loss confirms exist to prevent - and the RPC-reply pattern
+  (publish to your own server-named queue) hits it on every recovery that renames. The affected
+  entries are now re-encoded under the new name, from the payload and context each entry already
+  keeps, before the replay runs. Routing keys on named exchanges are left alone: there the key
+  is the caller's semantics, and the renamed binding already carries it to the right queue.
 - A topology replay that stops early is reported instead of being mistaken for success. A hard
   failure mid-replay - an RPC timeout from a broker that stopped answering, where each remaining
   entity would cost its own full timeout - still stops the replay, but now emits a

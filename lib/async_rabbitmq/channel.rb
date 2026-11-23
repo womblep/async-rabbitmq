@@ -938,6 +938,27 @@ module AsyncRabbitMQ
       @consumers.each_value { |c| c[:queue_name] = new_name if c[:queue_name] == old_name }
     end
 
+    # Internal: a server-named queue came back under a new name — rewrite the
+    # unconfirmed publishes addressed to it through the default exchange, whose
+    # routing key IS the queue name. The pending entries keep the pre-encoded
+    # frames for replay, and those carry the old name inside the Basic::Publish
+    # method frame: replaying them unchanged sends to a queue that no longer
+    # exists, unroutable and silently dropped — the loss confirms exist to
+    # prevent. Only the default exchange is rewritten: on a named exchange the
+    # routing key is the caller's semantics, and the binding that carries it to
+    # the queue has already been renamed and re-declared by topology recovery.
+    def rename_unconfirmed_queue(old_name, new_name)
+      @pending_confirms.each_value do |entry|
+        ctx = entry[2]
+        next unless ctx && ctx.exchange.to_s.empty? && ctx.routing_key == old_name
+
+        entry[0] = encode_publish(entry[1], exchange: ctx.exchange, routing_key: new_name, **ctx.options)
+        # Contexts are frozen and a batch shares one across its entries, so
+        # replace rather than mutate. publish_context re-copies the options.
+        entry[2] = publish_context(ctx.exchange, new_name, ctx.options)
+      end
+    end
+
     # The consumers on this channel no longer exist on the broker (the channel
     # is closed, by us or by it). @consumers itself is kept so that
     # reopen(recover_consumers: true) can register them again, which records

@@ -161,16 +161,11 @@ RSpec.describe "topology recovery", :integration do
   end
 
   it "republishes an unconfirmed publish to a renamed server-named queue under its NEW name" do
-    # KNOWN BUG (pending until fixed): republish_unconfirmed re-sends the
-    # pre-encoded frames, which carry the OLD routing key in the Basic::Publish
-    # method frame. queue_renamed updates the topology and consumer names but
-    # not @pending_confirms, so after a server-named queue is renamed on
-    # recovery the replayed publish goes to the old name via the default
-    # exchange, is unroutable, and is silently lost despite confirms. The fix
-    # is to rewrite the affected pending entries (re-encode from the kept
-    # PublishContext) when queue_renamed fires. When that lands, this test
-    # passes and RSpec flags the stale `pending`.
-    pending "republish does not follow a server-named queue rename (silent loss under confirms)"
+    # The pending entries keep pre-encoded frames with the routing key baked
+    # in; queue_renamed rewrites the ones addressed to the renamed queue via
+    # the default exchange before finish_recovery! replays them. Without that
+    # the replay went to the old name — unroutable, silently lost under
+    # confirms, in exactly the RPC-reply pattern server-named queues serve.
     isolated_session do |session, _|
       ch = session.open_channel
       q  = ch.temporary_queue # server-named: recovery re-declares it under a new name

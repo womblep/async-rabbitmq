@@ -590,7 +590,13 @@ module AsyncRabbitMQ
     def queue_renamed(old_name, new_name)
       @logger.info("Server-named queue #{old_name} recovered as #{new_name}")
       @topology.rename_queue(old_name, new_name)
-      @channels.values.each { |ch| ch.rename_consumer_queue(old_name, new_name) }
+      @channels.values.each do |ch|
+        ch.rename_consumer_queue(old_name, new_name)
+        # Before finish_recovery! replays them: an unconfirmed publish to this
+        # queue via the default exchange has the old name encoded in its kept
+        # frames, and replaying that is silently unroutable.
+        ch.rename_unconfirmed_queue(old_name, new_name)
+      end
     end
 
     # --- Async::Pool resource interface ---
