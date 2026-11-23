@@ -6,6 +6,33 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A topology replay that stops early is reported instead of being mistaken for success. A hard
+  failure mid-replay - an RPC timeout from a broker that stopped answering, where each remaining
+  entity would cost its own full timeout - still stops the replay, but now emits a
+  `recovery.topology_incomplete` event naming the failed entity and how many were skipped, and
+  `recovery.succeeded` carries `topology_complete: false`. Previously the abort was one log line
+  and recovery looked fully successful with an arbitrary suffix of the topology missing.
+- IPv6 works through `Session.from_uri`, `Cluster.from_uri` and `addresses:`. These flattened
+  every node to a `"host:port"` string and split it back on the first colon, which mangled an
+  IPv6 literal into nonsense (`"[::1]:5672"` became host `"["`, port 0). URI lists now carry
+  `[host, port]` pairs end-to-end, and `addresses:` accepts bracketed literals (`"[::1]:5672"`),
+  bare literals (`"::1"`, host only) and `[host, port]` pairs alongside the usual strings.
+  `host:` and `hosts:` already worked.
+- Concurrent `update_secret` calls no longer clobber each other's reply. Each call destroyed the
+  other's registration, both replies were dropped, both calls timed out - and `@password` was
+  never updated although the broker had accepted the new secret, so the next reconnect
+  authenticated with the stale one and recovery was abandoned for good. Calls are serialised
+  now. On a timeout the new secret is also kept for reconnects, with a warning: the reply, not
+  the request, may be what got lost, and with OAuth rotation the old token is the one about to
+  expire.
+- `close` no longer strands a channel when the Close RPC itself fails. A close-ok that never
+  arrived left close raising out of a channel its own RPC-timeout resync had just reopened - the
+  user got an exception and a live channel they believed closed. close now retries once on the
+  resynced channel, and raises only if the broker will not answer that either (the channel is
+  then alive and usable, and its id is not recycled under a broker that still considers it
+  open). A connection lost mid-close drops the channel so recovery cannot resurrect something
+  the user asked to be rid of.
+
 - A connection lost while a channel is resynchronising after an RPC timeout no longer kills the
   channel for good. The resync was parked waiting for a channel.close-ok that the dropped
   connection would never deliver; it waited out its whole timeout, then reopened against a

@@ -94,4 +94,45 @@ RSpec.describe "Session.from_uri parsing" do
     expect(s.addresses).to eq([["r1", 5672], ["r2", 5673]])
     expect(s.username).to eq("u")
   end
+
+  it "parses a bracketed IPv6 literal host" do
+    # The host:port string round-trip used to mangle this into host "[" port 0.
+    s = session_for("amqp://[::1]:5673/vh")
+    expect(s.host).to eq("::1")
+    expect(s.port).to eq(5673)
+    expect(s.addresses).to eq([["::1", 5673]])
+  end
+
+  it "mixes IPv6 and hostname URIs in one failover list" do
+    s = AsyncRabbitMQ::Session.from_uri("amqp://[2001:db8::7]:5672/vh", "amqp://r2:5673/vh")
+    expect(s.addresses).to eq([["2001:db8::7", 5672], ["r2", 5673]])
+  end
+end
+
+# Session.address_list — the canonical [host, port] list behind addresses:,
+# hosts: and host:. Also what Cluster builds its nodes from. No broker needed.
+RSpec.describe "Session.address_list" do
+  def list(**kwargs)
+    AsyncRabbitMQ::Session.address_list(host: "fallback", port: 5672, **kwargs)
+  end
+
+  it "splits host:port strings and defaults the port" do
+    expect(list(addresses: ["a:5673", "b"])).to eq([["a", 5673], ["b", 5672]])
+  end
+
+  it "passes [host, port] pairs through, defaulting a missing port" do
+    expect(list(addresses: [["a", 5673], ["b"]])).to eq([["a", 5673], ["b", 5672]])
+  end
+
+  it "strips URI brackets in the pair form too" do
+    expect(list(addresses: [["[::1]", 5673]])).to eq([["::1", 5673]])
+  end
+
+  it "parses bracketed IPv6 literals, with and without a port" do
+    expect(list(addresses: ["[::1]:5673", "[2001:db8::7]"])).to eq([["::1", 5673], ["2001:db8::7", 5672]])
+  end
+
+  it "treats a bare IPv6 literal as host-only rather than splitting its colons" do
+    expect(list(addresses: ["::1", "2001:db8::7"])).to eq([["::1", 5672], ["2001:db8::7", 5672]])
+  end
 end
