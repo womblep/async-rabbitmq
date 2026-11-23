@@ -95,6 +95,7 @@ module AsyncRabbitMQ
       @closed      = true
       @supervisors = {}   # session => the task connecting it, until it is up
       @wakeups     = {}   # session => Async::Condition, to cut a retry sleep short on close
+      @connect_condition = nil   # set while #connect waits for first reports
       @on_node_down = @on_node_up = @on_connection_lost = nil
       @on_blocked = @on_unblocked = @on_recovery_attempt = @on_recovery = @on_recovery_exhausted = nil
     end
@@ -122,7 +123,11 @@ module AsyncRabbitMQ
       @closed  = false
       pending  = @sessions.size
       errors   = {}
-      reported = Async::Condition.new
+      # Held in an ivar, not just a local, so #close can wake this connect from
+      # another fiber. Without that, close stops the supervisors before they
+      # report their first attempt, pending never reaches zero, and the fiber
+      # here parks on reported.wait for the life of the reactor.
+      reported = @connect_condition = Async::Condition.new
       # Parent the per-node supervisors at the reactor, not at whichever task
       # called connect. A caller that finishes, or is stopped, would otherwise
       # take every node's supervisor down with it — and with them the retry
@@ -139,14 +144,23 @@ module AsyncRabbitMQ
         end
       end
 
-      loop do
-        if (refused = errors.values.find { |e| e.is_a?(AuthenticationError) })
-          close
-          raise refused
+      begin
+        loop do
+          if (refused = errors.values.find { |e| e.is_a?(AuthenticationError) })
+            close
+            raise refused
+          end
+          break if pending.zero?
+          # A concurrent close stops the supervisors and signals this; bail out
+          # rather than wait for reports that are no longer coming.
+          break if @closed
+          reported.wait
+          break if @closed
         end
-        break if pending.zero?
-        reported.wait
+      ensure
+        @connect_condition = nil
       end
+      raise NotOpenError, "Cluster was closed during connect" if @closed
       return if open?
 
       close
@@ -168,6 +182,8 @@ module AsyncRabbitMQ
     def close
       return if @closed
       @closed = true
+      # Wake a connect parked waiting for first reports; it re-checks @closed.
+      @connect_condition&.signal rescue nil
       @sessions.each { |s| s.close rescue nil }
       @wakeups.values.each { |c| c.signal rescue nil }
       # The supervisors are parented at the reactor, so dropping the references
@@ -397,8 +413,19 @@ module AsyncRabbitMQ
       rescue => e
         @logger.error("on_node_down failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
       end
-      @on_connection_lost&.call(session, error)
-      notify_node_down(session, channels, error, unconfirmed)
+      # Each callback is isolated: a raising on_connection_lost must not skip
+      # notify_node_down, which under :drop is the only chance to see the
+      # messages the lost node never confirmed (they are gone after drop_channels).
+      begin
+        @on_connection_lost&.call(session, error)
+      rescue => e
+        @logger.error("on_connection_lost failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
+      end
+      begin
+        notify_node_down(session, channels, error, unconfirmed)
+      rescue => e
+        @logger.error("on_node_down callback failed for #{session.host}:#{session.port}: #{e.class}: #{e.message}")
+      end
     end
 
     # on_node_down took three arguments before unconfirmed messages were passed

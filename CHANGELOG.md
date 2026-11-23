@@ -6,6 +6,38 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- A connection lost while a channel is resynchronising after an RPC timeout no longer kills the
+  channel for good. The resync was parked waiting for a channel.close-ok that the dropped
+  connection would never deliver; it waited out its whole timeout, then reopened against a
+  session that was no longer open, which raised, dropped the channel from the session and
+  stranded its consumers - with `@consumers` already cleared, recovery had nothing left to
+  restore. The resync is now woken by the connection loss, sees the channel is recovering and
+  hands the reopen to the recovery loop, which brings the channel and its consumers back. This
+  also closes the related hang where a recovery that won the race had its channel.open-ok
+  discarded by the resync's own frame filter.
+- `close` on a channel that is mid-resync waits for the resync to settle and then closes the
+  live channel, instead of falling through and returning as though it had closed one that was in
+  fact still open and consuming.
+- An RPC timeout no longer leaks the old dispatch fiber. The resync swapped the channel's frame
+  queue without stopping the dispatch loop bound to the old one, which then parked on an orphaned
+  queue for the life of the reactor - one leaked fiber per RPC-timeout resync in a long-lived
+  process. The reopen path now stops the old loop first, as every other teardown already did.
+- One consumer whose queue is gone no longer takes every other consumer on the channel down with
+  it during recovery. Re-subscribing a consumer to a deleted queue draws a 404 that closes the
+  whole channel, cancelling the consumers already restored on it; the old code then failed the
+  rest with `NotOpenError` and left the channel closed and dropped from the session, while
+  recovery still reported success. Re-registration now works in passes: the rejected consumer is
+  dropped (with a `consumer.recovery_failed` event), the channel reopened, and the survivors
+  re-subscribed. Only a broker rejection of a specific consumer drops it — a connection lost
+  again mid-re-registration leaves every consumer in place for the next recovery cycle to
+  restore, rather than mistaking the outage for a dead queue and forgetting them.
+- `Cluster#close` called from another fiber while `connect` is still waiting for its nodes no
+  longer hangs that connect forever. The connect waited on a condition only the node supervisors
+  signalled, and close stopped the supervisors before they reported; it now wakes the connect,
+  which returns with a `NotOpenError`.
+- A `Cluster` `on_connection_lost` callback that raises no longer suppresses `on_node_down` -
+  which, under the `:drop` policy, is the only chance to see the messages the lost node never
+  confirmed. Each callback is now isolated.
 - A publisher parked on a full write queue is released when the connection stops. It was woken
   only by the writer draining the queue, and the writer had just been cancelled - so it stayed
   parked forever, holding the channel's publish semaphore, and every publish on that channel

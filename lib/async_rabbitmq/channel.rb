@@ -215,6 +215,19 @@ module AsyncRabbitMQ
     end
 
     def close
+      # A resync is reopening the channel in the background; it will land on
+      # :open (or :closed if it failed, or :recovering if the connection then
+      # dropped). Park until it settles, then close the live channel — rather
+      # than falling through `return unless open?` and silently doing nothing
+      # while the channel goes on consuming. If recovery is abandoned while we
+      # wait, wait_for_recovery! raises the reason; the channel is closed
+      # either way, which is what the caller asked for, so swallow it.
+      begin
+        wait_for_recovery! while resyncing?
+      rescue => e
+        @logger.debug("Channel #{@channel_id}: close saw recovery end while resyncing: #{e.class}")
+        return
+      end
       if recovering?
         # Give the channel up rather than letting recovery reopen it.
         drop!(NotOpenError.new("Channel #{@channel_id} closed during recovery"), reason: :user)
@@ -824,6 +837,13 @@ module AsyncRabbitMQ
       @confirm_condition&.signal(error)
       @confirm_condition = nil
       release_outstanding_slots(error)
+      # A resync in progress is parked waiting for a close-ok that this
+      # connection will never deliver. Wake it so it can see the channel is
+      # now :recovering and hand the reopen to the recovery loop instead of
+      # racing it (see resync_after_rpc_timeout).
+      cond = @resync_condition
+      @resync_condition = nil
+      cond&.signal(error)
     end
 
     # -------------------------------------------------------------------------
@@ -933,6 +953,15 @@ module AsyncRabbitMQ
       # Whatever was outstanding belonged to the old channel; the broker
       # requeued it and will deliver it again with fresh tags.
       @unsettled.clear
+      # Stop the dispatch loop bound to the old queue before swapping it out.
+      # It is parked inside old_queue.pop, which captured that queue as its
+      # receiver, so reassigning @queue alone would never wake it: it would
+      # park there for the life of the reactor (one leaked fiber per resync).
+      # The connection-recovery path already pushed this nil via interrupt_wait!
+      # — a second one into an orphaned queue is harmless; the resync path,
+      # which keeps the live connection, has pushed nothing, so this is its
+      # only stop signal.
+      @queue&.push(nil) rescue nil
       @queue    = @frame_io.register_channel(@channel_id)
       start_dispatch_task
       send_and_wait(AMQ::Protocol::Channel::Open.encode(@channel_id, ""), AMQ::Protocol::Channel::OpenOk)
@@ -1790,16 +1819,36 @@ module AsyncRabbitMQ
         AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Resynchronising after RPC timeout", 0, 0).encode
       )
 
+      outcome = nil
       begin
-        Async::Task.current.with_timeout(@rpc_timeout || RESYNC_TIMEOUT) { cond.wait }
+        outcome = Async::Task.current.with_timeout(@rpc_timeout || RESYNC_TIMEOUT) { cond.wait }
       rescue Async::TimeoutError
         @logger.error("Channel #{@channel_id}: no channel.close-ok while resynchronising")
       ensure
         @resync_condition = nil
       end
 
+      # The connection dropped while we waited: mark_recovering! moved the
+      # channel to :recovering and woke us (interrupt_wait! → fail_waiters!).
+      # The reopen is the recovery loop's job now — it reopens every channel on
+      # the new connection and replays the topology first. Racing it from here
+      # would set the channel :closed and call reopen_channel against a session
+      # that is not open, which raises, drops the channel out of the session,
+      # and strands its consumers (they were never cleared, so recovery can
+      # still restore them). Leave it be. @consumers is untouched; the dup is
+      # moot on this path.
+      if recovering? || outcome.is_a?(Exception)
+        @logger.info("Channel #{@channel_id}: connection lost during resync; recovery will reopen it")
+        return
+      end
+
       @state = :closed
-      @consumers.clear
+      # @consumers is deliberately NOT cleared here. If the connection drops
+      # while reopen_channel below is parked waiting for channel.open-ok, this
+      # method unwinds into the rescue with the channel now :recovering; the
+      # recovery loop will reopen it and re-register whatever is in @consumers,
+      # so emptying it would silently lose every consumer. (The dup is kept for
+      # the same reason — see the rescue.)
       @session.reopen_channel(self, state: :resyncing)
       # reopen_on restores confirm mode but deliberately leaves the unconfirmed
       # messages alone: during connection recovery the topology they are
@@ -1813,6 +1862,17 @@ module AsyncRabbitMQ
       re_register_consumers
       resume_parked!(:open)
     rescue => e
+      # A connection drop during the reopen (after the early-return guard above
+      # passed) lands here: the channel is now :recovering, or the session is no
+      # longer open. Recovery will reopen this channel and re-register its
+      # consumers, so leave it in the table with @consumers intact — restore the
+      # dup in case it was mid-replace — rather than marking it closed and
+      # dropping it, which would strand the consumers for good.
+      if recovering? || !@session.open?
+        @consumers.replace(consumers) if @consumers.empty?
+        @logger.info("Channel #{@channel_id}: connection lost during resync reopen; recovery will handle it")
+        return
+      end
       @logger.error("Channel #{@channel_id}: could not resynchronise after an RPC timeout: #{e.class}: #{e.message}")
       mark_closed!(ChannelError.new("Channel could not be resynchronised after an RPC timeout: #{e.message}",
                                     channel_id: @channel_id))
@@ -1989,18 +2049,80 @@ module AsyncRabbitMQ
       raise RpcTimeoutError, yield
     end
 
+    # Re-subscribe every consumer after a reopen. A consumer whose queue is
+    # gone draws a 404, and the broker closes the whole channel on it — taking
+    # down every consumer already re-registered on it, which were cancelled
+    # server-side by that same close. So a ChannelError cannot just be logged
+    # and skipped (the old behaviour: the first bad queue left the channel
+    # closed and dropped out of the session, so the rest raised NotOpenError
+    # and no consumer was restored, while recovery still reported success).
+    # Instead, on a ChannelError the offending consumer is dropped, the channel
+    # reopened, and the survivors re-subscribed. The dropped set bounds it, so a
+    # queue that stays gone is dropped once, not retried forever.
+    #
+    # Any OTHER error — the connection dropping again mid-recovery
+    # (ConnectionError from interrupt_wait!), the session going away
+    # (NotOpenError), an RPC timeout — is not this consumer's fault. It aborts
+    # the pass and leaves @consumers untouched, so the next recovery cycle
+    # restores every consumer; dropping them here would be silent, permanent
+    # loss on a connection flap, with recovery still reporting success.
     def re_register_consumers
-      @consumers.each do |tag, entry|
-        begin
-          basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack],
-                        exclusive: entry[:exclusive], arguments: entry[:arguments] || {},
-                        on_error: entry[:on_error], &entry[:block])
-        rescue => e
-          # Typically 404: the queue is gone and was not recovered. The broker
-          # closes the channel on that, so say so instead of failing silently.
-          @logger.error("Channel #{@channel_id}: could not re-register consumer #{tag} on #{entry[:queue_name]}: #{e.class}: #{e.message}")
+      return if @consumers.empty?
+
+      dropped = {}
+      # A ChannelError drops exactly one consumer (recorded in `dropped` and
+      # skipped next pass) or the pass completes, so this runs at most once per
+      # consumer — no spin even if the reopen itself keeps raising ChannelError.
+      restart = true
+      while restart
+        restart = false
+        aborted = catch(:abort_reregister) do
+          @consumers.keys.each do |tag|
+            next if dropped.key?(tag)
+            entry = @consumers[tag]
+            begin
+              reopen_for_reregister! unless open?
+              basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack],
+                            exclusive: entry[:exclusive], arguments: entry[:arguments] || {},
+                            on_error: entry[:on_error], &entry[:block])
+            rescue ChannelError => e
+              dropped[tag] = e
+              @logger.error("Channel #{@channel_id}: consumer #{tag} on #{entry[:queue_name]} rejected (#{e.message}); dropping it")
+              # The broker closed the channel rejecting this one, cancelling the
+              # consumers already restored on it. Restart to re-subscribe them.
+              # If it is somehow still open, the earlier subscriptions stand, so
+              # carry on to the next consumer.
+              if !open?
+                restart = true
+                break
+              end
+            rescue => e
+              @logger.warn("Channel #{@channel_id}: consumer re-registration interrupted (#{e.class}: #{e.message}); leaving consumers for the next recovery")
+              throw :abort_reregister, true
+            end
+          end
+          false
+        end
+        return if aborted
+      end
+
+      # Forget the ones the broker will not serve, and release anyone in #each
+      # waiting on them: they are not coming back on their own.
+      dropped.each_key do |tag|
+        cancelled = @consumers.delete(tag)
+        topology&.delete_consumer(tag)
+        wake_each_waiters(tag)
+        instrument("consumer.recovery_failed") do
+          { channel: @channel_id, consumer_tag: tag, queue: cancelled&.dig(:queue_name), reason: :queue_deleted }
         end
       end
+    end
+
+    # Reopen the channel in place during consumer re-registration, after the
+    # broker closed it rejecting a consumer. Keeps the same id; restores
+    # prefetch, confirm and tx mode (reopen_on does). Leaves the channel :open.
+    def reopen_for_reregister!
+      @session.reopen_channel(self, state: :open)
     end
 
     # Raise unless the channel is open. While the connection is being recovered
