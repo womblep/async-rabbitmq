@@ -151,6 +151,21 @@ All notable changes to this project will be documented in this file.
 - CI runs the unit specs, which were never exercised there, and the job times out after 30
   minutes instead of holding a runner for six hours when a toxiproxy spec wedges.
 
+### Changed
+
+- Every one-shot wait is an `Async::Promise` now, instead of a hand-rolled lazily-created
+  `Async::Condition`: the latch fibers park on through recovery and resync, the reply slot of
+  every synchronous operation, `update_secret`'s reply, and the `connection.blocked` gate. A
+  promise's resolution is sticky, which removes a whole class of lost-wakeup windows the
+  condition code had to defend against site by site - a waiter arriving after the resolution gets
+  the same answer instead of parking on a signal already spent, and a reply dispatched while the
+  requester is still parked inside its own write (a full write queue yields there) is kept for
+  it, where before it was discarded and the requester timed out into a needless channel resync.
+  Reply slots are registered before the request is written for the same reason. The recovery
+  retry sleep is poked by an `Async::Notification`, its purpose-built primitive. Raises the
+  `async` requirement to `~> 2.29`, where `Async::Promise` appeared (alongside thread-safe
+  `Condition`/`Queue`); `Async::Variable` was skipped as deprecated.
+
 ## [0.8.1] - 2026-11-15
 
 ### Fixed

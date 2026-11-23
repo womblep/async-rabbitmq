@@ -1,5 +1,6 @@
 require "async"
 require "async/condition"
+require "async/promise"
 require "async/semaphore"
 require_relative "errors"
 
@@ -143,7 +144,7 @@ module AsyncRabbitMQ
       @recover_cancelled_consumers = recover_cancelled_consumers
       @on_error_disposition = :dead_letter
       @resyncing         = false
-      @resync_condition  = nil
+      @resync_promise    = nil
       # Incremented on every reopen (connection recovery or a single-channel
       # reopen). Delivery tags are stamped with it so acks raised against a
       # previous generation can be dropped instead of hitting a live message.
@@ -153,10 +154,10 @@ module AsyncRabbitMQ
       @mutex             = Async::Semaphore.new(1)
       @publish_sem       = Async::Semaphore.new(1)   # one publish's frames go out contiguously
       @rpc_sem           = Async::Semaphore.new(1)   # one request/reply in flight per channel
-      @reply_condition   = nil
+      @reply_promise     = nil
       @content_condition = nil
       @pending_content   = nil
-      @recovered_condition = nil     # fibers parked while the connection recovers
+      @recovery_promise  = nil       # per-episode latch; fibers park on it while the connection recovers
       @pool_size         = validate_pool_size!(pool_size)
       @work_queue        = nil       # Async::Queue of [method, header, body, entry]
       @workers           = []        # long-lived handler fibers draining it
@@ -484,8 +485,11 @@ module AsyncRabbitMQ
     def basic_get(queue_name, manual_ack: true)
       msg, content = @rpc_sem.acquire do
         assert_open!
+        # Reply slot registered before the write, as in send_and_wait: the
+        # reply can be dispatched while write_frame yields on a full queue.
+        promise = @reply_promise = Async::Promise.new
         @frame_io.write_frame(AMQ::Protocol::Basic::Get.encode(@channel_id, queue_name, !manual_ack).encode)
-        m = wait_for_any(AMQ::Protocol::Basic::GetOk, AMQ::Protocol::Basic::GetEmpty)
+        m = wait_for_any(promise, AMQ::Protocol::Basic::GetOk, AMQ::Protocol::Basic::GetEmpty)
         stamp_delivery_tag(m) if m.is_a?(AMQ::Protocol::Basic::GetOk)
         # After GetOk the content header + body follow on this channel.
         [m, m.is_a?(AMQ::Protocol::Basic::GetOk) ? wait_content : nil]
@@ -818,8 +822,26 @@ module AsyncRabbitMQ
     # with +error+; new publishes and RPCs park until #reopen_after_recovery
     # (see #assert_open!); consumers are re-registered on reopen.
     def mark_recovering!(error)
+      begin_recovery_wait!
       @state = :recovering
       interrupt_wait!(error)
+    end
+
+    # Start a park-and-wait episode (:recovering or :resyncing): a fresh
+    # promise every arriving waiter latches onto. A promise, not a condition:
+    # resolution is sticky, so a waiter that arrives after finish_recovery! has
+    # already resolved the episode returns at once instead of parking on a
+    # signal that will never come again — the lost-wakeup class that used to
+    # need a re-check loop at every wait site. Every transition INTO
+    # :recovering or :resyncing must come through here.
+    #
+    # A still-PENDING promise is kept, not replaced: fibers are parked on it,
+    # and a replacement would orphan them forever — a resync that a connection
+    # drop escalates into recovery is one episode to its waiters, resolved by
+    # whichever teardown or finish ends it. Only a resolved (or absent) promise
+    # means the previous episode is over and a new latch is needed.
+    def begin_recovery_wait!
+      @recovery_promise = Async::Promise.new if @recovery_promise.nil? || @recovery_promise.resolved?
     end
 
     # Give the channel up while the session is recovering, instead of letting
@@ -863,8 +885,12 @@ module AsyncRabbitMQ
     # a publisher parked on an outstanding slot are the two with no clock of
     # their own.
     def fail_waiters!(error)
-      @reply_condition&.signal(error)
-      @reply_condition   = nil
+      # Reply and resync are one-shot promises: resolving with the error hands
+      # it to the waiter through the same value path a real reply takes, and a
+      # second resolution (a race between teardown paths) is a silent no-op.
+      promise = @reply_promise
+      @reply_promise = nil
+      promise&.resolve(error)
       @content_condition&.signal(error)
       @content_condition = nil
       @confirm_condition&.signal(error)
@@ -873,10 +899,12 @@ module AsyncRabbitMQ
       # A resync in progress is parked waiting for a close-ok that this
       # connection will never deliver. Wake it so it can see the channel is
       # now :recovering and hand the reopen to the recovery loop instead of
-      # racing it (see resync_after_rpc_timeout).
-      cond = @resync_condition
-      @resync_condition = nil
-      cond&.signal(error)
+      # racing it (see resync_after_rpc_timeout). Nil the slot too, so the
+      # dispatch filter stops discarding frames — recovery's channel.open-ok
+      # among them.
+      promise = @resync_promise
+      @resync_promise = nil
+      promise&.resolve(error)
     end
 
     # -------------------------------------------------------------------------
@@ -996,6 +1024,7 @@ module AsyncRabbitMQ
       @consumers.clear unless recover_consumers
       # Reopened :resyncing, not :open: the replay below must reach the wire
       # before any new publish, or a tag no longer matches its position on it.
+      begin_recovery_wait! # callers arriving while :resyncing park on this episode
       @session.reopen_channel(self, state: :resyncing)
       # Only this channel was closed, so the topology is intact and anything
       # left unconfirmed can go straight back out.
@@ -1364,12 +1393,12 @@ module AsyncRabbitMQ
       # While resynchronising, everything except the close-ok we are waiting
       # for belongs to the request that timed out. Dropping it here is the
       # point of the reopen: it must not reach the next caller.
-      if @resync_condition
+      if @resync_promise
         case method
         when AMQ::Protocol::Channel::CloseOk
-          cond = @resync_condition
-          @resync_condition = nil
-          cond.signal(:closed)
+          promise = @resync_promise
+          @resync_promise = nil
+          promise.resolve(:closed)
         when AMQ::Protocol::Basic::Ack
           # Confirms still in flight for messages published before the close.
           # Dropping them would strand their entries in @pending_confirms: they
@@ -1454,9 +1483,12 @@ module AsyncRabbitMQ
         @logger.debug("Channel #{@channel_id}: ignoring connection-level #{method.class} frame")
 
       else
-        # Wake any fiber waiting on this method type
-        @reply_condition&.signal(method)
-        @reply_condition = nil
+        # Resolve the registered reply slot. The promise latches, so a reply
+        # that lands while the requester is still parked inside its own
+        # write_frame (full write queue) is kept for it.
+        promise = @reply_promise
+        @reply_promise = nil
+        promise&.resolve(method)
         # Yield so the newly-woken fiber (e.g. basic_consume registering its consumer)
         # can run before dispatch_loop processes the next queued message.
         Async::Task.current.yield
@@ -1881,6 +1913,7 @@ module AsyncRabbitMQ
       # a publish issued now would go out after channel.close and be dropped by
       # the broker without a word, and another request's reply would be thrown
       # away as the late one we are shedding.
+      begin_recovery_wait!
       @state = :resyncing
       @logger.warn(
         "Channel #{@channel_id}: reopening after an RPC timeout. A late reply carries nothing " \
@@ -1889,18 +1922,23 @@ module AsyncRabbitMQ
       instrument("channel.resync") { { channel: @channel_id, reason: :rpc_timeout } }
 
       consumers = @consumers.dup
-      cond = @resync_condition = Async::Condition.new
+      # A promise: resolution is sticky, so a close-ok dispatched while this
+      # fiber is still parked inside its own write (full write queue) is kept
+      # rather than lost. Registered before the write for the same reason.
+      promise = @resync_promise = Async::Promise.new
       @frame_io.write_frame(
         AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Resynchronising after RPC timeout", 0, 0).encode
       )
 
       outcome = nil
       begin
-        outcome = Async::Task.current.with_timeout(@rpc_timeout || RESYNC_TIMEOUT) { cond.wait }
+        outcome = Async::Task.current.with_timeout(@rpc_timeout || RESYNC_TIMEOUT) { promise.wait }
       rescue Async::TimeoutError
         @logger.error("Channel #{@channel_id}: no channel.close-ok while resynchronising")
-      ensure
-        @resync_condition = nil
+        # Deliberately NOT clearing @resync_promise here: the dispatch filter
+        # keys on it, and it must keep discarding frames — a very late
+        # close-ok above all — until just before the reopen below. Cleared
+        # there; the teardown paths (fail_waiters!) clear it themselves.
       end
 
       # The connection dropped while we waited: mark_recovering! moved the
@@ -1918,6 +1956,11 @@ module AsyncRabbitMQ
       end
 
       @state = :closed
+      # The dispatch filter stays on until this point so a close-ok arriving
+      # after the timeout is still discarded — otherwise it would resolve the
+      # Open's reply promise below (registered before its write) and kill the
+      # reopen with "expected OpenOk, got CloseOk".
+      @resync_promise = nil
       # @consumers is deliberately NOT cleared here. If the connection drops
       # while reopen_channel below is parked waiting for channel.open-ok, this
       # method unwinds into the rescue with the channel now :recovering; the
@@ -1957,8 +2000,13 @@ module AsyncRabbitMQ
     end
 
     def send_and_wait(frame, *expected_classes)
+      # Register the reply slot BEFORE writing: write_frame yields when the
+      # write queue is full, and the reply can be dispatched inside that gap.
+      # The promise keeps it for us; a condition registered afterwards lost it,
+      # and the caller timed out into a needless resync.
+      promise = @reply_promise = Async::Promise.new
       @frame_io.write_frame(frame.encode)
-      wait_for_any(*expected_classes)
+      wait_for_any(promise, *expected_classes)
     end
 
     def topology
@@ -2089,22 +2137,31 @@ module AsyncRabbitMQ
       @logger.info("Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
     end
 
+    # Park until the current episode resolves. The promise is a latch: a waiter
+    # arriving after resolution returns immediately with the same outcome, so
+    # there is no window between "state says recovering" and "the wait is
+    # registered" for a resume to slip through. Raises the teardown error when
+    # the episode ended in mark_closed!.
     def wait_for_recovery!
-      @recovered_condition ||= Async::Condition.new
-      outcome = @recovered_condition.wait
-      raise outcome if outcome.is_a?(Exception)
+      promise = (@recovery_promise ||= Async::Promise.new)
+      promise.wait # :open, or raises the rejection from resume_parked!
     end
 
     def resume_parked!(outcome)
-      cond = @recovered_condition
-      @recovered_condition = nil
-      cond&.signal(outcome)
+      promise = @recovery_promise
+      return unless promise
+      # Keep the resolved promise in place as the latch for late arrivals; the
+      # next episode replaces it via begin_recovery_wait!.
+      outcome.is_a?(Exception) ? promise.reject(outcome) : promise.resolve(outcome)
     end
 
-    def wait_for_any(*expected_classes)
-      condition = @reply_condition = Async::Condition.new
-      result    = wait_with_timeout(condition) do
-        @reply_condition = nil if @reply_condition.equal?(condition)
+    # Wait on the reply promise +send_and_wait+ registered BEFORE it wrote the
+    # request. The promise latches, so a reply the dispatch fiber delivers
+    # while the writer is still parked on a full write queue — a yield point
+    # between send and wait under a Condition — is kept, not dropped.
+    def wait_for_any(promise, *expected_classes)
+      result = wait_with_timeout(promise) do
+        @reply_promise = nil if @reply_promise.equal?(promise)
         # amq-protocol method classes report their AMQP name, e.g. "queue.declare-ok".
         "No reply to #{expected_classes.map(&:name).join('/')} within #{@rpc_timeout}s on channel #{@channel_id}"
       end

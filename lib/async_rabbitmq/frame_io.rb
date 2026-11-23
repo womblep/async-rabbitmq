@@ -1,6 +1,7 @@
 require "async"
 require "async/queue"
 require "async/limited_queue"
+require "async/promise"
 require "async/semaphore"
 require "socket"
 require "amq/protocol"
@@ -41,7 +42,7 @@ module AsyncRabbitMQ
       @content_state      = {}
       @on_frame           = nil   # optional proc called each time a frame is read
       @blocked            = false
-      @unblocked_condition = nil
+      @unblocked_promise   = nil   # per blocked episode; see write_frame
     end
 
     # Set a callback invoked immediately after each frame is successfully read.
@@ -110,8 +111,11 @@ module AsyncRabbitMQ
     def write_frame(data, publish: false)
       if publish
         while @blocked
-          @unblocked_condition ||= Async::Condition.new
-          outcome = @unblocked_condition.wait
+          # One promise per blocked episode, created lazily by the first
+          # waiter (set_blocked only flips the flag). A latch: a publisher
+          # arriving between the unblock resolving and the flag flipping gets
+          # the same answer immediately instead of parking on a spent signal.
+          outcome = (@unblocked_promise ||= Async::Promise.new).wait
           raise outcome if outcome.is_a?(Exception)
         end
       end
@@ -170,9 +174,9 @@ module AsyncRabbitMQ
     # Wake every publisher waiting on the blocked gate. With +outcome+ nil they
     # re-check the gate; with an exception they raise it.
     def release_blocked_writers(outcome = nil)
-      cond = @unblocked_condition
-      @unblocked_condition = nil
-      cond&.signal(outcome)
+      promise = @unblocked_promise
+      @unblocked_promise = nil
+      promise&.resolve(outcome)
     end
 
     def writer_loop
