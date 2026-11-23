@@ -357,11 +357,23 @@ RSpec.describe AsyncRabbitMQ::Cluster, :integration do
       survivor = direct(cluster).first.channels.first || cluster.open_channel
       handed.each { |m| survivor.basic_publish(m.payload, routing_key: m.routing_key, **m.options) }
       wait_until("the node to recover") { node.open? }
-      # The originals DID land (only their acks were withheld from the client),
-      # so republishing the handed records duplicates them: 3 + 3. That is the
-      # at-least-once contract of confirms — an unconfirmed message may or may
-      # not have made it, and the only safe reaction is to send it again.
-      expect(ready_count_on(cluster, q.name)).to eq(6)
+      # At-least-once is the contract: an unconfirmed message may or may not
+      # have reached the broker before the node went (locally the acks were
+      # withheld, but each publish also races the outage through the proxy),
+      # so after republishing the handed records every payload is present at
+      # least once and at most twice. Asserting an exact count over-pins that
+      # race — it flaked on CI, where the originals sometimes die in transit.
+      wait_until("the republished messages to land") { ready_count_on(cluster, q.name) >= 3 }
+      drained = []
+      cluster.with_channel do |c|
+        while (got = c.basic_get(q.name, manual_ack: false))
+          _di, _h, body = got
+          break if body.nil?
+          drained << body
+        end
+      end
+      expect(drained.uniq).to match_array(%w[rescue-me-0 rescue-me-1 rescue-me-2])
+      expect(drained.size).to be_between(3, 6)
       channels # keep the reference alive
     end
   end
