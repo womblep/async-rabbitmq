@@ -159,4 +159,42 @@ RSpec.describe "topology recovery", :integration do
       expect(body).to eq("routed through two exchanges")
     end
   end
+
+  it "reports an incomplete topology replay end to end when a declare times out during recovery" do
+    isolated_session do |session, _|
+      ch  = session.open_channel
+      tag = SecureRandom.hex(4)
+      ch.queue("test.incomplete.a.#{tag}", durable: true)
+      doomed = ch.queue("test.incomplete.b.#{tag}", durable: true)
+      ch.queue("test.incomplete.c.#{tag}", durable: true)
+
+      incomplete = nil
+      succeeded  = nil
+      session.on_event("recovery.topology_incomplete") { |_n, p| incomplete ||= p }
+      session.on_event("recovery.succeeded")           { |_n, p| succeeded ||= p }
+
+      # Everything is real — the drop, the channel reopen, the replay loop, the
+      # event plumbing — except that one queue's re-declare stands in for a
+      # broker that went slow: it raises the RpcTimeoutError such a declare
+      # would. That is the one thing toxiproxy cannot target precisely (a
+      # blanket latency toxic fails channel.open first), so it is synthesised
+      # here while the rest of the path stays end to end.
+      original = ch.method(:recover_queue)
+      ch.define_singleton_method(:recover_queue) do |q|
+        raise AsyncRabbitMQ::RpcTimeoutError, "synthetic slow declare" if q.name == doomed.name
+        original.call(q)
+      end
+
+      recover_connection!(session)
+
+      expect(incomplete).not_to be_nil
+      expect(incomplete[:kind]).to eq(:queue)
+      expect(incomplete[:entity]).to eq(doomed.name)
+      expect(incomplete[:error]).to eq("AsyncRabbitMQ::RpcTimeoutError")
+      # recovery still SUCCEEDS (the channels are back), but says so honestly.
+      expect(succeeded).not_to be_nil
+      expect(succeeded[:topology_complete]).to be(false)
+      expect(session.open?).to be true
+    end
+  end
 end

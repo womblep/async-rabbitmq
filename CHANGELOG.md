@@ -20,6 +20,14 @@ All notable changes to this project will be documented in this file.
   that accepts TCP but never answers; `close` racing an outage; reconnecting a session after
   recovery exhausts its attempts; credentials revoked during an outage abandoning recovery with
   `reason: :authentication_failed`; and `recovery.succeeded` carrying `topology_complete: true`.
+- Degraded-transport coverage: a multi-frame message delivered in tiny TCP fragments (slicer
+  toxic) reassembles intact, and a connection cut mid-body (limit_data toxic) never hands a
+  truncated body to a handler and is redelivered whole after recovery. The incomplete-replay
+  reporting path is now also covered end to end — real drop, reopen and replay loop, with one
+  declare timing out — asserting `recovery.topology_incomplete` and `topology_complete: false`.
+- Cluster recovery edges: all nodes down at once leaving the cluster neither open nor closed and
+  `open_channel` raising until one returns; a node recovered through two outage cycles in a row;
+  and `:drop` keeping a node's durable topology recorded while forgetting its transient queues.
 
 ### Fixed
 
