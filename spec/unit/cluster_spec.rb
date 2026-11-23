@@ -74,4 +74,37 @@ RSpec.describe AsyncRabbitMQ::Cluster do
     missing  = expected.reject { |m| described_class.method_defined?(m) }
     expect(missing).to eq([])
   end
+
+  it "returns from connect when closed from another fiber, instead of hanging" do
+    # Both nodes are unreachable (port 1), so no supervisor ever reports success;
+    # connect would park on its condition forever if close could not wake it.
+    cluster = described_class.new(addresses: %w[127.0.0.1:1 127.0.0.1:2],
+                                  connect_timeout: 30, recovery_interval: 30,
+                                  logger: AsyncRabbitMQ::Log.silent)
+    Sync do |task|
+      connector = task.async do
+        cluster.connect
+      rescue => e
+        e
+      end
+
+      # Let connect spawn its supervisors and park waiting for first reports.
+      wait_until("connect is waiting") { cluster.instance_variable_get(:@connect_condition) }
+      result = nil
+      task.with_timeout(10) do
+        cluster.close
+        result = connector.wait
+      end
+      expect(result).to be_a(AsyncRabbitMQ::NotOpenError)
+      expect(cluster).to be_closed
+    end
+  end
+
+  def wait_until(what, timeout: 10)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    until yield
+      raise "timed out waiting for #{what}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.02
+    end
+  end
 end

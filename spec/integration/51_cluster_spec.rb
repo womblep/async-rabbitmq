@@ -316,4 +316,22 @@ RSpec.describe AsyncRabbitMQ::Cluster, :integration do
       wait_until("the node to recover") { node.open? }
     end
   end
+
+  it "still runs on_node_down when on_connection_lost raises" do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+    with_cluster(on_node_down: :drop) do |cluster, _|
+      node = proxied(cluster)
+
+      downs = []
+      # A raising on_connection_lost must not suppress on_node_down — under :drop
+      # that callback is the only chance to see the node's unconfirmed messages.
+      cluster.on_connection_lost { |_s, _e| raise "boom from on_connection_lost" }
+      cluster.on_node_down       { |session, _channels, _error| downs << session }
+
+      toxiproxy_rabbitmq.down do
+        wait_until("on_node_down to run despite the raising callback") { downs == [node] }
+      end
+      wait_until("the node to recover") { node.open? }
+    end
+  end
 end
