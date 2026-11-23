@@ -223,6 +223,10 @@ module AsyncRabbitMQ
       return unless open?
       rpc(AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0), AMQ::Protocol::Channel::CloseOk)
       @state = :closed
+      # Confirms outstanding at close will never be resolved now; a fiber in
+      # wait_for_confirms or parked on an outstanding slot has to hear that
+      # from us, or it waits forever.
+      fail_waiters!(NotOpenError.new("Channel #{@channel_id} was closed"))
       # Closing the channel cancelled its consumers on the broker side; an
       # auto-delete queue that just lost its last one is gone with it.
       forget_consumers_in_topology
@@ -580,7 +584,7 @@ module AsyncRabbitMQ
         # caller may arrive before reopen_after_recovery has re-selected confirms.
         @confirm_condition ||= Async::Condition.new
 
-        if deadline
+        outcome = if deadline
           remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
           raise ConfirmTimeoutError.new(unconfirmed_tags: @pending_confirms.keys, channel_id: @channel_id) if remaining <= 0
 
@@ -593,6 +597,9 @@ module AsyncRabbitMQ
           @confirm_condition.wait
         end
 
+        # A teardown path signalled us its error (broker channel close, user
+        # close, connection loss): raise that, it names what actually happened.
+        raise outcome if outcome.is_a?(Exception)
         raise ConnectionError, "Session disconnected while waiting for confirms" unless open?
       end
       result       = @only_acks
@@ -789,6 +796,23 @@ module AsyncRabbitMQ
     # (used on connection loss, and again if the connection dies mid-recovery).
     def interrupt_wait!(error = nil)
       error ||= ConnectionError.new(code: 0, text: "Connection lost during recovery")
+      fail_waiters!(error)
+      @queue&.push(nil) rescue nil
+      # The connection is gone, so the queued deliveries are too: the broker
+      # requeues whatever was unacknowledged and sends it again on the new one.
+      stop_workers(discard: true)
+    rescue => e
+      # ignore — best-effort unblock
+    end
+
+    # Wake every fiber parked on a reply, content, confirm or slot wait with
+    # +error+. Every teardown path — connection loss, broker-sent channel
+    # close, user close — must release all four: whichever one a path misses
+    # parks its caller forever, since nothing else will ever signal it on a
+    # channel that is gone. A confirm waiter with no timeout (the default) and
+    # a publisher parked on an outstanding slot are the two with no clock of
+    # their own.
+    def fail_waiters!(error)
       @reply_condition&.signal(error)
       @reply_condition   = nil
       @content_condition&.signal(error)
@@ -796,12 +820,6 @@ module AsyncRabbitMQ
       @confirm_condition&.signal(error)
       @confirm_condition = nil
       release_outstanding_slots(error)
-      @queue&.push(nil) rescue nil
-      # The connection is gone, so the queued deliveries are too: the broker
-      # requeues whatever was unacknowledged and sends it again on the new one.
-      stop_workers(discard: true)
-    rescue => e
-      # ignore — best-effort unblock
     end
 
     # -------------------------------------------------------------------------
@@ -1390,9 +1408,12 @@ module AsyncRabbitMQ
         ConnectionError.new(code: code, text: text)
       end
 
-      # Wake any waiting fiber with the error
-      @reply_condition&.signal(error)
-      @reply_condition = nil
+      # Wake every parked fiber with the error — the RPC caller, but equally a
+      # fiber in wait_for_confirms and a publisher parked on an outstanding
+      # slot: no ack will ever arrive on a closed channel, so missing them
+      # here was a permanent hang for a confirm wait with no timeout (the
+      # default), and a 15s stall holding the publish semaphore for the slot.
+      fail_waiters!(error)
       # Stop dispatch_loop
       @queue&.push(nil)
       stop_workers(discard: true)
