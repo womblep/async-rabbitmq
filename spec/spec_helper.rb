@@ -168,6 +168,48 @@ module IntegrationHelpers
     Toxiproxy[:rabbitmq]
   end
 
+  # Black-hole the proxy: no byte flows and, crucially, NO close ever arrives —
+  # the half-open connection a NAT idle-drop, VM freeze or pulled cable leaves
+  # behind. The reader never gets EOF/RST, so only the heartbeat watchdog (or
+  # TCP_USER_TIMEOUT) can notice. toxiproxy's timeout toxic with timeout: 0
+  # holds the connection open and silent forever.
+  #
+  #   blackhole(toxiproxy_rabbitmq) { ... }                        # both directions
+  #   blackhole(toxiproxy_rabbitmq, direction: :upstream) { ... }  # client->broker only
+  def blackhole(proxy, direction: :both, &block)
+    toxics = case direction
+             when :both       then proxy.downstream(:timeout, timeout: 0).upstream(:timeout, timeout: 0)
+             when :upstream   then proxy.upstream(:timeout, timeout: 0)
+             when :downstream then proxy.downstream(:timeout, timeout: 0)
+             end
+    toxics.apply(&block)
+  end
+
+  # Force-close a live connection from the broker side, as an operator's
+  # "Force Close" in the management UI or rabbitmqctl close_connection does.
+  # The broker sends connection.close (320 CONNECTION_FORCED) and expects a
+  # close-ok — a different detection path from any transport loss. Looks the
+  # connection up by the connection_name: the client supplied, polling because
+  # the management API learns of new connections with a small lag.
+  def force_close_connection!(connection_name, timeout: 10)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    loop do
+      conn = http_get("/api/connections").find do |c|
+        c.dig("client_properties", "connection_name") == connection_name
+      end
+      if conn
+        # Connection names look like "172.22.0.1:53422 -> 172.22.0.2:5672".
+        # This is a PATH segment: spaces must be %20. encode_www_form_component
+        # would give "+", which the API reads literally — and 404s.
+        http_delete("/api/connections/#{URI.encode_uri_component(conn['name'])}")
+        return conn["name"]
+      end
+      raise "connection #{connection_name.inspect} not visible to the management API within #{timeout}s" if
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.2
+    end
+  end
+
   # Returns the Toxiproxy::Proxy for RabbitMQ TLS traffic.
   def toxiproxy_rabbitmq_tls
     Toxiproxy[:rabbitmq_tls]
