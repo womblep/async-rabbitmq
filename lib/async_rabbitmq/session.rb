@@ -62,9 +62,12 @@ module AsyncRabbitMQ
       raise ArgumentError, "at least one URI string is required" if uri_strings.empty?
 
       first_opts = uri_options(uri_strings.first)
+      # [host, port] pairs, never "host:port" strings: an IPv6 literal has
+      # colons of its own, and the round-trip through a joined string parsed
+      # "[::1]:5672" into host "[" port 0.
       address_list = uri_strings.map do |u|
         parsed = uri_options(u)
-        "#{parsed[:host] || 'localhost'}:#{parsed[:port]}"
+        [parsed[:host] || "localhost", parsed[:port]]
       end
 
       # Connection-level settings come from the first URI; addresses from all.
@@ -84,7 +87,9 @@ module AsyncRabbitMQ
       params = query ? ::URI.decode_www_form(query).to_h : {}
 
       opts = { tls: !!parsed[:ssl], port: parsed[:port] }
-      opts[:host]     = parsed[:host] if parsed[:host]
+      # A URI carries an IPv6 literal in brackets and Ruby's URI keeps them:
+      # "amqp://[::1]" parses to host "[::1]". TCPSocket wants the bare "::1".
+      opts[:host]     = parsed[:host].delete_prefix("[").delete_suffix("]") if parsed[:host]
       opts[:username] = parsed[:user] if parsed[:user]
       opts[:password] = parsed[:pass] if parsed[:pass]
       # "amqp://host/" yields an empty vhost; treat it as the default "/" rather
@@ -121,16 +126,39 @@ module AsyncRabbitMQ
     #   host: "rabbit1", port: 5672 (default)           -> [["rabbit1",5672]]
     def self.address_list(host:, port:, hosts: nil, addresses: nil)
       if addresses && !addresses.empty?
-        addresses.map do |addr|
-          h, p = addr.to_s.split(":", 2)
-          [h, p ? p.to_i : port]
-        end
+        addresses.map { |addr| split_address(addr, port) }
       elsif hosts && !hosts.empty?
         hosts.map { |h| [h.to_s, port] }
       else
         [[host.to_s, port]]
       end
     end
+
+    # One address in any accepted shape to [host, port]. An IPv6 literal has
+    # colons of its own, so splitting on the first colon mangled it: bracketed
+    # ("[::1]:5672", the URI form) and bare ("::1", host only — a port after a
+    # bare literal is ambiguous and needs the brackets) are both handled.
+    # [host, port] pairs pass through, which is what from_uri now builds.
+    def self.split_address(addr, default_port)
+      if addr.is_a?(Array)
+        # Strip URI brackets here too, so ["[::1]", 5672] works like "[::1]:5672".
+        host = addr[0].to_s.delete_prefix("[").delete_suffix("]")
+        return [host, (addr[1] || default_port).to_i]
+      end
+
+      s = addr.to_s
+      if s.start_with?("[") # "[v6]:port" or "[v6]"
+        h, _, rest = s.delete_prefix("[").partition("]")
+        p = rest.delete_prefix(":")
+        [h, p.empty? ? default_port : p.to_i]
+      elsif s.count(":") > 1 # bare v6 literal: the whole thing is the host
+        [s, default_port]
+      else
+        h, p = s.split(":", 2)
+        [h, p ? p.to_i : default_port]
+      end
+    end
+    private_class_method :split_address
 
     def initialize(
       host: "localhost",
@@ -207,6 +235,8 @@ module AsyncRabbitMQ
       @frame_io          = nil
       @channels          = {}       # channel_id => Channel; a closed channel's id is free again
       @channel_mutex     = Async::Semaphore.new(1)
+      @update_secret_sem = Async::Semaphore.new(1)   # one connection.update-secret in flight
+      @topology_replay_failure = nil   # set by reopen_channels when the replay stopped early
       @negotiated_hb     = nil
       @negotiated_fm     = nil
       @negotiated_cmax   = nil
@@ -417,17 +447,36 @@ module AsyncRabbitMQ
     def update_secret(new_secret, reason = "secret update")
       raise NotOpenError, "Session is not open" unless open?
 
-      cond = @update_secret_condition = Async::Condition.new
-      @frame_io.write_frame(AMQ::Protocol::Connection::UpdateSecret.encode(new_secret, reason).encode)
-      result = Async::Task.current.with_timeout(@rpc_timeout || RPC_TIMEOUT) { cond.wait }
-      raise result if result.is_a?(Exception)
+      # One at a time. Two concurrent calls clobbered @update_secret_condition:
+      # the first caller's ensure nilled the second's condition, both replies
+      # were dropped, both calls timed out — and @password was never updated
+      # although the broker had accepted the new secret, so the next reconnect
+      # authenticated with the stale one and recovery was abandoned for good.
+      @update_secret_sem.acquire do
+        raise NotOpenError, "Session is not open" unless open? # re-check after parking
 
-      @password = new_secret
-      true
-    rescue Async::TimeoutError
-      raise RpcTimeoutError, "No reply to connection.update-secret within #{@rpc_timeout || RPC_TIMEOUT}s"
-    ensure
-      @update_secret_condition = nil
+        begin
+          cond = @update_secret_condition = Async::Condition.new
+          @frame_io.write_frame(AMQ::Protocol::Connection::UpdateSecret.encode(new_secret, reason).encode)
+          result = Async::Task.current.with_timeout(@rpc_timeout || RPC_TIMEOUT) { cond.wait }
+          raise result if result.is_a?(Exception)
+
+          @password = new_secret
+          true
+        rescue Async::TimeoutError
+          # No answer either way. The broker may well have applied the secret —
+          # the reply, not the request, may be what got lost — and with OAuth
+          # rotation the old token is the one about to expire, so reconnecting
+          # with it would strand the session. Keep the new secret for
+          # reconnects and say so.
+          @password = new_secret
+          @logger.warn("connection.update-secret got no reply in #{@rpc_timeout || RPC_TIMEOUT}s; " \
+                       "the new secret will be used for reconnects, its acceptance unconfirmed")
+          raise RpcTimeoutError, "No reply to connection.update-secret within #{@rpc_timeout || RPC_TIMEOUT}s"
+        ensure
+          @update_secret_condition = nil
+        end
+      end
     end
 
     # Check whether a queue exists on the broker without creating it.
@@ -1080,6 +1129,9 @@ module AsyncRabbitMQ
           @recovery_in_progress = false
           instrument("recovery.succeeded") do
             { attempts: attempts, host: @host, port: @port, channels: @channels.size,
+              # false when the topology replay stopped early; the details went
+              # out on recovery.topology_incomplete as it happened.
+              topology_complete: @topology_replay_failure.nil?,
               duration: recovery_started_at ? instrument_elapsed(recovery_started_at) : nil }
           end
           @on_recovery&.call(self)
@@ -1121,7 +1173,8 @@ module AsyncRabbitMQ
         end
       end
 
-      recover_topology_on(reopened) if @recover_topology && !@topology.empty?
+      @topology_replay_failure = nil
+      @topology_replay_failure = recover_topology_on(reopened) if @recover_topology && !@topology.empty?
       return false if @recovery_interrupted
 
       reopened.each { |channel| channel.finish_recovery! rescue nil }
@@ -1130,20 +1183,65 @@ module AsyncRabbitMQ
 
     # Re-declare exchanges, then queues, then bindings. Each entity is replayed
     # on the channel that declared it if that channel is still open, otherwise
-    # on a temporary channel. One entity failing does not stop the others.
+    # on a temporary channel. A broker rejection of one entity does not stop
+    # the others (recover_entity handles it per entity, reopening the channel).
+    #
+    # Returns nil when everything was replayed. A harder failure — an
+    # RpcTimeoutError from a broker that stopped answering, a ConnectionError
+    # from another drop — would cost a full timeout per remaining entity, so
+    # the replay stops there; but what is missing is now REPORTED, not just
+    # logged: the return value carries the failed entity and the skip count,
+    # recover_loop puts topology_complete: false in recovery.succeeded, and a
+    # recovery.topology_incomplete event names the details. Previously this
+    # aborted silently and recovery still looked fully successful.
     def recover_topology_on(channels)
       by_id = channels.to_h { |ch| [ch.channel_id, ch] }
       temp  = nil
       on    = ->(channel_id) { by_id[channel_id] || (temp ||= open_channel) }
 
-      @topology.exchanges.each         { |x| on.call(x.channel_id).recover_exchange(x) }
-      @topology.queues.each            { |q| on.call(q.channel_id).recover_queue(q) }
-      @topology.queue_bindings.each    { |b| on.call(b.channel_id).recover_queue_binding(b) }
-      @topology.exchange_bindings.each { |b| on.call(b.channel_id).recover_exchange_binding(b) }
-    rescue => e
-      @logger.error("Topology recovery aborted: #{e.class}: #{e.message}")
+      entities =
+        @topology.exchanges.map         { |x| [:exchange, x] } +
+        @topology.queues.map            { |q| [:queue, q] } +
+        @topology.queue_bindings.map    { |b| [:queue_binding, b] } +
+        @topology.exchange_bindings.map { |b| [:exchange_binding, b] }
+
+      entities.each_with_index do |(kind, entity), index|
+        begin
+          channel = on.call(entity.channel_id)
+          case kind
+          when :exchange         then channel.recover_exchange(entity)
+          when :queue            then channel.recover_queue(entity)
+          when :queue_binding    then channel.recover_queue_binding(entity)
+          when :exchange_binding then channel.recover_exchange_binding(entity)
+          end
+        rescue => e
+          # A drop mid-replay is not an incomplete replay: reopen_channels
+          # returns false on @recovery_interrupted and the whole recovery runs
+          # again, replaying everything. Emitting here would page a false
+          # alarm once per connection flap.
+          return nil if @recovery_interrupted
+
+          skipped = entities.size - index - 1
+          failure = { kind: kind, entity: describe_entity(kind, entity),
+                      error: e.class.name, message: e.message,
+                      replayed: index, skipped: skipped }
+          @logger.error("Topology replay stopped at #{kind} #{failure[:entity]} " \
+                        "(#{e.class}: #{e.message}); #{index} replayed, #{skipped} skipped")
+          instrument("recovery.topology_incomplete") { failure }
+          return failure
+        end
+      end
+      nil
     ensure
       temp&.close rescue nil
+    end
+
+    def describe_entity(kind, entity)
+      case kind
+      when :exchange, :queue then entity.name
+      when :queue_binding    then "#{entity.exchange} -> #{entity.queue} (#{entity.routing_key})"
+      else                        "#{entity.source} -> #{entity.destination} (#{entity.routing_key})"
+      end
     end
 
 

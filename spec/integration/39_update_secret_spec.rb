@@ -47,4 +47,24 @@ RSpec.describe "Session#update_secret", :integration do
     session = AsyncRabbitMQ::Session.new(host: RABBITMQ_HOST, port: RABBITMQ_PORT)
     expect { session.update_secret("x") }.to raise_error(AsyncRabbitMQ::NotOpenError)
   end
+
+  it "serialises concurrent calls so both get their reply" do
+    # Unserialised, the two calls clobbered each other's reply condition: the
+    # first caller's cleanup destroyed the second's registration, both replies
+    # were dropped, both calls timed out, and @password was never updated even
+    # though the broker had accepted the secret.
+    isolated_session do |session, _|
+      results = []
+      tasks = 2.times.map do |i|
+        Async::Task.current.async do
+          results << session.update_secret("guest", "concurrent rotation #{i}")
+        end
+      end
+      Async::Task.current.with_timeout(10) { tasks.each(&:wait) }
+
+      expect(results).to eq([true, true])
+      expect(session.open?).to be true
+      expect(session.instance_variable_get(:@password)).to eq("guest")
+    end
+  end
 end

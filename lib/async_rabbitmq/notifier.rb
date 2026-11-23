@@ -29,6 +29,7 @@ module AsyncRabbitMQ
       connection.unblocked
       recovery.attempt
       recovery.succeeded
+      recovery.topology_incomplete
       recovery.exhausted
       heartbeat.sent
       channel.open
