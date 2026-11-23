@@ -125,4 +125,38 @@ RSpec.describe "topology recovery", :integration do
       ch2.close
     end
   end
+
+  it "recovers an exchange-to-exchange binding, in dependency order" do
+    isolated_session do |session, _|
+      ch  = session.open_channel
+      tag = SecureRandom.hex(4)
+      src  = ch.topic("test.e2e.src.#{tag}", durable: true)
+      dest = ch.fanout("test.e2e.dest.#{tag}", durable: true)
+      ch.exchange_bind(destination: dest.name, source: src.name, routing_key: "audit.#")
+      q = ch.queue("test.e2e.q.#{tag}", durable: true)
+      q.bind(exchange: dest.name)
+
+      # Wipe the broker-side graph so only the client's replay can rebuild it.
+      # Through the management API, not the client: a client-side delete would
+      # (correctly) cascade through the topology registry and forget the
+      # binding, leaving nothing to replay. The broker losing state behind the
+      # client's back is the case recovery exists for.
+      session.with_channel { |_c| nil } # ensure declarations have settled
+      http_delete("/api/exchanges/#{URI.encode_uri_component(session.vhost)}/#{URI.encode_uri_component(dest.name)}")
+
+      recover!(session, ch)
+
+      # The full route must be back: src -> (e2e binding) -> dest -> q. If the
+      # exchange binding were replayed before both exchanges exist, or not at
+      # all, this publish is silently unroutable.
+      ch.basic_publish("routed through two exchanges", exchange: src.name, routing_key: "audit.login")
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+      body = nil
+      while body.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        _di, _h, body = ch.basic_get(q.name, manual_ack: false)
+        sleep 0.1 if body.nil?
+      end
+      expect(body).to eq("routed through two exchanges")
+    end
+  end
 end

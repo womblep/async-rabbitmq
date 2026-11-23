@@ -72,4 +72,31 @@ RSpec.describe "transactions", :integration do
       expect(ch.closed?).to be true
     end
   end
+
+  it "re-selects tx mode after a connection drop; uncommitted work is gone, the next transaction works" do
+    isolated_session do |session, _|
+      ch = session.open_channel
+      q  = ch.queue("test.tx.recover.#{SecureRandom.hex(4)}", durable: true)
+      ch.tx_select
+
+      # Buffered broker-side, never committed — it dies with the old channel.
+      # That loss is the documented contract ("work that was uncommitted when
+      # the connection dropped is lost, as with any client"); this pins it.
+      ch.basic_publish("uncommitted, lost with the channel", routing_key: q.name)
+
+      recover_connection!(session)
+
+      expect(ch.using_tx?).to be true
+      # Committing on the recovered channel must not raise — and must not
+      # resurrect the pre-drop publish: the new channel's transaction is empty.
+      ch.tx_commit
+      expect(ready_count(session, q.name)).to eq(0)
+
+      # The recovered channel is genuinely transactional, not just flagged so.
+      ch.basic_publish("committed after recovery", routing_key: q.name)
+      expect(ready_count(session, q.name)).to eq(0)   # held until commit
+      ch.tx_commit
+      expect(ready_count(session, q.name)).to eq(1)
+    end
+  end
 end

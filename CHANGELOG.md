@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Tests
+
+- Recovery coverage broadened beyond the clean-FIN disconnect the suite had tested almost
+  exclusively. New toxiproxy helpers (`blackhole` for a silent half-open connection via the
+  timeout toxic, `force_close_connection!` via the management API) and coverage for: the
+  heartbeat watchdog detecting a black-holed peer with no FIN/RST (the 15-minute-hang case the
+  watchdog exists for, previously never the detector in any test); broker-initiated
+  `connection.close` from an operator force-close and from a vhost deleted under a live session
+  (handshake refused on every retry); recovery over TLS (the `rabbitmq_tls` toxiproxy proxy was
+  provisioned but unused); exchange-to-exchange binding recovery; transactional-mode re-selection
+  across a drop; the cluster `:drop` policy handing a lost node's unconfirmed messages to a
+  four-argument `on_node_down`; four flaps in a row leaving exactly one consumer and no
+  duplicates; a publisher parked on the `connection.blocked` gate when the broker dies; a broker
+  that accepts TCP but never answers; `close` racing an outage; reconnecting a session after
+  recovery exhausts its attempts; credentials revoked during an outage abandoning recovery with
+  `reason: :authentication_failed`; and `recovery.succeeded` carrying `topology_complete: true`.
+
 ### Fixed
 
 - A topology replay that stops early is reported instead of being mistaken for success. A hard

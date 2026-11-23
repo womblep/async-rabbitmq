@@ -317,6 +317,59 @@ RSpec.describe AsyncRabbitMQ::Cluster, :integration do
     end
   end
 
+  it "hands the lost node's unconfirmed messages to a four-argument on_node_down" do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+    with_cluster(on_node_down: :drop) do |cluster, _|
+      # Three channels spread one per node; take the one on the proxied node.
+      channels = 3.times.map { cluster.open_channel }
+      node     = proxied(cluster)
+      ch       = node.channels.first
+      expect(ch).not_to be_nil
+
+      q = ch.queue("test.unconfirmed.handoff", durable: true)
+      ch.confirm_select
+
+      # Swallow broker acks on this channel so the publishes stay genuinely
+      # unconfirmed when the node goes down — the state :drop's fourth
+      # argument exists to rescue.
+      original = ch.method(:handle_method)
+      ch.define_singleton_method(:handle_method) do |method|
+        next nil if method.is_a?(AMQ::Protocol::Basic::Ack)
+        original.call(method)
+      end
+
+      3.times { |i| ch.basic_publish("rescue-me-#{i}", routing_key: q.name, headers: { "n" => i }) }
+      wait_until("the publishes to be outstanding") { ch.unconfirmed_messages.size == 3 }
+
+      handed = nil
+      cluster.on_node_down { |_session, _channels, _error, unconfirmed| handed = unconfirmed }
+
+      toxiproxy_rabbitmq.down do
+        wait_until("the four-argument callback") { handed }
+      end
+
+      # The records carry everything needed to republish on another node.
+      expect(handed.size).to eq(3)
+      expect(handed.map(&:payload)).to match_array(%w[rescue-me-0 rescue-me-1 rescue-me-2])
+      expect(handed.map(&:routing_key).uniq).to eq([q.name])
+      expect(handed.map { |m| m.options[:headers]["n"] }).to match_array([0, 1, 2])
+
+      survivor = direct(cluster).first.channels.first || cluster.open_channel
+      handed.each { |m| survivor.basic_publish(m.payload, routing_key: m.routing_key, **m.options) }
+      wait_until("the node to recover") { node.open? }
+      # The originals DID land (only their acks were withheld from the client),
+      # so republishing the handed records duplicates them: 3 + 3. That is the
+      # at-least-once contract of confirms — an unconfirmed message may or may
+      # not have made it, and the only safe reaction is to send it again.
+      expect(ready_count_on(cluster, q.name)).to eq(6)
+      channels # keep the reference alive
+    end
+  end
+
+  def ready_count_on(cluster, name)
+    cluster.with_channel { |c| c.queue(name, passive: true).message_count }
+  end
+
   it "still runs on_node_down when on_connection_lost raises" do
     skip "Toxiproxy not available" unless toxiproxy_available?
     with_cluster(on_node_down: :drop) do |cluster, _|
