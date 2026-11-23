@@ -98,8 +98,16 @@ module AsyncRabbitMQ
         return instantiate(name, username: username, password: password)
       end
 
-      # Preference order: EXTERNAL (strongest, no credentials on wire), PLAIN (universal)
-      %w[EXTERNAL PLAIN].each do |name|
+      # Preference order. EXTERNAL identifies the client by its TLS
+      # certificate and sends no credentials at all, so auto-selecting it for
+      # a caller who supplied a password silently discards that password — and
+      # fails against any broker whose auth_mechanisms happens to advertise
+      # EXTERNAL, despite the credentials being valid. PLAIN therefore wins
+      # whenever a password was given (Bunny and the Java client default to
+      # PLAIN for the same reason); EXTERNAL is picked only when there is no
+      # password to send, or when forced with auth_mechanism: "EXTERNAL".
+      order = password ? %w[PLAIN EXTERNAL] : %w[EXTERNAL PLAIN]
+      order.each do |name|
         if broker_list.include?(name)
           return instantiate(name, username: username, password: password)
         end
