@@ -234,7 +234,40 @@ module AsyncRabbitMQ
         return
       end
       return unless open?
-      rpc(AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0), AMQ::Protocol::Channel::CloseOk)
+      close_attempts = 0
+      begin
+        rpc(AMQ::Protocol::Channel::Close.encode(@channel_id, 200, "Goodbye", 0, 0), AMQ::Protocol::Channel::CloseOk)
+      rescue RpcTimeoutError
+        # No close-ok in time. rpc's ensure has already resynchronised the
+        # channel: it is back :open with its consumers (or dead, its waiters
+        # failed through the resync's own teardown). Nothing is left parked,
+        # but the close did not happen — try it once more on the resynced
+        # channel. A broker that answers neither attempt gets the error raised
+        # to the caller, with the channel alive and usable; raising beats
+        # pretending it closed, and beats force-forgetting an id the broker
+        # still considers open, which a later channel.open would collide with.
+        close_attempts += 1
+        retry if close_attempts == 1 && open?
+        # The resync can also leave the channel in a terminal state. Already
+        # :closed means its teardown ran (waiters failed, id released): close
+        # is done, not failed. :recovering means the connection went while the
+        # resync waited; the user asked for the channel to be gone, so drop it
+        # before the next recovery pass resurrects it, consumers and all.
+        return if closed?
+        unless open?
+          drop!(NotOpenError.new("Channel #{@channel_id} closed during recovery"), reason: :user)
+          return
+        end
+        raise
+      rescue => e
+        # The connection went while we waited (ConnectionError, NotOpenError
+        # out of the resync/park machinery). The session's teardown has
+        # already released this channel's waiters; the user still asked for
+        # the channel to be gone, so give it up rather than let recovery
+        # resurrect it. Already :closed means exactly that — done.
+        drop!(NotOpenError.new("Channel #{@channel_id} closed during recovery"), reason: :user) unless closed?
+        return
+      end
       @state = :closed
       # Confirms outstanding at close will never be resolved now; a fiber in
       # wait_for_confirms or parked on an outstanding slot has to hear that
