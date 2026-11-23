@@ -160,6 +160,51 @@ RSpec.describe "topology recovery", :integration do
     end
   end
 
+  it "republishes an unconfirmed publish to a renamed server-named queue under its NEW name" do
+    # KNOWN BUG (pending until fixed): republish_unconfirmed re-sends the
+    # pre-encoded frames, which carry the OLD routing key in the Basic::Publish
+    # method frame. queue_renamed updates the topology and consumer names but
+    # not @pending_confirms, so after a server-named queue is renamed on
+    # recovery the replayed publish goes to the old name via the default
+    # exchange, is unroutable, and is silently lost despite confirms. The fix
+    # is to rewrite the affected pending entries (re-encode from the kept
+    # PublishContext) when queue_renamed fires. When that lands, this test
+    # passes and RSpec flags the stale `pending`.
+    pending "republish does not follow a server-named queue rename (silent loss under confirms)"
+    isolated_session do |session, _|
+      ch = session.open_channel
+      q  = ch.temporary_queue # server-named: recovery re-declares it under a new name
+      ch.confirm_select
+
+      # Keep the publish unconfirmed across the drop by withholding its ack.
+      original = ch.method(:handle_method)
+      ch.define_singleton_method(:handle_method) do |method|
+        next nil if method.is_a?(AMQ::Protocol::Basic::Ack)
+        original.call(method)
+      end
+
+      ch.basic_publish("follow the rename", routing_key: q.name)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      sleep 0.05 while ch.unconfirmed_messages.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      expect(ch.unconfirmed_messages.size).to eq(1)
+
+      old_name = q.name
+      recover_connection!(session)
+      expect(q.name).not_to eq(old_name) # the broker handed out a new name
+
+      # The replayed publish was addressed to the OLD name via the default
+      # exchange. If the replay does not follow the rename, it is silently
+      # unroutable and the message is lost despite confirms.
+      body = nil
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+      while body.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        _di, _h, body = ch.basic_get(q.name, manual_ack: false)
+        sleep 0.1 if body.nil?
+      end
+      expect(body).to eq("follow the rename")
+    end
+  end
+
   it "reports an incomplete topology replay end to end when a declare times out during recovery" do
     isolated_session do |session, _|
       ch  = session.open_channel

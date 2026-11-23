@@ -27,7 +27,17 @@ All notable changes to this project will be documented in this file.
   declare timing out — asserting `recovery.topology_incomplete` and `topology_complete: false`.
 - Cluster recovery edges: all nodes down at once leaving the cluster neither open nor closed and
   `open_channel` raising until one returns; a node recovered through two outage cycles in a row;
-  and `:drop` keeping a node's durable topology recorded while forgetting its transient queues.
+  `:drop` keeping a node's durable topology recorded while forgetting its transient queues; and a
+  raising `on_node_down` policy contained so the node still recovers and the callback still fires.
+- RST-vs-FIN coverage (new `69_rst_and_teardown`, `reset_peer` / `slow_close` toxics): a peer
+  RESET mid-session recovered and detected as a transport error rather than by the watchdog, a
+  RESET during the handshake failing the connect promptly, and `close` staying bounded against a
+  peer lingering in half-close.
+- Multi-channel recovery: three channels with distinct state (confirm-tracking + prefetch, tx,
+  plain) restored in one pass with no cross-talk.
+- A pending test documents a known bug: `republish_unconfirmed` re-sends the pre-encoded frames,
+  so a publish left unconfirmed when the connection dropped is replayed to a server-named queue's
+  OLD name after recovery renames it — unroutable, silently lost under confirms. Fix pending.
 
 ### Fixed
 

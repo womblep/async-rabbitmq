@@ -388,6 +388,31 @@ RSpec.describe AsyncRabbitMQ::Cluster, :integration do
     end
   end
 
+  it "contains a raising on_node_down policy: the node still recovers and the callback still fires" do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+    policy = ->(_session, _channels, _error) { raise "buggy user policy" }
+    with_cluster(on_node_down: policy) do |cluster, _|
+      node = proxied(cluster)
+      ch   = node.open_channel
+      q    = ch.queue("test.buggy.policy", durable: true)
+      received = []
+      ch.basic_consume(q.name, manual_ack: false) { |_di, _h, body| received << body }
+
+      downs = []
+      cluster.on_node_down { |session, _channels, _error| downs << session }
+
+      toxiproxy_rabbitmq.down do
+        wait_until("on_node_down despite the raising policy") { downs == [node] }
+      end
+
+      # The policy raised and did nothing with the channels, so they behave as
+      # :park — and the exception must not wedge the node's recovery.
+      wait_until("the node to recover") { node.open? && ch.open? }
+      ch.basic_publish("after the buggy policy", routing_key: q.name)
+      wait_until("the parked channel to work again") { received.include?("after the buggy policy") }
+    end
+  end
+
   it "is neither open nor closed when every node is down, and refuses new channels until one returns" do
     with_cluster do |cluster, _|
       cluster.open_channel # prove it works first

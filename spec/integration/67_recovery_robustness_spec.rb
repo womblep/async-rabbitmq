@@ -53,6 +53,66 @@ RSpec.describe "recovery robustness", :integration, :toxiproxy do
     end
   end
 
+  it "recovers three channels with distinct state in one pass, with no cross-talk" do
+    with_proxied_session do |session, _|
+      # ch1: confirm-tracking with prefetch and a manual-ack consumer.
+      ch1 = session.open_channel
+      ch1.basic_qos(prefetch_count: 2)
+      ch1.confirm_select(tracking: true, outstanding_limit: 100)
+      q1 = ch1.queue("test.multi.confirms", durable: true)
+      got1 = []
+      ch1.basic_consume(q1.name, manual_ack: true) do |di, _h, body|
+        got1 << body
+        ch1.basic_ack(di.delivery_tag)
+      end
+
+      # ch2: transactional.
+      ch2 = session.open_channel
+      q2  = ch2.queue("test.multi.tx", durable: true)
+      ch2.tx_select
+
+      # ch3: plain, nothing selected.
+      ch3 = session.open_channel
+      q3  = ch3.queue("test.multi.plain", durable: true)
+
+      succeeded = nil
+      session.on_event("recovery.succeeded") { |_n, p| succeeded ||= p }
+      toxiproxy_rabbitmq.down do
+        wait_until("the drop") { !session.open? }
+      end
+      wait_until("recovery of all three") { succeeded && [ch1, ch2, ch3].all?(&:open?) }
+      expect(succeeded[:channels]).to eq(3)
+
+      # Each channel kept ITS state and only its state.
+      expect(ch1.tracking_confirms?).to be true
+      expect(ch1.outstanding_limit).to eq(100)
+      expect(ch1.instance_variable_get(:@prefetch)).to include(count: 2)
+      expect(ch1.using_tx?).to be false
+      expect(ch2.using_tx?).to be true
+      expect(ch2.tracking_confirms?).to be false
+      expect(ch3.using_tx?).to be false
+      expect(ch3.tracking_confirms?).to be false
+
+      # And each works in its own mode.
+      ch1.basic_publish("to confirms", routing_key: q1.name)
+      ch1.wait_for_confirms(timeout: 10)
+      wait_until("ch1's consumer") { got1.include?("to confirms") }
+
+      ch2.basic_publish("to tx", routing_key: q2.name)
+      ch2.tx_commit
+      _di, _h, tx_body = ch2.basic_get(q2.name, manual_ack: false)
+      expect(tx_body).to eq("to tx")
+
+      ch3.basic_publish("to plain", routing_key: q3.name)
+      plain_body = nil
+      wait_until("ch3's message") do
+        _di, _h, plain_body = ch3.basic_get(q3.name, manual_ack: false)
+        plain_body
+      end
+      expect(plain_body).to eq("to plain")
+    end
+  end
+
   it "survives four flaps in a row with exactly one consumer and no duplicates" do
     with_proxied_session do |session, _|
       ch = session.open_channel
