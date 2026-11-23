@@ -8,7 +8,9 @@ require "spec_helper"
 # watchdog is the component that notices, and how quickly.
 RSpec.describe "heartbeat watchdog on a black-holed connection", :integration, :toxiproxy do
 
-  HEARTBEAT = 2 # negotiated interval; dead after 2xT, checked every T/2
+  # Negotiated interval; dead after 2xT, checked every T/2. A method, not a
+  # constant: a constant here is lexically top-level and would leak suite-wide.
+  def heartbeat_interval = 2
 
   def wait_until(what, timeout: 20)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
@@ -21,7 +23,7 @@ RSpec.describe "heartbeat watchdog on a black-holed connection", :integration, :
   def proxied_session(vhost)
     AsyncRabbitMQ::Session.new(
       host: RABBITMQ_HOST, port: TOXIPROXY_PORT, vhost: vhost,
-      heartbeat: HEARTBEAT, connect_timeout: 1.5,
+      heartbeat: heartbeat_interval, connect_timeout: 1.5,
       recovery_interval: 0.3, recovery_max_interval: 0.5
     )
   end
@@ -40,11 +42,14 @@ RSpec.describe "heartbeat watchdog on a black-holed connection", :integration, :
       lost_at ||= Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    started = nil
     blackhole(toxiproxy_rabbitmq) do
       # No byte flows either way and no close ever arrives. Only the watchdog
       # can see this. Give it up to 5x the interval before declaring failure.
-      wait_until("the watchdog to notice the dead peer", timeout: HEARTBEAT * 5) { lost }
+      # The clock starts here, inside the block: installing the toxics costs
+      # HTTP round-trips that must not count against the detection window.
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      wait_until("the watchdog to notice the dead peer", timeout: heartbeat_interval * 5) { lost }
     end
 
     # Detection must be the heartbeat watchdog, not a transport error — and in
@@ -52,8 +57,8 @@ RSpec.describe "heartbeat watchdog on a black-holed connection", :integration, :
     # ~3xT (threshold + one T/2 check period, plus slack for scheduling).
     expect(lost[:error]).to eq("AsyncRabbitMQ::HeartbeatTimeoutError")
     elapsed = lost_at - started
-    expect(elapsed).to be_between(HEARTBEAT * 1.5, HEARTBEAT * 4),
-                       "detected in #{elapsed.round(2)}s; expected roughly 2x#{HEARTBEAT}s"
+    expect(elapsed).to be_between(heartbeat_interval * 1.5, heartbeat_interval * 4),
+                       "detected in #{elapsed.round(2)}s; expected roughly 2x2s"
 
     # Toxics are gone now: recovery must complete and the session must work.
     wait_until("recovery") { session.open? }
@@ -76,7 +81,7 @@ RSpec.describe "heartbeat watchdog on a black-holed connection", :integration, :
     # Downstream only: the broker hears our heartbeats and is content; we hear
     # nothing at all. The pure read-silence branch has to fire on its own.
     blackhole(toxiproxy_rabbitmq, direction: :downstream) do
-      wait_until("read-silence detection", timeout: HEARTBEAT * 5) { lost }
+      wait_until("read-silence detection", timeout: heartbeat_interval * 5) { lost }
     end
 
     expect(lost[:error]).to eq("AsyncRabbitMQ::HeartbeatTimeoutError")
