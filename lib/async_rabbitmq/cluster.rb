@@ -93,7 +93,7 @@ module AsyncRabbitMQ
       end
 
       @closed      = true
-      @supervisors = {}   # session => the task connecting it, until it is up
+      @supervisor_barrier = nil   # Async::Barrier over the per-node supervisors, per connect
       @wakeups     = {}   # session => Async::Condition, to cut a retry sleep short on close
       @connect_condition = nil   # set while #connect waits for first reports
       @on_node_down = @on_node_up = @on_connection_lost = nil
@@ -134,8 +134,12 @@ module AsyncRabbitMQ
       # loop that brings a node back — without raising anything. Transient so
       # they never hold the reactor open on their own; #close stops them.
       root = Async::Task.current.root
+      # One barrier over all the node supervisors, fresh per connect (a cancelled
+      # barrier refuses new tasks): #close stops the lot in one call instead of
+      # bookkeeping a task per session.
+      barrier = @supervisor_barrier = Async::Barrier.new
       @sessions.each do |session|
-        @supervisors[session] = root.async(transient: true) do
+        barrier.async(parent: root, transient: true) do
           supervise(session) do |error|
             errors[session] = error
             pending -= 1
@@ -189,8 +193,8 @@ module AsyncRabbitMQ
       # The supervisors are parented at the reactor, so dropping the references
       # would not stop them; a node still in its retry backoff would keep
       # reconnecting after the cluster was closed.
-      @supervisors.each_value { |task| task.stop rescue nil }
-      @supervisors.clear
+      @supervisor_barrier&.cancel rescue nil
+      @supervisor_barrier = nil
     end
 
     # Open a channel on the connected node with the fewest channels.

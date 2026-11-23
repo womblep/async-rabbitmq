@@ -1275,7 +1275,9 @@ module AsyncRabbitMQ
     def ensure_worker(queue)
       return if queue.nil? || @workers.size >= @pool_size
 
-      @workers << @session.spawn_background { worker_loop(queue) }
+      # Detached, not in the session barrier: a graceful close lets workers
+      # finish the backlog they hold (see Session#spawn_detached).
+      @workers << @session.spawn_detached { worker_loop(queue) }
     end
 
     # Retire this generation's workers. The sentinel goes on the back of the
@@ -1578,7 +1580,8 @@ module AsyncRabbitMQ
     # Bunny hands cancel notifications to its consumer work pool and the Java
     # client to its work service, for the same reason.
     def notify_app(name, &block)
-      @session.spawn_background { run_callback(name, &block) }
+      # Detached: an application callback is not ours to stop at close.
+      @session.spawn_detached { run_callback(name, &block) }
     end
 
     # The body of #notify_app, for a caller that is already off the dispatch

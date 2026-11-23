@@ -3,6 +3,7 @@ require "async/condition"
 require "async/promise"
 require "async/semaphore"
 require "async/notification"
+require "async/barrier"
 require "socket"
 require "openssl"
 require "uri"
@@ -251,6 +252,7 @@ module AsyncRabbitMQ
       @heartbeat_task    = nil
       @channel0_task     = nil    # drains channel-0 queue; handles connection.blocked/unblocked
       @recovery_task     = nil
+      @background        = nil    # Async::Barrier per connection lifecycle; see spawn_background
       @recovery_wakeup   = Async::Notification.new   # close pokes the retry sleep
       @session_root_task = nil    # top-level task; recovery is spawned here so it
                                   # survives reader-task Cancel propagation
@@ -375,18 +377,50 @@ module AsyncRabbitMQ
     # Internal. Run a long-lived background loop (channel dispatch, heartbeat,
     # channel-0 monitor).
     #
-    # These must not become children of whichever task happened to open the
-    # channel or the session: a short-lived caller that finishes, or is stopped,
-    # would silently take its dispatch loop with it while the channel still
-    # reported itself open. Parent them at the reactor instead, and mark them
-    # transient so they never hold the reactor open by themselves — #close
-    # stops them explicitly.
+    # Infrastructure tasks: the frame reader and writer, heartbeat, channel-0
+    # monitor, recovery loop, channel dispatch loops and cancelled-consumer
+    # reconcilers. These must not become children of whichever task happened to
+    # open the channel or the session: a short-lived caller that finishes, or
+    # is stopped, would silently take its dispatch loop with it while the
+    # channel still reported itself open. Parent them at the reactor instead,
+    # and mark them transient so they never hold the reactor open by
+    # themselves.
+    #
+    # Every one is also registered in a per-lifecycle Async::Barrier, so #close
+    # can stop whatever the orderly teardown missed in one call — the class of
+    # leak the resync dispatch fiber once was — and a test can hold the barrier
+    # and assert nothing outlived the session.
     #
     # @api private
     def spawn_background(&block)
-      # Looked up per call, never memoised: a Session reused across two
+      # Refused after close (or a failed connect) until the next connect resets
+      # the flag. Without this the ||= below would quietly mint a fresh barrier
+      # and resurrect infrastructure on a closed session — every caller is
+      # gated today, but the guarantee belongs here, not in each of them.
+      # Callers tolerate nil (their task handles are all used through &.).
+      if @closed_by_user
+        @logger.debug("Session closed: background task not started")
+        return nil
+      end
+      barrier = (@background ||= Async::Barrier.new)
+      # The barrier only sheds finished tasks in #wait, which nothing calls:
+      # sweep here instead, so a flapping connection's reader/heartbeat churn
+      # does not accumulate a node per task for the life of the session.
+      barrier.tasks.each { |node| barrier.tasks.remove?(node) if node.task.finished? }
+      # Parent looked up per call, never memoised: a Session reused across two
       # separate Sync/Async reactors would otherwise keep spawning onto the
       # first, finished one.
+      barrier.async(parent: Async::Task.current.root, transient: true, &block)
+    end
+
+    # Detached tasks: consumer-handler workers and application callbacks.
+    # Deliberately NOT in the barrier — a graceful #close lets workers finish
+    # the backlog they already hold (the broker considers auto-ack deliveries
+    # settled, so killing them loses messages), and an in-flight on_error/
+    # on_return callback is the application's code to finish, not ours to stop.
+    #
+    # @api private
+    def spawn_detached(&block)
       Async::Task.current.root.async(transient: true, &block)
     end
 
@@ -409,6 +443,13 @@ module AsyncRabbitMQ
       @channel0_task&.cancel rescue nil
       @recovery_task&.cancel rescue nil
       @frame_io&.stop rescue nil
+      # The catch-all, after the orderly teardown above: cancel every
+      # infrastructure task this lifecycle spawned — dispatch loops, reconcile
+      # loops, anything the targeted cancels missed. A cancelled barrier refuses
+      # new tasks, so it is dropped; the next connect starts a fresh one.
+      # Detached workers draining a backlog are deliberately not in it.
+      @background&.cancel rescue nil
+      @background = nil
       @state = :closed
       instrument("connection.closed") { { reason: :user, host: @host, port: @port } }
     end
@@ -740,6 +781,10 @@ module AsyncRabbitMQ
       @channel0_task&.cancel rescue nil
       @frame_io&.stop rescue nil
       @frame_io = nil
+      # Cancel whatever the half-made attempt spawned (reader/writer at least);
+      # the next connect starts a fresh barrier.
+      @background&.cancel rescue nil
+      @background = nil
       @state = :closed
     end
 

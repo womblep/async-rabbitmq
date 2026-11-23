@@ -165,6 +165,16 @@ All notable changes to this project will be documented in this file.
   retry sleep is poked by an `Async::Notification`, its purpose-built primitive. Raises the
   `async` requirement to `~> 2.29`, where `Async::Promise` appeared (alongside thread-safe
   `Condition`/`Queue`); `Async::Variable` was skipped as deprecated.
+- A session's infrastructure tasks - frame reader and writer, heartbeat, channel-0 monitor,
+  recovery loop, channel dispatch loops and cancelled-consumer reconcilers - are owned by a
+  per-connection-lifecycle `Async::Barrier`. `close`, and the cleanup after a failed `connect`,
+  end by cancelling it, so anything the targeted teardown missed is stopped too: the leaked
+  dispatch fiber a resync once left behind is now impossible by construction rather than fixed
+  case by case. Spawning is refused once the session is closed, so nothing can quietly start a
+  fresh barrier on a closed session. Consumer workers and application callbacks stay outside it
+  on purpose: a graceful close still lets workers finish the backlog they hold, and a callback
+  in flight is the application's to finish. `Cluster`'s per-node supervisors share one barrier
+  the same way.
 
 ## [0.8.1] - 2026-11-15
 
