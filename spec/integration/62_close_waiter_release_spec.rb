@@ -56,7 +56,14 @@ RSpec.describe "Waiter release on channel close", :integration do
       Async::Task.current.with_timeout(10) { waiter.wait }
       expect(error).to be_a(AsyncRabbitMQ::NotOpenError)
     ensure
-      ch.queue_delete("test.close.waiters") rescue nil
+      # ch is closed by the test; delete the durable queue from a fresh channel.
+      begin
+        cleanup = session.open_channel
+        cleanup.queue_delete("test.close.waiters")
+        cleanup.close
+      rescue StandardError
+        nil
+      end
     end
   end
 

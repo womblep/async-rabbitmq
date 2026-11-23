@@ -120,10 +120,12 @@ module AsyncRabbitMQ
       # The connection was stopped while this write was parked on (or racing)
       # the queue. Writing to a stopped connection has always been a silent
       # no-op — the bytes were enqueued to a queue nobody would ever drain —
-      # so a write that loses that race stays one: a publish under confirms is
-      # already recorded for replay on the recovered channel, and a publish
-      # without confirms is fire-and-forget by contract. The point of the
-      # close is to get here at all instead of parking forever.
+      # so a write that loses that race stays one. Returning rather than
+      # raising is load-bearing: a confirm-mode publisher reserves its confirm
+      # tag AFTER this call returns, and that reservation is what gets the
+      # message replayed on the recovered channel. A publish without confirms
+      # is fire-and-forget by contract. The point of the close is to get here
+      # at all instead of parking forever.
       @logger.debug("FrameIO: write after stop discarded (#{data.bytesize} bytes)")
       nil
     end

@@ -580,6 +580,10 @@ module AsyncRabbitMQ
       deadline = timeout && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout)
 
       until @pending_confirms.empty?
+        # A closed channel will never resolve them. The teardown paths signal
+        # the waiters parked at that moment; a waiter arriving afterwards has
+        # to hear it here, or it parks on a condition nothing will ever signal.
+        raise NotOpenError, "Channel #{@channel_id} is not open" if closed?
         # Lazily (re)created: interrupt_wait! clears it on connection loss and a
         # caller may arrive before reopen_after_recovery has re-selected confirms.
         @confirm_condition ||= Async::Condition.new

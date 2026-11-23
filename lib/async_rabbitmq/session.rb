@@ -244,9 +244,15 @@ module AsyncRabbitMQ
       # every :recovering channel's parked fibers with nothing left that could
       # ever release them. Close the session first to connect it afresh.
       if @connecting || @recovery_in_progress || !closed?
-        raise NotOpenError, "Session is #{@connecting ? 'connecting' : 'recovering'}; close it first to force a fresh connection"
+        doing = if @connecting   then "connecting"
+                elsif !closed?   then @state.to_s   # :recovering, :closing
+                else                  "recovering"  # recovery task still winding down
+                end
+        hint = @connecting ? "wait for the other connect to finish" : "close it first to force a fresh connection"
+        raise NotOpenError, "Session is #{doing}; #{hint}"
       end
       @connecting        = true
+      attempt_started    = true    # read by the ensure below; nil if a guard raised
       @closed_by_user    = false   # a previous failed connect must not disable recovery
       @session_root_task = Async::Task.current
 
@@ -314,6 +320,16 @@ module AsyncRabbitMQ
       else
         raise ConnectionTimeoutError, "Could not connect to any host (tried #{tried}) — #{last_error&.message}"
       end
+    ensure
+      # An exception the rescue clauses above never see can leave here with the
+      # attempt half-made: the caller's own with_timeout, its task being
+      # stopped (both arrive as non-StandardErrors at whatever yield point the
+      # handshake was parked on), or an error class outside the rescued list.
+      # @connecting stuck true would make the guard refuse every future
+      # connect — with close a no-op, permanently. Tear the half-made attempt
+      # down. attempt_started distinguishes our own flag from another fiber's:
+      # a guard raise above exits with it nil and must not stomp theirs.
+      cleanup_after_failed_connect if attempt_started && @connecting
     end
 
     def open?
@@ -744,7 +760,11 @@ module AsyncRabbitMQ
         start.mechanisms,
         preferred: @auth_mechanism,
         username: @username,
-        password: @password
+        password: @password,
+        # Certificate material means this connection can be identified by its
+        # cert, and the password is usually the untouched guest default: let
+        # EXTERNAL outrank PLAIN then, and only then.
+        prefer_external: !(@tls_cert || @tls_context).nil?
       )
       send_connection_start_ok(sasl)
 

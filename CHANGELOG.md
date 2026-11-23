@@ -29,9 +29,11 @@ All notable changes to this project will be documented in this file.
 - SASL negotiation no longer auto-selects EXTERNAL over PLAIN. EXTERNAL authenticates by TLS
   certificate and sends no credentials, so picking it for a caller who supplied a password
   silently discarded that password - refused credentials against any broker whose
-  `auth_mechanisms` advertises EXTERNAL, despite the password being valid. PLAIN now wins
-  whenever a password is given, as in Bunny and the Java client; EXTERNAL is chosen when there
-  is no password, or when forced with `auth_mechanism: "EXTERNAL"`.
+  `auth_mechanisms` advertises EXTERNAL, despite the password being valid. PLAIN now wins when
+  a password is given and no client certificate is configured, as in Bunny and the Java client.
+  Certificate material (`tls_cert:` / `tls_context:`) keeps EXTERNAL first - the certificate is
+  the identity the caller configured on purpose, where the password is usually the untouched
+  guest default - and `auth_mechanism:` still forces either outright.
 - CI runs the unit specs, which were never exercised there, and the job times out after 30
   minutes instead of holding a runner for six hours when a toxiproxy spec wedges.
 
