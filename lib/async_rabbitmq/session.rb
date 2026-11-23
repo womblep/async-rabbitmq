@@ -5,6 +5,7 @@ require "async/semaphore"
 require "async/notification"
 require "async/barrier"
 require "socket"
+require "io/endpoint/host_endpoint"
 require "openssl"
 require "uri"
 require "amq/uri"
@@ -91,7 +92,7 @@ module AsyncRabbitMQ
 
       opts = { tls: !!parsed[:ssl], port: parsed[:port] }
       # A URI carries an IPv6 literal in brackets and Ruby's URI keeps them:
-      # "amqp://[::1]" parses to host "[::1]". TCPSocket wants the bare "::1".
+      # "amqp://[::1]" parses to host "[::1]". The socket layer wants the bare "::1".
       opts[:host]     = parsed[:host].delete_prefix("[").delete_suffix("]") if parsed[:host]
       opts[:username] = parsed[:user] if parsed[:user]
       opts[:password] = parsed[:pass] if parsed[:pass]
@@ -788,32 +789,62 @@ module AsyncRabbitMQ
       @state = :closed
     end
 
+    # Connect one host through io-endpoint, the connection layer the rest of
+    # the socketry stack (async-http, falcon) is built on. It resolves the
+    # host and tries the addresses in order, IPv6 included. They share one
+    # connect_timeout (the caller's with_timeout around this call and the
+    # handshake after it), so an address that silently drops packets can use
+    # up the budget before the next is tried — as TCPSocket.new under a fiber
+    # scheduler did before this, since it skips Happy Eyeballs there too.
+    #
+    # Sockets are created with TCP_NODELAY, as messaging clients
+    # conventionally are: an ack or a confirm should not sit behind Nagle's
+    # algorithm waiting on a delayed ACK.
     def open_socket(target_host = @host, target_port = @port)
-      if @tls
-        require "openssl"
-        ctx = @tls_context || build_tls_context
-        raw = TCPSocket.new(target_host, target_port)
-        # SSLSocket does not close the socket it wraps when the handshake fails,
-        # and a failed connect has no frame_io to stop, so without this a broker
-        # with a bad certificate leaks one descriptor per recovery attempt.
-        handshaked = false
-        begin
-          ssl = OpenSSL::SSL::SSLSocket.new(raw, ctx)
-          # Without this, closing the SSL socket sends close_notify but leaves
-          # the TCP socket open until the GC finalises it, so every amqps
-          # reconnect strands a connection (Amazon MQ, for example).
-          ssl.sync_close = true
-          ssl.hostname = target_host
-          ssl.connect
-          handshaked = true
-          apply_socket_timeouts(raw)
-          ssl
-        ensure
-          raw.close unless handshaked
-        end
-      else
-        TCPSocket.new(target_host, target_port).tap { |sock| apply_socket_timeouts(sock) }
+      tcp = IO::Endpoint.tcp(target_host, target_port)
+      # Built before any socket exists, so a TLS configuration error (a bad
+      # certificate path, say) fails without opening anything to leak.
+      tls = tls_endpoint(tcp) if @tls
+      # io-endpoint closes the socket on ANY exception during the TCP connect,
+      # cancellation included.
+      socket = tcp.connect
+      socket = tls_handshake(tls, socket) if tls
+      # On the TCP socket itself; an SSL socket exposes it through #to_io.
+      apply_socket_timeouts(socket.respond_to?(:to_io) ? socket.to_io : socket)
+      socket
+    end
+
+    def tls_endpoint(tcp)
+      require "io/endpoint/ssl_endpoint"
+      # The SSL endpoint takes the hostname from the TCP endpoint, for SNI and
+      # certificate verification alike.
+      IO::Endpoint::SSLEndpoint.new(tcp, ssl_context: @tls_context || build_tls_context)
+    end
+
+    # The TLS handshake, run here rather than through SSLEndpoint#connect.
+    # That method closes the socket on a failed handshake with a bare
+    # `rescue`, which catches StandardError only: an Async::Cancel or
+    # Async::Stop arriving mid-handshake — #close cancelling a recovery that
+    # is retrying an amqps broker, or the caller's task being stopped — skips
+    # it, and with no frame_io yet there is nothing else to close the TCP
+    # socket until GC. The endpoint's pieces are still used: make_socket sets
+    # sync_close (or closing the TLS socket leaves the TCP one open, one
+    # leaked connection per amqps reconnect), and hostname drives SNI and
+    # certificate verification.
+    def tls_handshake(endpoint, tcp_socket)
+      socket = tcp_socket
+      socket = endpoint.make_socket(tcp_socket)
+      if (name = endpoint.hostname)
+        socket.hostname = name
       end
+      socket.connect
+      socket
+    rescue Exception # rubocop:disable Lint/RescueException
+      # Any exit but success, cancellation included. Closing the TLS socket
+      # closes the TCP one through sync_close; if make_socket itself raised,
+      # `socket` is still the TCP socket.
+      socket&.close rescue nil
+      raise
     end
 
     # Bound how long the kernel will retransmit unacknowledged data before it

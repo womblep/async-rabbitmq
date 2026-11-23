@@ -105,10 +105,12 @@ RSpec.describe "Session#connect broker-refused handshake", :integration do
   # OpenSSL::SSL::SSLSocket does not close the socket it wraps when the
   # handshake fails, and a failed connect has no frame_io to stop, so a broker
   # with an expired or mismatched certificate would leak one descriptor per
-  # attempt — once every recovery interval, forever.
+  # attempt — once every recovery interval, forever. io-endpoint's SSL
+  # endpoint owns that close now; this pins that it still happens. Its
+  # sockets are made with ::Socket.new, so that is where the spy sits.
   it "closes the underlying socket when the TLS handshake fails" do
     raw_sockets = []
-    allow(TCPSocket).to receive(:new).and_wrap_original do |original, *args|
+    allow(Socket).to receive(:new).and_wrap_original do |original, *args|
       original.call(*args).tap { |socket| raw_sockets << socket }
     end
 
@@ -119,7 +121,47 @@ RSpec.describe "Session#connect broker-refused handshake", :integration do
       expect { session.connect }.to raise_error(AsyncRabbitMQ::Error)
     end
 
-    expect(raw_sockets.size).to eq(3)
+    # At least one per attempt: the endpoint makes a socket for each address
+    # the host resolves to, so the exact count depends on the resolver.
+    expect(raw_sockets.size).to be >= 3
+    expect(raw_sockets).to all(be_closed)
+  end
+
+  # The handshake can also end by cancellation: #close stopping a recovery
+  # that is mid-handshake with an amqps broker, or the caller's own task being
+  # stopped. Async::Cancel/Stop are not StandardErrors, so a close in a bare
+  # `rescue` (io-endpoint's SSLEndpoint#connect) never runs for them.
+  it "closes the underlying socket when a TLS handshake is cancelled", :toxiproxy do
+    skip "Toxiproxy not available" unless toxiproxy_available?
+
+    raw_sockets = []
+    # Both directions: with only downstream black-holed, the ClientHello still
+    # reaches the broker's plaintext port, which closes the connection, and
+    # the handshake fails with an ordinary SSLError before any cancel lands.
+    blackhole(toxiproxy_rabbitmq) do
+      # Spy only inside the block, after the toxics are applied, so nothing
+      # but this connect's own sockets is counted.
+      allow(Socket).to receive(:new).and_wrap_original do |original, *args|
+        original.call(*args).tap { |socket| raw_sockets << socket }
+      end
+
+      # TCP connects to the proxy listener; nothing gets through either way
+      # after that, so the handshake hangs until cancelled.
+      session = AsyncRabbitMQ::Session.new(host: RABBITMQ_HOST, port: TOXIPROXY_PORT, tls: true,
+                                           connect_timeout: 30, logger: Logger.new(nil))
+      connecting = Async::Task.current.async { session.connect }
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      sleep 0.05 while raw_sockets.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      sleep 0.3 # well into the handshake
+      expect(raw_sockets).not_to be_empty
+      # Still connecting: the cancel below must land mid-handshake, or this
+      # test would pass on the ordinary failure path without testing anything.
+      expect(connecting).to be_running
+
+      connecting.stop
+      connecting.wait rescue nil
+    end
+
     expect(raw_sockets).to all(be_closed)
   end
 end

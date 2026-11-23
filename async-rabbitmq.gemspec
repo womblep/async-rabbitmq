@@ -31,6 +31,9 @@ Gem::Specification.new do |spec|
   # introduced Queue#close, which FrameIO#stop relies on.
   spec.add_dependency "async",        "~> 2.29"
   spec.add_dependency "amq-protocol", "~> 2.9"
+  # Connection establishment (TCP, TLS, address resolution) - the same layer
+  # async-http and the rest of the socketry stack build on.
+  spec.add_dependency "io-endpoint",  "~> 0.19"
 
   spec.add_development_dependency "rspec",      "~> 3.13"
   spec.add_development_dependency "simplecov",  "~> 0.22"

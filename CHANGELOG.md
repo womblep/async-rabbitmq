@@ -175,6 +175,21 @@ All notable changes to this project will be documented in this file.
   on purpose: a graceful close still lets workers finish the backlog they hold, and a callback
   in flight is the application's to finish. `Cluster`'s per-node supervisors share one barrier
   the same way.
+- Connections are opened through `io-endpoint`, the connection layer `async-http` and the rest of
+  the socketry stack use, replacing the hand-built `TCPSocket` + `OpenSSL::SSL::SSLSocket` code.
+  The endpoint resolves the host and tries its addresses in order, within the one
+  `connect_timeout` (as `TCPSocket.new` did under a fiber scheduler, where it skips Happy
+  Eyeballs). For TLS, its socket wrapper sets `sync_close` (without it, closing the TLS socket
+  left the TCP socket open until GC, one leaked connection per `amqps` reconnect) and its
+  hostname drives SNI and certificate verification. The handshake itself still runs in this
+  client, because the endpoint's own `connect` only closes the socket on a `StandardError`: a
+  handshake cut short by cancellation (`close` stopping a recovery mid-handshake) would leak
+  the TCP socket. Here any exit but success closes it. `TCP_USER_TIMEOUT` is still applied to
+  the TCP socket underneath, TLS included. New runtime dependency: `io-endpoint ~> 0.19`.
+- Sockets are opened with `TCP_NODELAY`, io-endpoint's default and the usual choice for messaging
+  clients (the RabbitMQ Java client sets it too): an ack or a publisher confirm is a few bytes
+  and should go out at once, not wait on Nagle's algorithm for a delayed ACK. Previously Nagle
+  was left on.
 
 ## [0.8.1] - 2026-11-15
 
