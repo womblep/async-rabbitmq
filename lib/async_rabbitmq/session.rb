@@ -1,6 +1,8 @@
 require "async"
 require "async/condition"
+require "async/promise"
 require "async/semaphore"
+require "async/notification"
 require "socket"
 require "openssl"
 require "uri"
@@ -249,12 +251,12 @@ module AsyncRabbitMQ
       @heartbeat_task    = nil
       @channel0_task     = nil    # drains channel-0 queue; handles connection.blocked/unblocked
       @recovery_task     = nil
-      @recovery_wakeup   = nil    # Async::Condition to interrupt the retry sleep
+      @recovery_wakeup   = Async::Notification.new   # close pokes the retry sleep
       @session_root_task = nil    # top-level task; recovery is spawned here so it
                                   # survives reader-task Cancel propagation
       @on_blocked              = nil
       @on_unblocked            = nil
-      @update_secret_condition = nil
+      @update_secret_promise   = nil
       @on_recovery_attempt     = nil
       @on_recovery             = nil
       @on_recovery_exhausted   = nil
@@ -392,7 +394,7 @@ module AsyncRabbitMQ
     def close
       return if closed?
       @closed_by_user = true
-      @recovery_wakeup&.signal rescue nil
+      @recovery_wakeup.signal rescue nil
       # Unblock any fibers waiting on channel replies (e.g. wait_for inside
       # reopen_after_recovery) so that @recovery_task.cancel below can actually
       # terminate the task rather than leaving it stuck on an Async::Condition.
@@ -447,7 +449,7 @@ module AsyncRabbitMQ
     def update_secret(new_secret, reason = "secret update")
       raise NotOpenError, "Session is not open" unless open?
 
-      # One at a time. Two concurrent calls clobbered @update_secret_condition:
+      # One at a time. Two concurrent calls clobbered the shared reply slot:
       # the first caller's ensure nilled the second's condition, both replies
       # were dropped, both calls timed out — and @password was never updated
       # although the broker had accepted the new secret, so the next reconnect
@@ -456,9 +458,12 @@ module AsyncRabbitMQ
         raise NotOpenError, "Session is not open" unless open? # re-check after parking
 
         begin
-          cond = @update_secret_condition = Async::Condition.new
+          # A promise, registered before the write: write_frame can yield on a
+          # full write queue, and a reply resolved in that gap latches instead
+          # of being dropped (a Condition signalled with no waiter is a no-op).
+          promise = @update_secret_promise = Async::Promise.new
           @frame_io.write_frame(AMQ::Protocol::Connection::UpdateSecret.encode(new_secret, reason).encode)
-          result = Async::Task.current.with_timeout(@rpc_timeout || RPC_TIMEOUT) { cond.wait }
+          result = Async::Task.current.with_timeout(@rpc_timeout || RPC_TIMEOUT) { promise.wait }
           raise result if result.is_a?(Exception)
 
           @password = new_secret
@@ -474,7 +479,7 @@ module AsyncRabbitMQ
                        "the new secret will be used for reconnects, its acceptance unconfirmed")
           raise RpcTimeoutError, "No reply to connection.update-secret within #{@rpc_timeout || RPC_TIMEOUT}s"
         ensure
-          @update_secret_condition = nil
+          @update_secret_promise = nil
         end
       end
     end
@@ -677,7 +682,7 @@ module AsyncRabbitMQ
       # on the channels park until they are reopened after reconnect.
       conn_error = ConnectionError.new(code: 0, text: "Connection lost: #{error.message}")
       @channels.values.each { |ch| ch.mark_recovering!(conn_error) rescue nil }
-      @update_secret_condition&.signal(conn_error)
+      @update_secret_promise&.resolve(conn_error)
       # Tell the owner now, while the channels are still in the table: a
       # Cluster in :drop mode gives them up here, before they are reopened.
       connection_lost(error)
@@ -1048,12 +1053,14 @@ module AsyncRabbitMQ
         jitter    = delay * RECOVERY_JITTER * (rand * 2 - 1)
         wait_secs = delay + jitter
 
-        # Sleep until the delay expires OR session.close signals @recovery_wakeup.
-        @recovery_wakeup = Async::Condition.new
+        # Sleep until the delay expires OR session.close signals the wakeup.
+        # An Async::Notification — the purpose-built "poke a sleeping loop"
+        # primitive — created once in the constructor; a signal with nobody
+        # sleeping is a no-op, and the loop's own @closed_by_user check covers
+        # that case on its next pass.
         Async::Task.current.with_timeout(wait_secs) do
           @recovery_wakeup.wait
-        end rescue nil   # TimeoutError is normal; Condition#signal raises nothing
-        @recovery_wakeup = nil
+        end rescue nil   # TimeoutError is normal
 
         break if @closed_by_user
 
@@ -1279,11 +1286,11 @@ module AsyncRabbitMQ
           instrument("connection.unblocked") { {} }
           @on_unblocked&.call
         when AMQ::Protocol::Connection::UpdateSecretOk
-          @update_secret_condition&.signal(method)
+          @update_secret_promise&.resolve(method)
         when AMQ::Protocol::Connection::Close
           # FrameIO has already answered with close-ok and triggered recovery;
           # fail a pending update_secret with the broker's reason.
-          @update_secret_condition&.signal(ConnectionError.new(code: method.reply_code, text: method.reply_text))
+          @update_secret_promise&.resolve(ConnectionError.new(code: method.reply_code, text: method.reply_text))
         end
         # Other channel-0 methods during normal operation are intentionally
         # ignored; the handshake uses wait_channel0_method, not this loop.
