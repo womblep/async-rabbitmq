@@ -35,12 +35,32 @@ All notable changes to this project will be documented in this file.
   peer lingering in half-close.
 - Multi-channel recovery: three channels with distinct state (confirm-tracking + prefetch, tx,
   plain) restored in one pass with no cross-talk.
-- A pending test documents a known bug: `republish_unconfirmed` re-sends the pre-encoded frames,
-  so a publish left unconfirmed when the connection dropped is replayed to a server-named queue's
-  OLD name after recovery renames it — unroutable, silently lost under confirms. Fix pending.
+- The server-named-rename replay test (added pending in this cycle when it exposed the bug) now
+  runs active against the fix below.
 
 ### Fixed
 
+- An unconfirmed publish follows a server-named queue's rename into the replay. Recovery
+  re-declares a server-named queue under a new broker-generated name and renamed the registry,
+  the bindings and the consumers - but not the pending confirms, whose kept pre-encoded frames
+  carry the routing key inside the Basic::Publish method frame. A publish left unconfirmed at
+  the drop was therefore replayed to the OLD name through the default exchange: unroutable,
+  silently dropped, the exact loss confirms exist to prevent - and the RPC-reply pattern
+  (publish to your own server-named queue) hits it on every recovery that renames. The affected
+  entries are now rewritten under the new name before the replay runs. `reply_to` follows the
+  rename too, whatever the exchange - the RPC request pattern names the publisher's own
+  server-named queue there, and a replayed request carrying the old name sends the responder's
+  answer to a dead queue. Routing keys on named exchanges are left alone: there the key is the
+  caller's semantics, and the renamed binding already carries it to the right queue.
+- The replay re-encodes each message from the payload and context the entry already keeps,
+  rather than re-sending the bytes recorded at publish time, so it also splits frames at the
+  frame_max the reconnect actually negotiated. Replaying stale frames encoded for a larger
+  frame_max (a failover to a differently configured node) was a 501 FRAME_ERROR that killed each
+  fresh connection in turn. New publishes after such a failover use the renegotiated size too.
+- The payload kept with a pending confirm is snapshotted at publish time. It was held by
+  reference, so a caller that reused or mutated its buffer after publishing could corrupt what a
+  replay re-encoded or what `unconfirmed_messages` handed to a `Cluster` `on_node_down` callback.
+  Frozen strings skip the copy.
 - A topology replay that stops early is reported instead of being mistaken for success. A hard
   failure mid-replay - an RPC timeout from a broker that stopped answering, where each remaining
   entity would cost its own full timeout - still stops the replay, but now emits a

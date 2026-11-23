@@ -938,6 +938,42 @@ module AsyncRabbitMQ
       @consumers.each_value { |c| c[:queue_name] = new_name if c[:queue_name] == old_name }
     end
 
+    # Internal: a server-named queue came back under a new name — rewrite the
+    # unconfirmed publishes that refer to it, in two places. The routing key,
+    # when the publish went through the default exchange, whose routing key IS
+    # the queue name: replayed unchanged it addresses a queue that no longer
+    # exists, unroutable and silently dropped — the loss confirms exist to
+    # prevent. And reply_to, whatever the exchange: in the RPC pattern the
+    # request names the publisher's own server-named queue there, and a replay
+    # carrying the old name sends the responder's answer to a dead queue. Only
+    # those two are structurally tied to the queue name; a routing key on a
+    # named exchange is the caller's semantics, and the renamed binding already
+    # carries it to the right queue. The rewrite only updates the kept context:
+    # republish_unconfirmed re-encodes the frames from it.
+    def rename_unconfirmed_queue(old_name, new_name)
+      @pending_confirms.each_value do |entry|
+        ctx = entry[2]
+        next unless ctx
+
+        routing  = ctx.exchange.to_s.empty? && ctx.routing_key == old_name
+        reply_to = ctx.options[:reply_to] == old_name ||
+                   (ctx.options[:properties].is_a?(Hash) && ctx.options[:properties][:reply_to] == old_name)
+        next unless routing || reply_to
+
+        opts = ctx.options
+        if reply_to
+          opts = opts.dup
+          opts[:reply_to] = new_name if opts[:reply_to] == old_name
+          if opts[:properties].is_a?(Hash) && opts[:properties][:reply_to] == old_name
+            opts[:properties] = opts[:properties].merge(reply_to: new_name)
+          end
+        end
+        # Contexts are frozen and a batch shares one across its entries, so
+        # replace rather than mutate. publish_context re-copies the options.
+        entry[2] = publish_context(ctx.exchange, routing ? new_name : ctx.routing_key, opts)
+      end
+    end
+
     # The consumers on this channel no longer exist on the broker (the channel
     # is closed, by us or by it). @consumers itself is kept so that
     # reopen(recover_consumers: true) can register them again, which records
@@ -977,6 +1013,12 @@ module AsyncRabbitMQ
     # until the topology has been replayed (see #finish_recovery!).
     def reopen_on(frame_io, state: :open)
       @frame_io = frame_io
+      # The reconnect may have negotiated a different frame_max (a failover to
+      # a differently configured node). Splitting frames at the old size would
+      # hand the broker over-sized body frames — a 501 that kills the fresh
+      # connection — so every encode from here on, replays included, uses the
+      # live value.
+      @frame_max = @session.frame_max if @session.respond_to?(:frame_max)
       # The broker restarts delivery tags at 1 on a reopened channel, so any
       # tag handed out before this point is now stale.
       @delivery_generation += 1
@@ -1965,6 +2007,13 @@ module AsyncRabbitMQ
     # until the broker acks it, so it can be re-published after a reconnect.
     def reserve_confirm_tag(bytes, payload = nil, context = nil)
       @delivery_tag += 1
+      # Snapshot the payload: the caller may reuse or mutate its string after
+      # publishing (publish_context copies headers for the same reason), and
+      # everything that reads this entry later — a replay re-encoded after a
+      # queue rename or a frame_max change, #unconfirmed_messages handed out on
+      # a node failure — must see the bytes as they were sent, not as the
+      # buffer looks now. Frozen strings skip the copy.
+      payload = payload.dup if payload.is_a?(String) && !payload.frozen?
       @pending_confirms[@delivery_tag] = [bytes, payload, context]
       # The encoded frames carry this channel's id, so they can only be replayed
       # on this channel. Keep the payload and where it was going alongside, so a
@@ -2022,9 +2071,20 @@ module AsyncRabbitMQ
       @delivery_tag      = 0
       @confirm_condition ||= Async::Condition.new   # keep one an early waiter created
       pending.each do |entry|
-        @frame_io.write_frame(entry[0], publish: true)
+        # Re-encode from the kept payload and context instead of replaying the
+        # bytes recorded at publish time: the context may have been rewritten
+        # by a server-named queue rename, and the reconnect may have negotiated
+        # a different frame_max, so stale frames could be mis-addressed or
+        # over-sized. This is the rare recovery path; the per-publish hot path
+        # still records the pre-encoded bytes untouched.
+        bytes = if (ctx = entry[2])
+          encode_publish(entry[1], exchange: ctx.exchange, routing_key: ctx.routing_key, **ctx.options)
+        else
+          entry[0]
+        end
+        @frame_io.write_frame(bytes, publish: true)
         @delivery_tag += 1
-        @pending_confirms[@delivery_tag] = entry
+        @pending_confirms[@delivery_tag] = [bytes, entry[1], entry[2]]
       end
       @logger.info("Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
     end

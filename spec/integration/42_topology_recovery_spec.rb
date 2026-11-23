@@ -161,16 +161,11 @@ RSpec.describe "topology recovery", :integration do
   end
 
   it "republishes an unconfirmed publish to a renamed server-named queue under its NEW name" do
-    # KNOWN BUG (pending until fixed): republish_unconfirmed re-sends the
-    # pre-encoded frames, which carry the OLD routing key in the Basic::Publish
-    # method frame. queue_renamed updates the topology and consumer names but
-    # not @pending_confirms, so after a server-named queue is renamed on
-    # recovery the replayed publish goes to the old name via the default
-    # exchange, is unroutable, and is silently lost despite confirms. The fix
-    # is to rewrite the affected pending entries (re-encode from the kept
-    # PublishContext) when queue_renamed fires. When that lands, this test
-    # passes and RSpec flags the stale `pending`.
-    pending "republish does not follow a server-named queue rename (silent loss under confirms)"
+    # The pending entries keep pre-encoded frames with the routing key baked
+    # in; queue_renamed rewrites the ones addressed to the renamed queue via
+    # the default exchange before finish_recovery! replays them. Without that
+    # the replay went to the old name — unroutable, silently lost under
+    # confirms, in exactly the RPC-reply pattern server-named queues serve.
     isolated_session do |session, _|
       ch = session.open_channel
       q  = ch.temporary_queue # server-named: recovery re-declares it under a new name
@@ -183,7 +178,10 @@ RSpec.describe "topology recovery", :integration do
         original.call(method)
       end
 
-      ch.basic_publish("follow the rename", routing_key: q.name)
+      # reply_to names the same server-named queue, as the RPC request pattern
+      # does: it must follow the rename too, or the responder answers into a
+      # queue that no longer exists.
+      ch.basic_publish("follow the rename", routing_key: q.name, reply_to: q.name)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
       sleep 0.05 while ch.unconfirmed_messages.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
       expect(ch.unconfirmed_messages.size).to eq(1)
@@ -196,12 +194,14 @@ RSpec.describe "topology recovery", :integration do
       # exchange. If the replay does not follow the rename, it is silently
       # unroutable and the message is lost despite confirms.
       body = nil
+      header = nil
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
       while body.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        _di, _h, body = ch.basic_get(q.name, manual_ack: false)
+        _di, header, body = ch.basic_get(q.name, manual_ack: false)
         sleep 0.1 if body.nil?
       end
       expect(body).to eq("follow the rename")
+      expect(header.properties[:reply_to]).to eq(q.name) # the NEW name
     end
   end
 
