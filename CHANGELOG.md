@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- A publisher parked on a full write queue is released when the connection stops. It was woken
+  only by the writer draining the queue, and the writer had just been cancelled - so it stayed
+  parked forever, holding the channel's publish semaphore, and every publish on that channel
+  after recovery queued behind it. A full write queue at disconnect is the likely case: TCP
+  backpressure is how a partition presents itself to a writer. The queue is closed on stop; a
+  write that loses the race is discarded, which is what already happened to every write that
+  reached the dead queue. Requires async >= 2.24 (where `Async::Queue#close` appeared).
+- A channel close releases every parked waiter, whichever way the close came. The broker
+  closing the channel (a 404 publish under confirms is the canonical case) and the user calling
+  `close` each woke the RPC caller but not a fiber in `wait_for_confirms` - which, with no
+  timeout given (the default), parked forever on an ack that can never arrive - nor a publisher
+  parked on an outstanding-confirm slot, which stalled `rpc_timeout` seconds holding the publish
+  semaphore. All teardown paths now release all waiters, and `wait_for_confirms` raises the
+  error it was handed - the channel's actual fate - rather than a generic disconnect message.
+- `connect` refuses to run while the session is recovering or already connecting. A connect
+  racing the recovery loop fought it for the connection, and when that connect failed - the
+  broker being down is why recovery was running - its cleanup cancelled the recovery task and
+  marked the session closed, stranding every recovering channel's parked fibers permanently:
+  `close` was by then a no-op and a later `connect` never reopens recovering channels. Close the
+  session first to force a fresh connection.
+- SASL negotiation no longer auto-selects EXTERNAL over PLAIN. EXTERNAL authenticates by TLS
+  certificate and sends no credentials, so picking it for a caller who supplied a password
+  silently discarded that password - refused credentials against any broker whose
+  `auth_mechanisms` advertises EXTERNAL, despite the password being valid. PLAIN now wins when
+  a password is given and no client certificate is configured, as in Bunny and the Java client.
+  Certificate material (`tls_cert:` / `tls_context:`) keeps EXTERNAL first - the certificate is
+  the identity the caller configured on purpose, where the password is usually the untouched
+  guest default - and `auth_mechanism:` still forces either outright.
+- CI runs the unit specs, which were never exercised there, and the job times out after 30
+  minutes instead of holding a runner for six hours when a toxiproxy spec wedges.
+
 ## [0.8.1] - 2026-11-15
 
 ### Fixed

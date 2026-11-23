@@ -57,8 +57,23 @@ RSpec.describe AsyncRabbitMQ::SASL do
       expect(mech).to be_a(AsyncRabbitMQ::SASL::Plain)
     end
 
-    it "prefers EXTERNAL over PLAIN when both offered" do
+    it "prefers PLAIN over EXTERNAL when a password is supplied" do
+      # EXTERNAL would silently discard the password and authenticate by TLS
+      # certificate alone — refused credentials despite the password being valid.
       mech = described_class.negotiate("PLAIN EXTERNAL", username: "u", password: "p")
+      expect(mech).to be_a(AsyncRabbitMQ::SASL::Plain)
+    end
+
+    it "prefers EXTERNAL over PLAIN when no password is supplied" do
+      mech = described_class.negotiate("PLAIN EXTERNAL", username: nil, password: nil)
+      expect(mech).to be_a(AsyncRabbitMQ::SASL::External)
+    end
+
+    it "prefers EXTERNAL when the connection has a client certificate, password notwithstanding" do
+      # Session passes prefer_external when tls_cert/tls_context are set: the
+      # password there is usually the untouched guest default, and the
+      # certificate is the identity the caller configured on purpose.
+      mech = described_class.negotiate("PLAIN EXTERNAL", username: "guest", password: "guest", prefer_external: true)
       expect(mech).to be_a(AsyncRabbitMQ::SASL::External)
     end
 

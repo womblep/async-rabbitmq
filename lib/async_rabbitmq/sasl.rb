@@ -87,7 +87,10 @@ module AsyncRabbitMQ
     # Select the best mechanism the broker supports, in preference order.
     # Returns an instantiated mechanism object.
     # Raises AuthenticationError if no common mechanism is found.
-    def self.negotiate(broker_mechanisms_string, preferred: nil, username: nil, password: nil)
+    # +prefer_external+: the caller has transport-layer identity to offer — a
+    # TLS client certificate — so EXTERNAL outranks PLAIN for it. Session sets
+    # this when certificate material was configured.
+    def self.negotiate(broker_mechanisms_string, preferred: nil, username: nil, password: nil, prefer_external: false)
       broker_list = broker_mechanisms_string.split(/\s+/)
 
       if preferred
@@ -98,8 +101,18 @@ module AsyncRabbitMQ
         return instantiate(name, username: username, password: password)
       end
 
-      # Preference order: EXTERNAL (strongest, no credentials on wire), PLAIN (universal)
-      %w[EXTERNAL PLAIN].each do |name|
+      # Preference order. EXTERNAL identifies the client by its TLS
+      # certificate and sends no credentials at all, so auto-selecting it for
+      # a caller who supplied a password silently discards that password — and
+      # fails against any broker whose auth_mechanisms happens to advertise
+      # EXTERNAL, despite the credentials being valid. PLAIN therefore wins
+      # whenever there is a password and no client certificate (Bunny and the
+      # Java client default to PLAIN for the same reason). EXTERNAL wins when
+      # the connection carries a certificate to be identified by — a password
+      # is usually the untouched guest default there — or when there is no
+      # password at all; auth_mechanism: forces either outright.
+      order = (prefer_external || !password) ? %w[EXTERNAL PLAIN] : %w[PLAIN EXTERNAL]
+      order.each do |name|
         if broker_list.include?(name)
           return instantiate(name, username: username, password: password)
         end

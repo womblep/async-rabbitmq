@@ -10,6 +10,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     name: Ruby ${{ matrix.ruby }}
+    # A wedged toxiproxy spec otherwise holds the runner for the 6-hour default.
+    timeout-minutes: 30
 
     strategy:
       matrix:
@@ -104,7 +106,9 @@ jobs:
           exit 1
 
       - name: Run tests
-        run: bundle exec rspec spec/integration/
+        # Both suites in one run so the coverage gate sees the whole picture.
+        # spec/unit was previously never exercised in CI at all.
+        run: bundle exec rspec spec/unit/ spec/integration/
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4

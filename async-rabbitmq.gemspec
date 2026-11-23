@@ -26,7 +26,9 @@ Gem::Specification.new do |spec|
   }
   spec.require_paths = ["lib"]
 
-  spec.add_dependency "async",        "~> 2.0"
+  # 2.24 is where Async::Queue#close / ClosedError appear, which FrameIO#stop
+  # relies on to release publishers parked on a full write queue.
+  spec.add_dependency "async",        "~> 2.24"
   spec.add_dependency "amq-protocol", "~> 2.9"
 
   spec.add_development_dependency "rspec",      "~> 3.13"
