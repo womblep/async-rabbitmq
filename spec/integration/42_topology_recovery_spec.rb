@@ -178,7 +178,10 @@ RSpec.describe "topology recovery", :integration do
         original.call(method)
       end
 
-      ch.basic_publish("follow the rename", routing_key: q.name)
+      # reply_to names the same server-named queue, as the RPC request pattern
+      # does: it must follow the rename too, or the responder answers into a
+      # queue that no longer exists.
+      ch.basic_publish("follow the rename", routing_key: q.name, reply_to: q.name)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
       sleep 0.05 while ch.unconfirmed_messages.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
       expect(ch.unconfirmed_messages.size).to eq(1)
@@ -191,12 +194,14 @@ RSpec.describe "topology recovery", :integration do
       # exchange. If the replay does not follow the rename, it is silently
       # unroutable and the message is lost despite confirms.
       body = nil
+      header = nil
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
       while body.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        _di, _h, body = ch.basic_get(q.name, manual_ack: false)
+        _di, header, body = ch.basic_get(q.name, manual_ack: false)
         sleep 0.1 if body.nil?
       end
       expect(body).to eq("follow the rename")
+      expect(header.properties[:reply_to]).to eq(q.name) # the NEW name
     end
   end
 
