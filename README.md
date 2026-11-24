@@ -135,17 +135,31 @@ this does not cover, pass `tls_context:` and it is used as given.
 
 ### Logging
 
-By default the client logs through [Console](https://github.com/socketry/console),
-like the rest of the async stack. Every message names the object that logged it
-(the `Session`, a `Channel`, the `FrameIO` connection layer, a `Cluster`), so
-Console's controls work per component:
-
-```bash
-CONSOLE_LEVEL=debug bundle exec ruby worker.rb      # everything, from everyone
-```
+By default the client logs warnings and errors through
+[Console](https://github.com/socketry/console), like the rest of the async stack.
+How much it says is set in one place, whichever logger a session was given:
 
 ```ruby
-Console.logger.filter(AsyncRabbitMQ::Channel, Console::Logger::DEBUG)  # just channels
+AsyncRabbitMQ.log_level = :warn    # the default: warnings and errors
+AsyncRabbitMQ.log_level = :debug   # everything, when troubleshooting a connection
+AsyncRabbitMQ.log_level = :off     # nothing, from any session
+```
+
+```bash
+ASYNC_RABBITMQ_LOG_LEVEL=debug bundle exec ruby worker.rb
+```
+
+The level is checked before a message reaches any logger, so an application that
+runs Console or Rails' logger at info does not get this client's info and debug
+lines unless it asks for them. It is process-wide and can be changed at any time.
+
+Every message names the object that logged it (the `Session`, a `Channel`, the
+`FrameIO` connection layer, a `Cluster`), so Console's own controls can narrow it
+further, per component. They act within `AsyncRabbitMQ.log_level`, never past it:
+
+```ruby
+AsyncRabbitMQ.log_level = :debug
+Console.logger.filter(AsyncRabbitMQ::Channel, Console::Logger::DEBUG)  # debug from channels
 ```
 
 Console's logger is per fiber, so a `Console.logger = ...` set before `connect`

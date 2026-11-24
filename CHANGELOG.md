@@ -192,9 +192,15 @@ All notable changes to this project will be documented in this file.
   work per component: `CONSOLE_LEVEL=debug` for everything, or
   `Console.logger.filter(AsyncRabbitMQ::Channel, Console::Logger::DEBUG)` for channels alone.
   Console's logger is per fiber; one set with `Console.logger =` before `connect` reaches every
-  background task the session starts. **Visible change:** Console's default level is info
-  (the old default was warnings and errors), so messages such as "Recovery successful after N
-  attempt(s)" now appear; `CONSOLE_LEVEL=warn` restores the old volume.
+  background task the session starts. Each session gets its own adapter object, so patching one
+  session's logger can never reach another.
+- `AsyncRabbitMQ.log_level` caps what this gem logs at all, whatever logger a session was given:
+  `:debug`, `:info`, `:warn` (the default), `:error`, `:fatal` or `:off`, also settable with the
+  `ASYNC_RABBITMQ_LOG_LEVEL` environment variable. It is checked before a message reaches the
+  logger, so an application running Console or Rails' logger at info is not flooded with this
+  client's info and debug lines unless it raises the level, and the default volume stays
+  warnings and errors, as it was. Process-wide and read on every call; an unknown level is
+  refused when set.
 - `logger:` still takes anything with `debug`/`info`/`warn`/`error` - `Rails.logger`, a stdlib
   `Logger`, `AsyncRabbitMQ::Log` - and still sends that session's messages there alone; such a
   logger is wrapped in a small adapter that drops the subject. New: `logger: nil` discards
