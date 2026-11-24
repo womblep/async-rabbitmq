@@ -47,7 +47,9 @@ module AsyncRabbitMQ
 
     def initialize(logger: nil)
       @subscribers = []
-      @logger      = logger
+      # Default nil: a Notifier built on its own (to share between sessions)
+      # stays as quiet as it always was; sessions pass theirs.
+      @logger      = Logging.resolve(logger)
     end
 
     def subscribe(pattern = nil, &block)
@@ -81,7 +83,7 @@ module AsyncRabbitMQ
         begin
           block.call(name, payload)
         rescue => e
-          @logger&.error("Event subscriber for #{name} raised #{e.class}: #{e.message}")
+          @logger.error(self, "Event subscriber for #{name} raised #{e.class}: #{e.message}")
         end
       end
       nil

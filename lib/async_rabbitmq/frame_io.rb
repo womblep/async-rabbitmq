@@ -29,9 +29,9 @@ module AsyncRabbitMQ
     # 403 access-refused, 404 not-found, 405 resource-locked, 406 precondition-failed.
     SOFT_ERROR_CODES = [311, 312, 313, 403, 404, 405, 406].freeze
 
-    def initialize(socket, logger: Log.new)
+    def initialize(socket, logger: Console)
       @socket        = socket
-      @logger        = logger
+      @logger        = Logging.resolve(logger)
       @channels      = {}
       @channel_sem   = Async::Semaphore.new(1)
       @write_queue   = Async::LimitedQueue.new(WRITE_QUEUE_LIMIT)
@@ -130,21 +130,21 @@ module AsyncRabbitMQ
       # message replayed on the recovered channel. A publish without confirms
       # is fire-and-forget by contract. The point of the close is to get here
       # at all instead of parking forever.
-      @logger.debug("FrameIO: write after stop discarded (#{data.bytesize} bytes)")
+      @logger.debug(self, "FrameIO: write after stop discarded (#{data.bytesize} bytes)")
       nil
     end
 
     # Called by the Session channel-0 monitor when connection.blocked is received.
     def set_blocked(reason)
       @blocked = true
-      @logger.warn("Connection blocked: #{reason}")
+      @logger.warn(self, "Connection blocked: #{reason}")
     end
 
     # Called by the Session channel-0 monitor when connection.unblocked is received.
     def set_unblocked
       @blocked = false
       release_blocked_writers
-      @logger.info("Connection unblocked")
+      @logger.info(self, "Connection unblocked")
     end
 
     def blocked?
@@ -190,7 +190,7 @@ module AsyncRabbitMQ
     rescue => e
       # The writer is gone either way; without recovery every publisher would
       # block forever once the write queue fills, with nothing to drain it.
-      @logger.error("FrameIO writer: #{e.class}: #{e.message}")
+      @logger.error(self, "FrameIO writer: #{e.class}: #{e.message}")
       trigger_recovery(e) if @running
     end
 
@@ -202,17 +202,17 @@ module AsyncRabbitMQ
       end
     rescue EOFError, Errno::ECONNRESET, Errno::EPIPE, IOError, Errno::EBADF => e
       if @running
-        @logger.warn("FrameIO reader closed: #{e.class}")
+        @logger.warn(self, "FrameIO reader closed: #{e.class}")
         trigger_recovery(e)
       else
         # #stop closed the socket under us: an orderly shutdown, not a failure.
-        @logger.debug("FrameIO reader stopped (#{e.class})")
+        @logger.debug(self, "FrameIO reader stopped (#{e.class})")
       end
     rescue AMQ::Protocol::Error => e
-      @logger.error("FrameIO AMQP error: #{e.class}: #{e.message}")
+      @logger.error(self, "FrameIO AMQP error: #{e.class}: #{e.message}")
       trigger_recovery(e)
     rescue => e
-      @logger.error("FrameIO reader error: #{e.class}: #{e.message}")
+      @logger.error(self, "FrameIO reader error: #{e.class}: #{e.message}")
       trigger_recovery(e)
     end
 
@@ -266,7 +266,7 @@ module AsyncRabbitMQ
               @socket.write(AMQ::Protocol::Connection::CloseOk.encode.encode)
             end
           rescue => e
-            @logger.warn("FrameIO: could not send Connection::CloseOk — #{e.message}")
+            @logger.warn(self, "FrameIO: could not send Connection::CloseOk — #{e.message}")
           end
           route_to_channel(0, [:method, method])
           trigger_recovery(
@@ -295,7 +295,7 @@ module AsyncRabbitMQ
       when AMQ::Protocol::BodyFrame
         state = @content_state[channel_id]
         unless state
-          @logger.warn("Body frame on channel #{channel_id} without content header — dropped")
+          @logger.warn(self, "Body frame on channel #{channel_id} without content header — dropped")
           return
         end
         chunk = frame_obj.payload
@@ -312,7 +312,7 @@ module AsyncRabbitMQ
         route_to_channel(0, [:heartbeat])
 
       else
-        @logger.warn("Unknown frame type #{frame_obj.class} on channel #{channel_id} — dropped")
+        @logger.warn(self, "Unknown frame type #{frame_obj.class} on channel #{channel_id} — dropped")
       end
     end
 
@@ -321,7 +321,7 @@ module AsyncRabbitMQ
       if queue
         queue.push(message)
       else
-        @logger.debug("No queue for channel #{channel_id} — frame dropped (#{message.first})")
+        @logger.debug(self, "No queue for channel #{channel_id} — frame dropped (#{message.first})")
       end
     end
 

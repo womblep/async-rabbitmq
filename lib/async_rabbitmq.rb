@@ -12,12 +12,34 @@ module AsyncRabbitMQ
     #
     #   AsyncRabbitMQ.warn_unbounded_consumers = false
     attr_accessor :warn_unbounded_consumers
+
+    # The most this gem logs, whichever logger a session was given: :debug,
+    # :info, :warn (the default), :error, :fatal, or :off. Checked before a
+    # message reaches the logger, so an application running Console - or
+    # Rails' logger - at info is not flooded with this client's info and debug
+    # lines; raise it to see them. Process-wide and read on every call, so it
+    # can be changed at any time. To silence one session, give it logger: nil.
+    #
+    #   AsyncRabbitMQ.log_level = :debug   # troubleshooting a connection
+    #   AsyncRabbitMQ.log_level = :off     # nothing at all
+    attr_reader :log_level
+
+    def log_level=(level)
+      level = level.to_sym
+      unless %i[debug info warn error fatal off].include?(level)
+        raise ArgumentError, "log_level must be :debug, :info, :warn, :error, :fatal or :off (got #{level.inspect})"
+      end
+
+      @log_level = level
+    end
   end
   self.warn_unbounded_consumers = true
+  self.log_level = ENV.fetch("ASYNC_RABBITMQ_LOG_LEVEL", "warn")
 end
 
 require_relative "async_rabbitmq/version"
 require_relative "async_rabbitmq/log"
+require_relative "async_rabbitmq/logging"
 require_relative "async_rabbitmq/errors"
 require_relative "async_rabbitmq/tls"
 require_relative "async_rabbitmq/channel_id_allocator"
