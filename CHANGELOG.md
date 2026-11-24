@@ -2,7 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.9.0] - 2026-11-24
+
+A reliability release: three waves of fixes from a full review of 0.8.1, a broadened recovery
+test suite that found one more, and the first steps of moving the internals onto the async
+ecosystem's own primitives. No public method was removed or renamed.
+
+### Upgrading from 0.8
+
+- **Dependencies:** `async` `~> 2.29` (was `~> 2.0`), and two new runtime dependencies,
+  `io-endpoint` `~> 0.19` (which needs the `openssl` gem `>= 3.3`, shipped with Ruby 3.4) and
+  `console` `~> 1.29` (already loaded by `async`).
+- **Logging** goes through Console by default, capped at warnings by the new
+  `AsyncRabbitMQ.log_level`, so the default volume is unchanged. `logger:` still takes
+  `Rails.logger`, a stdlib `Logger` or `AsyncRabbitMQ::Log`. `logger: nil` now silences a session,
+  and **`Cluster.new(logger: nil)` is now silent** where it used to fall back to the default;
+  leave `logger:` out to get the default. A value that is not a logger raises `ArgumentError`.
+- **`connect` raises `NotOpenError`** while the session is recovering or another connect is in
+  flight; close the session first to force a fresh connection.
+- **SASL prefers PLAIN over EXTERNAL** when a password is given and no client certificate is
+  configured; certificate material keeps EXTERNAL first, and `auth_mechanism:` still forces
+  either.
+- **Sockets use `TCP_NODELAY`.**
+- **`update_secret` keeps the new secret on a timeout** for reconnects, with a warning, rather
+  than discarding it.
+- **New events and payload keys:** `recovery.topology_incomplete`, and `topology_complete:` on
+  `recovery.succeeded`.
 
 ### Tests
 
@@ -112,7 +137,15 @@ All notable changes to this project will be documented in this file.
   dropped (with a `consumer.recovery_failed` event), the channel reopened, and the survivors
   re-subscribed. Only a broker rejection of a specific consumer drops it — a connection lost
   again mid-re-registration leaves every consumer in place for the next recovery cycle to
-  restore, rather than mistaking the outage for a dead queue and forgetting them.
+  restore, rather than mistaking the outage for a dead queue and forgetting them. On a channel
+  with publisher confirms, that reopen replays the unconfirmed messages and resets the confirm
+  numbering as `Channel#reopen` does, so later acks resolve the right publishes. A consumer is
+  only ever dropped for a close the broker made over its own `basic.consume` - `channel.close`
+  names the method at fault. A replayed message the broker refuses (sent to an exchange that
+  is gone) blames no consumer: the channel is reopened without replaying, and the unconfirmed
+  messages are reported to the publisher as nacked, since their fate is unknown and replaying
+  them would close the channel every time. A second such close gives the channel up instead of
+  looping, and a connection lost meanwhile leaves everything for the next recovery.
 - `Cluster#close` called from another fiber while `connect` is still waiting for its nodes no
   longer hangs that connect forever. The connect waited on a condition only the node supervisors
   signalled, and close stopped the supervisors before they reported; it now wakes the connect,
