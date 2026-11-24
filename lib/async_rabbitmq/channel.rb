@@ -843,6 +843,7 @@ module AsyncRabbitMQ
     def begin_recovery_wait!
       @recovery_promise = Async::Promise.new if @recovery_promise.nil? || @recovery_promise.resolved?
     end
+    private :begin_recovery_wait!
 
     # Give the channel up while the session is recovering, instead of letting
     # recovery reopen it: everything waiting or parked raises +error+, #each
@@ -906,6 +907,7 @@ module AsyncRabbitMQ
       @resync_promise = nil
       promise&.resolve(error)
     end
+    private :fail_waiters!
 
     # -------------------------------------------------------------------------
     # Internal: called by Session after reconnect
