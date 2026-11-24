@@ -141,7 +141,16 @@ RSpec.describe "resync and recovery edges", :integration do
       dch.queue_delete(doomed.name)
       direct.close
     end
-    wait_until { session.open? && ch.open? }
+    # Wait for re-registration to FINISH, not just for the channel to be open:
+    # finish_recovery! marks the channel open and releases parked publishers
+    # before it re-registers consumers. A publish sent between the doomed
+    # consumer's re-subscribe and the broker's 404 channel.close is dropped
+    # by the closing channel (no confirms here), and the delivery wait below
+    # times out — which made this example flaky. The doomed consumer is
+    # dropped from @consumers only at the very end of re_register_consumers.
+    wait_until do
+      session.open? && ch.open? && !ch.instance_variable_get(:@consumers).key?(doomed_tag)
+    end
 
     # The doomed consumer is gone; the two good ones work.
     ch.basic_publish("to a", routing_key: good1.name)
