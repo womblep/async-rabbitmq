@@ -483,6 +483,10 @@ RSpec.describe AsyncRabbitMQ::Cluster, :integration do
       # placement is least-loaded, so a few tries settle it) and declare a
       # durable queue plus a transient (exclusive, server-named) one on it.
       node = proxied(cluster)
+      # Cluster#connect returns once every node has made a first attempt, not
+      # once each is up, and placement only considers nodes that are open: wait
+      # for this one, or every channel lands on the direct nodes.
+      wait_until("the proxied node to be connected") { node.open? }
       ch = nil
       10.times do
         c = cluster.open_channel

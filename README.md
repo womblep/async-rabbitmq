@@ -7,7 +7,7 @@ of [Bunny](https://github.com/ruby-amqp/bunny) and [Async](https://github.com/so
 
 ```ruby
 # Gemfile
-gem "async-rabbitmq", "~> 0.5"
+gem "async-rabbitmq", "~> 0.9"
 ```
 
 or

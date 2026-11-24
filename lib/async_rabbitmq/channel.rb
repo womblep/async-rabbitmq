@@ -843,6 +843,7 @@ module AsyncRabbitMQ
     def begin_recovery_wait!
       @recovery_promise = Async::Promise.new if @recovery_promise.nil? || @recovery_promise.resolved?
     end
+    private :begin_recovery_wait!
 
     # Give the channel up while the session is recovering, instead of letting
     # recovery reopen it: everything waiting or parked raises +error+, #each
@@ -906,6 +907,7 @@ module AsyncRabbitMQ
       @resync_promise = nil
       promise&.resolve(error)
     end
+    private :fail_waiters!
 
     # -------------------------------------------------------------------------
     # Internal: called by Session after reconnect
@@ -2202,65 +2204,115 @@ module AsyncRabbitMQ
       raise RpcTimeoutError, yield
     end
 
-    # Re-subscribe every consumer after a reopen. A consumer whose queue is
-    # gone draws a 404, and the broker closes the whole channel on it — taking
-    # down every consumer already re-registered on it, which were cancelled
-    # server-side by that same close. So a ChannelError cannot just be logged
-    # and skipped (the old behaviour: the first bad queue left the channel
-    # closed and dropped out of the session, so the rest raised NotOpenError
-    # and no consumer was restored, while recovery still reported success).
-    # Instead, on a ChannelError the offending consumer is dropped, the channel
-    # reopened, and the survivors re-subscribed. The dropped set bounds it, so a
-    # queue that stays gone is dropped once, not retried forever.
+    # Re-subscribe every consumer after a reopen. What a failure means depends
+    # on what the broker closed the channel over — channel.close names the
+    # method that caused it:
     #
-    # Any OTHER error — the connection dropping again mid-recovery
-    # (ConnectionError from interrupt_wait!), the session going away
-    # (NotOpenError), an RPC timeout — is not this consumer's fault. It aborts
-    # the pass and leaves @consumers untouched, so the next recovery cycle
-    # restores every consumer; dropping them here would be silent, permanent
-    # loss on a connection flap, with recovery still reporting success.
+    # - This consumer's own basic.consume (a 404: its queue is gone): drop that
+    #   consumer, with a consumer.recovery_failed event, and reopen to
+    #   re-subscribe the survivors the close cancelled. The dropped set bounds
+    #   it, so a queue that stays gone is dropped once, not retried forever.
+    # - A basic.publish, or a close that landed during the replay of the
+    #   unconfirmed messages: a replayed message the broker refuses (sent to an
+    #   exchange that is gone), not the consumer's fault. Reopen WITHOUT
+    #   replaying - replaying would draw the same close every time - and report
+    #   the unconfirmed messages as nacked, since their fate is unknown.
+    # - Anything else that closed the channel (a qos refused on reopen, an ack
+    #   timeout): not the consumer's fault, and not the replay's. Reopen,
+    #   replaying as usual.
+    # - A second close that was not a consumer's: give the channel up rather
+    #   than loop.
+    # - A ChannelError that left the channel open (an unexpected reply): that
+    #   consumer is not subscribed now, but nothing closed; it stays registered
+    #   and the rest carry on.
+    #
+    # A connection or session error, anywhere here — the connection dropping
+    # again mid-recovery, the session going away — is not a verdict on any
+    # consumer or on the channel. It aborts and leaves everything, consumers
+    # included, for the next recovery cycle; dropping or closing here would
+    # turn a network blip into permanent loss with recovery still reporting
+    # success.
     def re_register_consumers
       return if @consumers.empty?
 
-      dropped = {}
-      # A ChannelError drops exactly one consumer (recorded in `dropped` and
-      # skipped next pass) or the pass completes, so this runs at most once per
-      # consumer — no spin even if the reopen itself keeps raising ChannelError.
-      restart = true
+      dropped        = {}
+      foreign_closes = 0
+      replay         = true
+      restart        = true
       while restart
         restart = false
-        aborted = catch(:abort_reregister) do
+        outcome = catch(:reregister) do
           @consumers.keys.each do |tag|
             next if dropped.key?(tag)
             entry = @consumers[tag]
             begin
-              reopen_for_reregister! unless open?
+              reopen_for_reregister!(replay: replay) unless open?
               basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack],
                             exclusive: entry[:exclusive], arguments: entry[:arguments] || {},
                             on_error: entry[:on_error], &entry[:block])
             rescue ChannelError => e
-              dropped[tag] = e
-              @logger.error(self, "Channel #{@channel_id}: consumer #{tag} on #{entry[:queue_name]} rejected (#{e.message}); dropping it")
-              # The broker closed the channel rejecting this one, cancelling the
-              # consumers already restored on it. Restart to re-subscribe them.
-              # If it is somehow still open, the earlier subscriptions stand, so
-              # carry on to the next consumer.
-              if !open?
-                restart = true
-                break
+              if open?
+                # Nothing closed; this one is not subscribed, but neither is it
+                # known to be gone. Keep it and carry on.
+                @logger.error(self, "Channel #{@channel_id}: could not re-register consumer #{tag} on #{entry[:queue_name]} " \
+                                    "(#{e.message}); it stays registered but is not consuming")
+                next
+              elsif consume_rejected?(e)
+                dropped[tag] = e
+                @logger.error(self, "Channel #{@channel_id}: consumer #{tag} on #{entry[:queue_name]} rejected (#{e.message}); dropping it")
+              else
+                foreign_closes += 1
+                throw :reregister, [:give_up, e] if foreign_closes > 1
+
+                replay = false if replay_refused?(e)
+                @logger.warn(self, "Channel #{@channel_id}: closed by the broker during consumer re-registration, " \
+                                   "not by a consumer (#{e.message}); reopening#{replay ? '' : ' without replaying unconfirmed messages'}")
               end
+              # The close cancelled the consumers already restored on this
+              # channel; restart to re-subscribe them.
+              restart = true
+              break
             rescue => e
-              @logger.warn(self, "Channel #{@channel_id}: consumer re-registration interrupted (#{e.class}: #{e.message}); leaving consumers for the next recovery")
-              throw :abort_reregister, true
+              @logger.warn(self, "Channel #{@channel_id}: consumer re-registration interrupted (#{e.class}: #{e.message}); " \
+                                 "leaving consumers for the next recovery")
+              throw :reregister, [:abort]
             end
           end
-          false
+          [:done]
         end
-        return if aborted
+
+        case outcome.first
+        when :abort   then return
+        when :give_up
+          forget_dropped_consumers(dropped)
+          give_up_reregistration!(outcome.last)
+          return
+        end
       end
 
-      # Forget the ones the broker will not serve, and release anyone in #each
-      # waiting on them: they are not coming back on their own.
+      # The last pass can end on a close with nothing left to subscribe (every
+      # consumer was rejected). Reopen so the channel is usable and anything
+      # parked on it is released.
+      unless open?
+        begin
+          reopen_for_reregister!(replay: replay)
+        rescue ChannelError => e
+          forget_dropped_consumers(dropped)
+          give_up_reregistration!(e)
+          return
+        rescue => e
+          @logger.warn(self, "Channel #{@channel_id}: reopen after re-registration interrupted (#{e.class}: #{e.message}); " \
+                             "leaving it for the next recovery")
+          return
+        end
+      end
+
+      forget_dropped_consumers(dropped)
+    end
+
+    # Forget the consumers the broker will not serve, and release anyone in
+    # #each waiting on them: they are not coming back on their own.
+    def forget_dropped_consumers(dropped)
       dropped.each_key do |tag|
         cancelled = @consumers.delete(tag)
         topology&.delete_consumer(tag)
@@ -2271,11 +2323,87 @@ module AsyncRabbitMQ
       end
     end
 
+    # Whether the broker closed the channel over a basic.consume — the
+    # consumer's own subscription, as opposed to anything else on the channel.
+    def consume_rejected?(error)
+      closed_over?(error, AMQ::Protocol::Basic::Consume)
+    end
+
+    # Whether the close points at the replay of unconfirmed messages: a
+    # basic.publish the broker refused, or a close that landed while they were
+    # being replayed (raised by reopen_for_reregister!, with no close method).
+    def replay_refused?(error)
+      error.close_method.nil? || closed_over?(error, AMQ::Protocol::Basic::Publish)
+    end
+
+    def closed_over?(error, method_class)
+      close = error.close_method
+      !close.nil? && close.class_id == AMQ::Protocol::Basic.method_id && close.method_id == method_class.method_id
+    end
+
+    # Re-registration cannot bring this channel back. Close it for good: every
+    # parked fiber is released with the error rather than waiting on a reopen
+    # that is not coming, and the remaining consumers are kept, for
+    # reopen(recover_consumers: true). The broker's close already released
+    # this channel's id, and another channel may have been given it since:
+    # only a session that still maps the id to THIS channel is told.
+    def give_up_reregistration!(error)
+      @logger.error(self, "Channel #{@channel_id}: giving up re-registering consumers (#{error.class}: #{error.message})")
+      mark_closed!(error)
+      return unless @session.respond_to?(:channels) && @session.channels.any? { |ch| ch.equal?(self) }
+
+      @session.channel_closed(@channel_id) rescue nil
+    end
+
+    # The unconfirmed messages could not be replayed: report them to the
+    # publisher as nacked, as a broker nack would — wait_for_confirms returns
+    # false (or raises MessageNacked when tracking) and nacked_tags names
+    # them — and reset the counter to match the broker's fresh numbering.
+    def abandon_unconfirmed!
+      abandoned = @pending_confirms.keys
+      @pending_confirms = {}
+      @delivery_tag     = 0
+      return if abandoned.empty?
+
+      @logger.warn(self, "Channel #{@channel_id}: #{abandoned.size} unconfirmed message(s) could not be re-published " \
+                         "and are reported as nacked")
+      @nacked_tags.concat(abandoned)
+      @nacked_this_cycle.concat(abandoned)
+      @only_acks = false
+      @confirm_condition&.signal
+      release_outstanding_slots
+    end
+
     # Reopen the channel in place during consumer re-registration, after the
-    # broker closed it rejecting a consumer. Keeps the same id; restores
-    # prefetch, confirm and tx mode (reopen_on does). Leaves the channel :open.
-    def reopen_for_reregister!
-      @session.reopen_channel(self, state: :open)
+    # broker closed it. Keeps the same id; reopen_on restores prefetch,
+    # confirm and tx mode. Leaves the channel :open.
+    #
+    # Like #reopen, and for the same reason: the broker restarts confirm
+    # numbering at 1 on the reopened channel, so the unconfirmed messages are
+    # replayed — which also resets @delivery_tag to match — before anything
+    # new is published, or every later ack resolves the wrong publish. With
+    # +replay+ false they are reported as nacked instead (see
+    # #re_register_consumers). Reopened :resyncing first so a publisher
+    # arriving meanwhile parks rather than taking a tag ahead of the replay.
+    # If the channel did not stay :resyncing through the replay it is not
+    # overwritten with :open: a connection loss raises as one (the next
+    # recovery handles it), a broker close as a ChannelError.
+    def reopen_for_reregister!(replay: true)
+      begin_recovery_wait!
+      @session.reopen_channel(self, state: :resyncing)
+      if @confirms_enabled
+        replay ? republish_unconfirmed : abandon_unconfirmed!
+      end
+      unless resyncing?
+        if recovering?
+          raise ConnectionError.new(code: 0, text: "Connection lost while reopening channel #{@channel_id}")
+        end
+
+        raise ChannelError.new("Channel #{@channel_id} was closed while replaying unconfirmed messages",
+                               channel_id: @channel_id)
+      end
+      @state = :open
+      resume_parked!(:open)
     end
 
     # Raise unless the channel is open. While the connection is being recovered

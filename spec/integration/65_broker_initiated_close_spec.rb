@@ -73,7 +73,12 @@ RSpec.describe "broker-initiated connection.close", :integration do
     # refused. Recovery cannot succeed and must exhaust its attempts.
     delete_vhost(vhost)
 
-    wait_until("recovery to start") { !session.open? }
+    # Wait for the CHANNEL to be recovering, not just the session: the session
+    # goes :recovering a moment before its channels are marked (a fiber switch
+    # sits between), and a publish in that instant is not parked - it goes
+    # onto the dying connection, fire-and-forget. This example is about a
+    # publish parked during recovery.
+    wait_until("recovery to start") { ch.recovering? }
     publisher = Async::Task.current.async do
       ch.basic_publish("never getting there", routing_key: "test.vanishing")
     rescue => e
