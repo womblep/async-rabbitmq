@@ -409,7 +409,18 @@ named has a new name. `on_attach` is how to hear of it:
 replies.on_attach { |consumer| announce(consumer.queue_name) }
 ```
 
-To name the queue yourself, pass the name with `exclusive: true`.
+The queue can be named instead, by passing a name with `exclusive: true`. The
+same name is then declared again after every reconnect.
+
+- **On a single node this is fine.** The old queue is gone by the time the
+  new connection declares it.
+- **In a cluster it can fail.** An exclusive queue is deleted when its
+  connection closes, and the nodes do not all learn of that at once. A
+  declaration that arrives before the old queue is gone everywhere is
+  refused, and `each` raises `ChannelError` with `resource_locked?` true.
+
+In a cluster, let the broker name the queue. A name it chooses is new each
+time, so it cannot collide with the old one.
 
 ## When the connection is lost
 

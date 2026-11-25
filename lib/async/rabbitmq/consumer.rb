@@ -48,6 +48,13 @@ module Async
     # on the next one. Whatever was in it went with the old connection, and a
     # queue the broker named has a new name; #on_attach is how to hear of it.
     #
+    # A queue named by the caller is declared again under the same name. On a
+    # single node that is fine. In a cluster it can be refused: the old queue
+    # goes when its connection closes, but not on every node at once, and
+    # until it has, #each raises a ChannelError that is resource_locked?. A
+    # name the broker chooses is new each time and cannot meet the old one,
+    # so in a cluster leave the naming to the broker.
+    #
     # == How #each ends
     #
     # It returns when the consumer goes away, and says why:
