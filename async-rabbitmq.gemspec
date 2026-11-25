@@ -37,6 +37,8 @@ Gem::Specification.new do |spec|
   # Connection establishment (TCP, TLS, address resolution) - the same layer
   # async-http and the rest of the socketry stack build on.
   spec.add_dependency "io-endpoint",  "~> 0.19"
+  # Buffered reads and writes over the socket, for the 1.0 connection layer.
+  spec.add_dependency "io-stream",    "~> 0.11"
 
   spec.add_development_dependency "rspec",      "~> 3.13"
   spec.add_development_dependency "simplecov",  "~> 0.22"
