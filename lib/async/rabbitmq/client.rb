@@ -419,12 +419,17 @@ module Async
       # sent this way can be repeated without harm. A ChannelError is the
       # broker's answer and is raised; it has closed the channel, and the next
       # request opens another.
+      #
+      # A request that loses the connection three times running is taken to
+      # be what is losing it - the broker closes the connection, not just
+      # the channel, over some things it refuses - and the error is raised.
       def admin
         stale = 0
+        lost  = 0
         begin
           yield admin_channel
         rescue ConnectionError
-          raise if @closed || @failure
+          raise if @closed || @failure || (lost += 1) >= 3
 
           retry
         rescue ClosedError

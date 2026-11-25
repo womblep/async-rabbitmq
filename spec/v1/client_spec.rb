@@ -62,6 +62,18 @@ RSpec.describe Async::RabbitMQ::Client, :integration do
   end
 
   describe "declaring" do
+    # RabbitMQ 4 refuses a queue that is neither durable nor exclusive, and
+    # closes the whole connection to say so.
+    it "raises, and does not retry for ever, when a declaration costs the connection each time" do
+      with_client do |client, _|
+        expect { client.queue("transient", durable: false) }
+          .to raise_error(Async::RabbitMQ::ConnectionError, /transient_nonexcl_queues/)
+        wait_for { client.connected? }
+        expect(client.queue("fine").exists?).to be true
+        expect(client.topology.queues.map(&:name)).to eq(%w[fine])
+      end
+    end
+
     it "declares a durable queue by default and reports its status" do
       with_client do |client, _|
         queue = client.queue("orders")
