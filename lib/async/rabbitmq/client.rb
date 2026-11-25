@@ -12,6 +12,8 @@ require_relative "topology"
 require_relative "queue"
 require_relative "exchange"
 require_relative "publisher"
+require_relative "consumer"
+require_relative "managed_consumer"
 
 module Async
   module RabbitMQ
@@ -177,6 +179,33 @@ module Async
           yield publisher
         ensure
           publisher.close
+        end
+      end
+
+      # A Consumer of +queue+ (a Queue or its name), to pull messages from.
+      # With no queue the consumer declares one of its own. With a block,
+      # yields the consumer and closes it afterwards. See Consumer.
+      def consumer(queue = nil, **options)
+        consumer = Consumer.new(self, queue, **options)
+        return consumer unless block_given?
+
+        begin
+          yield consumer
+        ensure
+          consumer.close
+        end
+      end
+
+      # A ManagedConsumer of +queue+, which runs a handler for each message.
+      # With a block, yields it and closes it afterwards. See ManagedConsumer.
+      def managed_consumer(queue = nil, **options)
+        consumer = ManagedConsumer.new(self, queue, **options)
+        return consumer unless block_given?
+
+        begin
+          yield consumer
+        ensure
+          consumer.close
         end
       end
 

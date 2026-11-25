@@ -63,8 +63,14 @@ module Async
     #              its return is matched to it; consumers will see it.
     # [persistent] have the broker write the message to disk. Default true.
     #
-    # And two for the publisher alone:
+    # And three for the publisher alone:
     #
+    # [timestamps]      stamp each message with when it was published: the
+    #                   +timestamp+ property, in seconds, and the
+    #                   +timestamp_in_ms+ header, in milliseconds, which is
+    #                   what Message#elapsed reads. Default true. A value the
+    #                   caller gives for either is left alone. A message sent
+    #                   again keeps the time it was first published.
     # [resend]          send again, on the next connection, what the broker
     #                   had not answered for when one is lost. Default false.
     # [max_unconfirmed] how many messages may be waiting for the broker's
@@ -80,6 +86,11 @@ module Async
       # matched to it.
       PUBLISH_ID_HEADER = "x-async-rabbitmq-publish-id"
 
+      # The header that carries the time of publishing in milliseconds since
+      # the epoch. The name is the one RabbitMQ's message-timestamp plugin
+      # uses.
+      TIMESTAMP_HEADER = "timestamp_in_ms"
+
       # How long #close waits, by default, for the broker to answer for what
       # has been sent.
       CLOSE_TIMEOUT = 5
@@ -87,7 +98,8 @@ module Async
       attr :client, :exchange
 
       def initialize(client, exchange = "", mandatory: false, persistent: true, resend: false,
-                     max_unconfirmed: 1000)
+                     timestamps: true, max_unconfirmed: 1000)
+        @timestamps  = timestamps
         @client      = client
         @exchange    = exchange.to_s
         @mandatory   = mandatory
@@ -160,14 +172,18 @@ module Async
         properties[:user_id]          = user_id          if user_id
         properties[:app_id]           = app_id           if app_id
 
+        # A copy: the caller keeps its hash and may change it, and what is sent
+        # again after a reconnect must be what was sent the first time.
+        headers    = headers.dup if headers
         publish_id = nil
         if mandatory
           publish_id = "#{@token}.#{@sequence += 1}"
-          headers    = headers ? headers.merge(PUBLISH_ID_HEADER => publish_id) : { PUBLISH_ID_HEADER => publish_id }
-        elsif headers
-          # The caller keeps its hash and may change it; what is sent again
-          # after a reconnect must be what was sent the first time.
-          headers = headers.dup
+          (headers ||= {})[PUBLISH_ID_HEADER] = publish_id
+        end
+        if @timestamps
+          now = Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond)
+          properties[:timestamp] ||= now / 1000
+          (headers ||= {})[TIMESTAMP_HEADER] ||= now
         end
         properties[:headers] = headers if headers
 

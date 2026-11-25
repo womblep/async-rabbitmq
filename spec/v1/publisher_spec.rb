@@ -54,7 +54,27 @@ RSpec.describe Async::RabbitMQ::Publisher, :integration do
         expect(properties).to include(content_type: "application/json", correlation_id: "c-1", reply_to: "replies",
                                       message_id: "m-1", type: "order.created", app_id: "spec", priority: 3,
                                       expiration: "60000", delivery_mode: 2)
-        expect(properties[:headers]).to eq("tenant" => "acme")
+        expect(properties[:headers]).to include("tenant" => "acme")
+      end
+    end
+
+    it "stamps each message with when it was published, unless told not to" do
+      with_client do |client, _|
+        orders = client.queue("orders")
+        before = Time.now
+        client.publisher.publish("stamped", routing_key: "orders")
+        client.publisher.publish("given", routing_key: "orders", timestamp: 1_700_000_000,
+                                          headers: { "timestamp_in_ms" => 1_700_000_000_123 })
+        client.publisher(timestamps: false).publish("bare", routing_key: "orders")
+
+        stamped, given, bare = messages_in(client, orders, 3).map(&:last)
+        milliseconds = stamped[:headers]["timestamp_in_ms"]
+        expect(milliseconds).to be_between((before.to_f * 1000).floor, (Time.now.to_f * 1000).ceil)
+        expect(stamped[:timestamp].to_i).to eq(milliseconds / 1000)
+        expect(given[:timestamp].to_i).to eq(1_700_000_000)
+        expect(given[:headers]["timestamp_in_ms"]).to eq(1_700_000_000_123)
+        expect(bare).not_to have_key(:timestamp)
+        expect(bare).not_to have_key(:headers)
       end
     end
 
@@ -181,7 +201,7 @@ RSpec.describe Async::RabbitMQ::Publisher, :integration do
 
         received, properties = messages_in(client, orders, 1).first
         expect(received).to eq("original")
-        expect(properties[:headers]).to eq("k" => "v")
+        expect(properties[:headers]).to include("k" => "v")
       end
     end
 

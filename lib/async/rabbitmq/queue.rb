@@ -63,6 +63,16 @@ module Async
         @client.queue?(@name)
       end
 
+      # A Consumer of this queue. See Client#consumer.
+      def consumer(**options, &block)
+        @client.consumer(@name, **options, &block)
+      end
+
+      # A ManagedConsumer of this queue. See Client#managed_consumer.
+      def managed_consumer(**options, &block)
+        @client.managed_consumer(@name, **options, &block)
+      end
+
       # Remove every message that is ready. Returns how many there were.
       def purge
         @client.purge_queue(@name)

@@ -1,0 +1,494 @@
+# frozen_string_literal: true
+
+require "async"
+require "async/promise"
+require "async/queue"
+require "async/semaphore"
+require "console"
+require "amq/protocol"
+
+require_relative "error"
+require_relative "channel"
+require_relative "message"
+
+module Async
+  module RabbitMQ
+    # A consumer you pull from. #each hands the block one Message at a time,
+    # in the fiber that called it, and the block settles each one itself:
+    #
+    #   consumer = client.consumer("orders", prefetch: 10)
+    #   consumer.each do |message|
+    #     process(message.body)
+    #     message.ack
+    #   rescue InvalidOrder
+    #     message.reject(requeue: false)
+    #   end
+    #
+    # Nothing is settled for you. A block that returns without calling #ack,
+    # #nack or #reject leaves the message unacknowledged, which is how a
+    # message is handed to another fiber to finish later. An exception out of
+    # the block ends the loop and is raised from #each, with the message it
+    # was holding still unacknowledged.
+    #
+    # +prefetch+ is what bounds the consumer: the broker sends no more than
+    # that many unsettled messages, so that is the most that can ever be
+    # waiting here.
+    #
+    # == A queue of the consumer's own
+    #
+    # Given no queue, or +exclusive: true+, the consumer declares a queue
+    # that is its alone - exclusive to its connection, and gone when that
+    # connection goes - and binds it as asked:
+    #
+    #   replies = client.consumer(prefetch: 50)
+    #   replies.queue_name                       # the name the broker chose
+    #   replies.bind("events", routing_key: "order.*")
+    #
+    # After a lost connection the queue is declared again, with its bindings,
+    # on the next one. Whatever was in it went with the old connection, and a
+    # queue the broker named has a new name; #on_attach is how to hear of it.
+    #
+    # == How #each ends
+    #
+    # It returns when the consumer goes away, and says why:
+    #
+    # [:stopped]         #stop was called.
+    # [:cancelled]       the broker cancelled the consumer (the queue was
+    #                    deleted).
+    # [:closed]          the consumer, or its client, was closed.
+    # [:connection_lost] the connection was lost, and the consumer was
+    #                    created with +on_connection_loss: :end+.
+    #
+    # A +break+ out of the block ends it too. It raises ChannelError if the
+    # broker closes the consumer's channel or refuses the queue, and
+    # ConnectionError if the client gives up reconnecting. However it ends,
+    # the consumer is cancelled and the messages that had arrived but had not
+    # been handed to the block are put back on the queue. The consumer can be
+    # run again; messages the block kept unsettled can still be settled until
+    # the consumer is closed.
+    #
+    # == A lost connection
+    #
+    # By default it is not an ending. #each waits for the client's next
+    # connection, consumes again there, and carries on. Messages delivered on
+    # the old connection are stale: the broker has requeued them and sends
+    # them again, so any still waiting here are dropped without being
+    # yielded, and settling one already handed out does nothing.
+    #
+    # Options:
+    #
+    # [prefetch]           unsettled messages the broker sends at once.
+    #                      Default 100; nil for no limit, which has the broker
+    #                      send the whole queue.
+    # [on_connection_loss] :wait (the default) or :end; see above.
+    # [exclusive]          the queue is the consumer's own. Default true when
+    #                      no queue is named, false otherwise.
+    # [queue_arguments]    arguments for the consumer's own queue.
+    # [arguments]          arguments for basic.consume.
+    #
+    # For handlers that run concurrently, are acked when they return and
+    # nacked when they raise, see ManagedConsumer, which is built on this.
+    class Consumer
+      include Channel::Delegate
+
+      P = AMQ::Protocol
+      private_constant :P
+
+      # Pushed onto the buffer to wake #each. Compared by identity.
+      WAKE = Object.new.freeze
+      # The broker cancelled the consumer, or closed or lost the channel.
+      Cancelled = Struct.new(:channel)
+      Lost      = Struct.new(:channel, :error)
+      private_constant :WAKE, :Cancelled, :Lost
+
+      LOSS_POLICIES = %i[wait end].freeze
+
+      attr :client, :prefetch
+
+      # The tag of the running consumer; nil when #each is not running.
+      attr :consumer_tag
+
+      def initialize(client, queue = nil, prefetch: 100, on_connection_loss: :wait, exclusive: nil,
+                     queue_arguments: {}, arguments: {}, register: true)
+        unless prefetch.nil? || (prefetch.is_a?(Integer) && prefetch.positive?)
+          raise ArgumentError, "prefetch must be a positive Integer or nil (got #{prefetch.inspect})"
+        end
+        unless LOSS_POLICIES.include?(on_connection_loss)
+          raise ArgumentError, "on_connection_loss must be :wait or :end (got #{on_connection_loss.inspect})"
+        end
+
+        name = queue.respond_to?(:name) ? queue.name : queue.to_s
+        exclusive = name.empty? if exclusive.nil?
+        raise ArgumentError, "A consumer of a queue that is not its own needs the queue's name" if name.empty? && !exclusive
+
+        @client          = client
+        @requested_name  = name
+        @queue_name      = name.empty? ? nil : name
+        @exclusive       = exclusive ? true : false
+        @queue_arguments = queue_arguments
+        @arguments       = arguments
+        @prefetch        = prefetch
+        @on_loss         = on_connection_loss
+        @bindings        = []
+        @on_attach       = nil
+        @channel         = nil
+        @queue_connection = nil # the connection the consumer's own queue lives on
+        @attaching       = Async::Semaphore.new(1)
+        @buffer          = nil # the running #each's queue of messages and signals
+        @consuming       = nil # the channel the running #each is consuming on
+        @consumer_tag    = nil
+        @broker_cancelled = false
+        @stopping        = false
+        @done            = nil # Promise resolved when the running #each has ended
+        @fiber           = nil
+        @closed          = false
+        @attached_before = false
+
+        client.register(self) if register
+        begin
+          channel
+        rescue Exception # rubocop:disable Lint/RescueException
+          client.unregister(self) if register
+          @closed = true
+          raise
+        end
+      end
+
+      # The name of the queue consumed from. For a queue the broker named, the
+      # name it has now: it changes when the queue is declared again on a new
+      # connection.
+      attr :queue_name
+
+      # True if the queue is the consumer's own.
+      def exclusive?
+        @exclusive
+      end
+
+      # :wait or :end.
+      def on_connection_loss
+        @on_loss
+      end
+
+      # True while #each is running.
+      def running?
+        !@buffer.nil?
+      end
+
+      def closed?
+        @closed
+      end
+
+      # Bind the consumer's own queue to +exchange+ (an Exchange or its
+      # name). The binding is the consumer's: it is made again whenever the
+      # queue is declared again. For a queue that is not the consumer's own,
+      # bind the Queue.
+      def bind(exchange, routing_key: "", arguments: {})
+        raise Error, "Only a consumer's own queue is bound through it; bind #{@queue_name} with Queue#bind" unless @exclusive
+
+        binding = [exchange.respond_to?(:name) ? exchange.name : exchange.to_s, routing_key.to_s, arguments]
+        return self if @bindings.include?(binding)
+
+        current = @channel
+        @bindings << binding
+        begin
+          # If there is a channel the binding is made now; if there is not,
+          # opening one makes it with the rest.
+          current&.open? ? bind_queue(current, binding) : channel
+        rescue ChannelError
+          # Refused, and it would be refused again on every reconnect.
+          @bindings.delete(binding)
+          raise
+        end
+        self
+      end
+
+      # Undo a #bind.
+      def unbind(exchange, routing_key: "", arguments: {})
+        binding = [exchange.respond_to?(:name) ? exchange.name : exchange.to_s, routing_key.to_s, arguments]
+        return self unless @bindings.delete(binding)
+
+        # On whatever channel there is or can be had: the queue outlives its
+        # channel, and the binding with it.
+        current = channel
+        current.call(P::Queue::Unbind.encode(current.id, @queue_name, binding[0], binding[1], arguments),
+                     P::Queue::UnbindOk)
+        self
+      end
+
+      # Have +block+ called, with the consumer, each time it has attached to
+      # a connection after the first: its channel is open and, if the queue
+      # is its own, the queue is declared and bound. It runs in whichever
+      # fiber brought that about, before any message from the new connection
+      # is handed out. This is where to learn the new name of a queue the
+      # broker named.
+      def on_attach(&block)
+        @on_attach = block
+        self
+      end
+
+      # Consume, yielding one Message at a time to the block in the calling
+      # fiber, until the consumer goes away. Returns why; see the class
+      # comment.
+      def each
+        raise ArgumentError, "Consumer#each needs a block" unless block_given?
+        raise ClosedError, "This consumer has been closed" if @closed
+        raise Error, "This consumer is already running on #{@queue_name}" if @buffer
+
+        buffer    = @buffer = Async::Queue.new
+        @done     = Async::Promise.new
+        @fiber    = Fiber.current
+        @stopping = false
+        result    = nil
+        begin
+          subscribe
+          loop do
+            # Checked before the wait as well as after: a stop asked for
+            # while the block ran must not go on to hand out what is waiting.
+            if @stopping
+              result = @closed ? :closed : :stopped
+              break
+            end
+
+            item = buffer.dequeue
+            case item
+            when Message
+              if @stopping
+                requeue(item)
+              elsif !item.stale?
+                yield item
+              end
+            when Cancelled
+              next unless item.channel.equal?(@consuming)
+
+              @broker_cancelled = true
+              result = :cancelled
+              break
+            when Lost
+              next unless item.channel.equal?(@consuming)
+              raise item.error unless item.error.is_a?(ConnectionError)
+
+              @consuming = @consumer_tag = nil
+              if @on_loss == :end
+                result = :connection_lost
+                break
+              end
+              subscribe
+            end
+          end
+        rescue ClosedError
+          # The consumer or its client was closed while this waited for a
+          # connection.
+          raise unless @closed || @client.closed?
+
+          result = :closed
+        end
+        result
+      ensure
+        finish(buffer) if buffer
+      end
+
+      # Ask a running #each to end. It returns :stopped once the block has
+      # finished with the message it is on; anything waiting behind that is
+      # put back on the queue. Safe from any fiber, and when not running.
+      def stop
+        return unless (buffer = @buffer)
+
+        @stopping = true
+        buffer.push(WAKE)
+        nil
+      end
+
+      # Close the consumer: stop #each if it is running, wait for it to
+      # return, and close the channel. Messages left unsettled go back on the
+      # queue, and a queue of the consumer's own goes with its connection.
+      def close
+        return if @closed
+
+        @closed = true
+        stop
+        # Wait for #each to cancel and put back what it holds, while the
+        # channel is still there to do it on. An #each that is itself waiting
+        # for a connection is not waited for: it has nothing to put back, and
+        # returns :closed when its wait ends.
+        done = @done
+        done.wait if done && @consuming && !@fiber.equal?(Fiber.current)
+        @client.unregister(self)
+        channel, @channel = @channel, nil
+        channel&.close
+        nil
+      end
+
+      def inspect
+        state = @closed ? "closed" : (running? ? "running" : "idle")
+        "#<#{self.class.name} queue=#{@queue_name.inspect} #{state}>"
+      end
+
+      # -----------------------------------------------------------------------
+      # Internal: Channel::Delegate. Called on the connection's reader fiber,
+      # so nothing here may wait.
+      # -----------------------------------------------------------------------
+
+      def deliver(method, header, body)
+        message = Message.new(@channel, method, header, body)
+        if (buffer = @buffer)
+          buffer.push(message)
+        else
+          # Nobody is reading: it was on its way when the consumer was
+          # cancelled, and goes straight back.
+          requeue(message)
+        end
+      end
+
+      def cancelled(_method)
+        @buffer&.push(Cancelled.new(@channel))
+      end
+
+      def closed(error)
+        channel, @channel = @channel, nil
+        @buffer&.push(Lost.new(channel, error))
+      end
+
+      private
+
+      # The consumer's channel, opened and prepared if there is none: prefetch
+      # set and, for a queue of its own, the queue declared and bound. Waits
+      # for a connection if need be. Raises what the broker refuses, and
+      # ClosedError or ConnectionError once the client has ended.
+      def channel
+        current = @channel
+        return current if current&.open?
+
+        @attaching.acquire do
+          current = @channel
+          return current if current&.open?
+
+          delay = 0.05
+          loop do
+            raise ClosedError, "This consumer has been closed" if @closed
+
+            fresh = @channel = @client.open_channel(self)
+            if @closed
+              @channel = nil
+              fresh.close
+              raise ClosedError, "This consumer has been closed"
+            end
+            begin
+              if prepare(fresh) && fresh.open?
+                attached if @attached_before
+                @attached_before = true
+                return fresh
+              end
+            rescue ConnectionError
+              raise if @client.closed? || @client.failure
+            end
+            sleep(delay)
+            delay = [delay * 2, 1].min
+          end
+        end
+      end
+
+      def prepare(channel)
+        if @prefetch
+          channel.call(P::Basic::Qos.encode(channel.id, 0, @prefetch, false), P::Basic::QosOk)
+        end
+        return true unless @exclusive
+
+        # On the connection the queue was declared on it still exists, and is
+        # asked for by the name it has; on another it is declared anew, and a
+        # queue the broker names gets a new name.
+        connection = channel.connection
+        if connection.equal?(@queue_connection) && @requested_name.empty?
+          # A name the broker chose cannot be declared, only asked after.
+          begin
+            channel.call(P::Queue::Declare.encode(channel.id, @queue_name, true, false, true, false, false, {}),
+                         P::Queue::DeclareOk)
+          rescue ChannelError => error
+            raise unless error.not_found?
+
+            # Deleted behind our back. The refusal closed the channel; the
+            # next attempt declares a new queue.
+            @queue_connection = nil
+            return false
+          end
+        else
+          ok = channel.call(P::Queue::Declare.encode(channel.id, @requested_name, false, false, true, false, false,
+                                                     @queue_arguments), P::Queue::DeclareOk)
+          @queue_name       = ok.queue
+          @queue_connection = connection
+        end
+        @bindings.each { |binding| bind_queue(channel, binding) }
+        true
+      end
+
+      def bind_queue(channel, binding)
+        exchange, routing_key, arguments = binding
+        channel.call(P::Queue::Bind.encode(channel.id, @queue_name, exchange, routing_key, false, arguments),
+                     P::Queue::BindOk)
+      end
+
+      def attached
+        @on_attach&.call(self)
+      rescue StandardError => error
+        Console.error(self, "on_attach for #{@queue_name} raised", exception: error)
+      end
+
+      # Start consuming on the consumer's channel, opening one if need be.
+      def subscribe
+        stale = 0
+        begin
+          channel = self.channel
+          ok = channel.call(P::Basic::Consume.encode(channel.id, @queue_name, "", false, false, false, false,
+                                                     @arguments), P::Basic::ConsumeOk)
+          @consumer_tag     = ok.consumer_tag
+          @consuming        = channel
+          @broker_cancelled = false
+        rescue ConnectionError
+          raise if @closed || @client.closed? || @client.failure
+
+          retry
+        rescue ClosedError
+          # The channel closed between being handed over and being used.
+          raise if @closed || @client.closed? || (stale += 1) > 3
+
+          retry
+        end
+      end
+
+      # Cancel the consumer and put back whatever arrived and was not handed
+      # out. Runs on every way out of #each, a stop of the calling task
+      # included, so nothing here may assume the channel is still usable.
+      def finish(buffer)
+        channel = @consuming
+        tag     = @consumer_tag
+        if channel&.open? && tag && !@broker_cancelled
+          begin
+            # Deliveries already on their way arrive before the cancel-ok,
+            # and land in the buffer, which is emptied below.
+            channel.call(P::Basic::Cancel.encode(channel.id, tag, false), P::Basic::CancelOk)
+          rescue Error => error
+            Console.debug(self, "Consumer #{tag} on #{@queue_name}: cancel failed while stopping", exception: error)
+          end
+        end
+      ensure
+        @buffer = nil if @buffer.equal?(buffer)
+        until buffer.empty?
+          item = buffer.dequeue
+          requeue(item) if item.is_a?(Message)
+        end
+        @consuming = @consumer_tag = nil
+        @stopping  = false
+        @fiber     = nil
+        done, @done = @done, nil
+        done&.resolve(true)
+      end
+
+      # Put an undelivered message back. A channel that has gone has already
+      # requeued it.
+      def requeue(message)
+        message.nack(requeue: true)
+      rescue StandardError
+        false
+      end
+    end
+  end
+end
