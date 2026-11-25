@@ -163,6 +163,10 @@ module AsyncRabbitMQ
           # Taken off the queue just as the consumer began to stop: it has
           # not started, so it goes back like the rest that had not.
           next requeue(message) if @draining
+          # Waiting here when the connection went. The broker took it back
+          # and will send it again; handling this copy would do the work
+          # twice, and the first time could not even be acknowledged.
+          next if message.stale?
 
           @busy += 1
           begin

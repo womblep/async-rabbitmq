@@ -272,6 +272,48 @@ RSpec.describe "Native consumers", :integration do
       end
     end
 
+    it "does not come back when its closed channel is reopened with its consumers" do
+      isolated_session do |session, _|
+        ch, q = setup(session, "reopen")
+        consumer = q.consumer(prefetch: 1)
+        task = Async { consumer.each { |message| message.ack } }
+        wait_for { consumer.consumer_tag }
+
+        # An ack for a delivery that never was: the broker closes the channel.
+        ch.basic_ack(AsyncRabbitMQ::VersionedDeliveryTag.new(999, ch.delivery_generation))
+        expect(task.wait).to eq(:closed)
+
+        ch.reopen(recover_consumers: true)
+        expect(consumers(q)).to eq(0)
+        ch.basic_publish("later", routing_key: q.name)
+        wait_for { ready(q) == 1 }
+        ch.close
+      end
+    end
+
+    it "cancels itself if the channel puts it back after its each has ended" do
+      isolated_session do |session, _|
+        ch, q = setup(session, "orphan")
+        consumer = q.consumer(prefetch: 1)
+        task = Async { consumer.each { |message| message.ack } }
+        wait_for { consumer.consumer_tag }
+        block = ch.instance_variable_get(:@consumers).fetch(consumer.consumer_tag)[:block]
+        consumer.stop
+        expect(task.wait).to eq(:stopped)
+
+        # What the recovery of a broker-cancelled consumer does when it was
+        # already under way as each ended: consume again with the old block.
+        ch.basic_consume(q.name, manual_ack: true, &block)
+        expect(consumers(q)).to eq(1)
+        ch.basic_publish("orphaned", routing_key: q.name)
+
+        wait_for { consumers(q) == 0 }
+        wait_for { ready(q) == 1 } # put back, and not sent round again
+        expect(ch).to be_open
+        ch.close
+      end
+    end
+
     it "can be run again after it has ended" do
       isolated_session do |session, _|
         ch, q = setup(session, "again", count: 2)
@@ -630,6 +672,33 @@ RSpec.describe "Native consumers", :integration do
 
         ch.close
         expect(task.wait).to eq(:closed)
+      end
+    end
+
+    it "does not run handlers for messages that were waiting when the connection went" do
+      isolated_session do |session, _|
+        ch, q = setup(session, "managed-stale", count: 5)
+        consumer = q.managed_consumer(concurrency: 1, prefetch: 5)
+        handled = []
+        release = Async::Promise.new
+        task = Async do
+          consumer.run do |message|
+            handled << [message.body, message.redelivered?]
+            release.wait if handled.size == 1 # m0 holds the only slot; m1..m4 wait behind it
+            consumer.stop if handled.count { |_, redelivered| redelivered } == 5
+          end
+        end
+        wait_for { handled.size == 1 && consumer.instance_variable_get(:@jobs).size == 4 }
+
+        recover_connection!(session)
+        release.resolve(true)
+        expect(task.wait).to eq(:stopped)
+
+        # Each message once from the new connection. The four that were
+        # queued behind m0 on the old one were the broker's again by then.
+        expect(handled.reject { |_, redelivered| redelivered }).to eq([["m0", false]])
+        expect(handled.select { |_, redelivered| redelivered }.map(&:first)).to eq(%w[m0 m1 m2 m3 m4])
+        ch.close
       end
     end
 

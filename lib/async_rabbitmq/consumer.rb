@@ -53,7 +53,7 @@ module AsyncRabbitMQ
 
     # One #each call's state. Late deliveries from an earlier subscription
     # hold the earlier object, so they can never land in a later one's buffer.
-    Subscription = Struct.new(:buffer, :open, :ended_because)
+    Subscription = Struct.new(:buffer, :open, :ended_because, :orphan_cancelled)
     private_constant :Subscription
 
     # What the channel signals when the consumer is gone for good.
@@ -110,7 +110,7 @@ module AsyncRabbitMQ
         # is there any point handing out a message from a channel that has
         # closed, since it can no longer be settled; a consumer the broker
         # cancelled is different, and what it already delivered is still good.
-        break if @stopping || subscription.ended_because == :closed
+        break if @stopping || @channel.closed?
 
         message = subscription.buffer.dequeue
         break if message.equal?(ENDED)
@@ -125,7 +125,7 @@ module AsyncRabbitMQ
 
         yield message
       end
-      subscription.ended_because || :stopped
+      subscription.ended_because || (@stopping ? :stopped : :closed)
     ensure
       finish(subscription) if subscription
     end
@@ -154,11 +154,33 @@ module AsyncRabbitMQ
       @consumer_tag = channel.basic_consume(@queue_name, consumer_tag: @requested_tag, manual_ack: true,
                                             exclusive: @exclusive, arguments: @arguments) do |info, header, body|
         message = Message.new(channel, info, header, body)
-        # A delivery can still be on its way to this block after the consumer
-        # was cancelled. Nobody will dequeue it, so it goes straight back.
-        subscription.open ? subscription.buffer.push(message) : requeue(message)
+        if subscription.open
+          subscription.buffer.push(message)
+        else
+          # Nobody will dequeue it, so it goes straight back.
+          requeue(message)
+          cancel_orphan(channel, info.consumer_tag, subscription)
+        end
       end
       @channel.watch_consumer(@consumer_tag, Watcher.new(self, subscription))
+    end
+
+    # A delivery for a subscription that has ended. Usually it was simply on
+    # its way when the consumer was cancelled, and the cancel has dealt with
+    # it. But the channel can also put a consumer back that this object has
+    # finished with: a reopen that restores consumers, or the recovery of a
+    # consumer the broker cancelled, which was already under way when #each
+    # ended. Such a consumer has nobody reading from it, and would have every
+    # message put back and sent again without end. So if this tag is still
+    # consuming, it is cancelled, once.
+    def cancel_orphan(channel, tag, subscription)
+      return if subscription.orphan_cancelled || !channel.open? || !channel.consumer?(tag)
+
+      subscription.orphan_cancelled = true
+      channel.basic_cancel(tag)
+    rescue StandardError => e
+      channel.logger.debug(self, "Consumer #{tag} on #{@queue_name}: could not cancel after its each had ended: " \
+                                 "#{e.class}: #{e.message}")
     end
 
     # The channel's signal that this consumer will not deliver again.
@@ -185,7 +207,14 @@ module AsyncRabbitMQ
           # back, for ever. basic_cancel waits the recovery out and then
           # cancels, so on that path this does not return until the
           # connection is back or has been given up on.
-          @channel.basic_cancel(tag) if !@channel.closed? && @channel.consumer?(tag)
+          if @channel.closed?
+            # Nothing to cancel on the broker, but the channel remembers its
+            # consumers so that reopen(recover_consumers: true) can put them
+            # back, and this one must not come back.
+            @channel.forget_consumer(tag)
+          elsif @channel.consumer?(tag)
+            @channel.basic_cancel(tag)
+          end
         rescue StandardError => e
           @channel.logger.debug(self, "Consumer #{tag} on #{@queue_name}: cancel failed while stopping: #{e.class}: #{e.message}")
         end

@@ -647,6 +647,16 @@ module AsyncRabbitMQ
       @each_waiters.delete(consumer_tag)
     end
 
+    # Internal, for Consumer: drop a consumer from this channel's books
+    # without a basic.cancel, for a channel that is closed and so has nothing
+    # to cancel on. It will not be restored by reopen(recover_consumers: true)
+    # or by a connection recovery.
+    def forget_consumer(consumer_tag)
+      @consumers.delete(consumer_tag)
+      topology&.delete_consumer(consumer_tag)
+      nil
+    end
+
     # Ask the broker to redeliver all unacknowledged messages on this channel.
     # RabbitMQ only supports requeue: true; requeue: false raises a channel error.
     def basic_recover(requeue: true)
