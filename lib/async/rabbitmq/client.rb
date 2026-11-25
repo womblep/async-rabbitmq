@@ -11,6 +11,7 @@ require_relative "connection"
 require_relative "topology"
 require_relative "queue"
 require_relative "exchange"
+require_relative "publisher"
 
 module Async
   module RabbitMQ
@@ -165,6 +166,20 @@ module Async
                                                               arguments: {})
       end
 
+      # A Publisher to +exchange+ (an Exchange or its name; the default
+      # exchange if none is given). With a block, yields it and closes it
+      # afterwards. See Publisher for the options.
+      def publisher(exchange = "", **options)
+        publisher = Publisher.new(self, exchange, **options)
+        return publisher unless block_given?
+
+        begin
+          yield publisher
+        ensure
+          publisher.close
+        end
+      end
+
       # Whether a queue of this name exists on the broker.
       def queue?(name)
         queue_status(name.to_s)
@@ -310,6 +325,15 @@ module Async
       def unregister(link)
         @links.delete(link)
         nil
+      end
+
+      # Run +block+ in a background task for a link: one that does not hold
+      # the reactor open, and does not belong to whichever fiber happened to
+      # create the link, which may be long finished while the link lives on.
+      def spawn(&block)
+        parent = @supervisor
+        parent = Async::Task.current if parent.nil? || parent.finished?
+        parent.async(transient: true, &block)
       end
 
       private

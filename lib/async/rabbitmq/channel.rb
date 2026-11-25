@@ -128,7 +128,13 @@ module Async
       def write_content(bytes)
         raise closed_error if @closed
 
-        @connection.write_content(bytes)
+        if @connection.blocked?
+          @connection.wait_unblocked
+          # The channel can have closed during the wait, and a frame sent on a
+          # closed channel costs the whole connection.
+          raise closed_error if @closed
+        end
+        @connection.write(bytes)
       end
 
       # Close the channel. The delegate is not told: it asked.

@@ -2,6 +2,7 @@
 
 require "async"
 require "async/promise"
+require "async/condition"
 require "console"
 require "amq/protocol"
 
@@ -96,6 +97,9 @@ module Async
         @unblocked = nil # Promise for one blocked episode
         @reader    = nil
         @heartbeater = nil
+        @flusher   = nil
+        @flush_wanted  = Async::Condition.new
+        @flush_pending = false
         @last_read = now
       end
 
@@ -175,13 +179,24 @@ module Async
 
       # Send whole frames. Raises ConnectionError if the connection has closed
       # or closes in the attempt.
+      #
+      # The frames go into the stream's buffer, and the flusher task puts them
+      # on the wire the next time the reactor comes round to it. Everything
+      # written in between - a hundred fibers each publishing one message, say
+      # - goes out in one write to the socket, where sending each as it came
+      # would cost a system call apiece. A fiber that writes and then waits
+      # for the reply loses nothing: its waiting is what lets the flusher run.
       def write(bytes)
         raise closed_error if @state == :closed
 
-        # A cancel that landed part way through would leave half a frame on
-        # the wire and the stream beyond use, so it is held until the frame
-        # is out.
-        uninterrupted { @framer.write(bytes) }
+        # The stream sends the buffer itself once it is large, from this
+        # fiber. A cancel that landed part way through that would leave half a
+        # frame on the wire and the stream beyond use, so it is held off.
+        uninterrupted { @framer.write(bytes, flush: false) }
+        unless @flush_pending
+          @flush_pending = true
+          @flush_wanted.signal
+        end
       rescue IOError, SystemCallError => error
         failure = ConnectionError.new("Connection to #{@endpoint} lost: #{error.class}: #{error.message}")
         finish(failure)
@@ -192,11 +207,17 @@ module Async
       # blocked. Acks, closes and everything else are never held back, so a
       # resource alarm cannot stop a consumer settling or a shutdown finishing.
       def write_content(bytes)
+        wait_unblocked
+        write(bytes)
+      end
+
+      # Wait for as long as the broker has publishing blocked. Raises
+      # ConnectionError if the connection closes first.
+      def wait_unblocked
         while @blocked
           outcome = (@unblocked ||= Async::Promise.new).wait
           raise outcome if outcome.is_a?(Exception)
         end
-        write(bytes)
       end
 
       # Give a closed channel's id back.
@@ -247,6 +268,7 @@ module Async
         @last_read   = now
         @reader      = parent.async(transient: true) { read_frames }
         @heartbeater = parent.async(transient: true) { send_heartbeats } if @heartbeat.positive?
+        @flusher     = parent.async(transient: true) { flush_writes }
         self
       end
 
@@ -313,6 +335,19 @@ module Async
         # However the reader ends, the connection is over: nothing else would
         # ever notice a frame again.
         finish(failure || @error) unless @state == :closed
+      end
+
+      # Put on the wire what #write has buffered. While this is in the middle
+      # of a write to a socket that is full, the stream's lock is held, and
+      # the fibers writing wait behind it: that is the backpressure.
+      def flush_writes
+        loop do
+          @flush_wanted.wait until @flush_pending
+          @flush_pending = false
+          @framer.flush
+        end
+      rescue IOError, SystemCallError => error
+        finish(ConnectionError.new("Connection to #{@endpoint} lost: #{error.class}: #{error.message}"))
       end
 
       def receive(frame)
@@ -410,7 +445,7 @@ module Async
         channels.each { |channel| channel.connection_closed(closed_error) }
         @finished.resolve(error)
         current = Async::Task.current?
-        [@reader, @heartbeater].each { |task| cancel(task) if task && !task.equal?(current) }
+        [@reader, @heartbeater, @flusher].each { |task| cancel(task) if task && !task.equal?(current) }
       end
 
       def closed_error

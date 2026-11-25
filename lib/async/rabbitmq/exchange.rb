@@ -57,6 +57,11 @@ module Async
         @client.exchange?(@name)
       end
 
+      # A Publisher to this exchange. See Client#publisher.
+      def publisher(**options, &block)
+        @client.publisher(@name, **options, &block)
+      end
+
       # Delete the exchange, and have the client forget it.
       def delete(if_unused: false)
         @client.delete_exchange(@name, if_unused: if_unused)

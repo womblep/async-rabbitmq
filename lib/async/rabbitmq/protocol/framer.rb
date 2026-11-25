@@ -44,11 +44,17 @@ module Async
           raise ProtocolError, "Invalid frame from the broker: #{error.message}"
         end
 
-        # Write +bytes+, which must be whole frames, and send them. The stream
-        # appends under a lock of its own, so frames written from different
-        # fibers never interleave.
-        def write(bytes)
-          @stream.write(bytes, flush: true)
+        # Write +bytes+, which must be whole frames. The stream appends under a
+        # lock of its own, so frames written from different fibers never
+        # interleave. Without +flush+ they wait in the stream's buffer for a
+        # #flush, or for the buffer to fill.
+        def write(bytes, flush: true)
+          @stream.write(bytes, flush: flush)
+        end
+
+        # Send whatever is waiting in the buffer.
+        def flush
+          @stream.flush
         end
 
         def write_protocol_header

@@ -73,5 +73,42 @@ module Async
 
     # Every channel id the broker allows on this connection is in use.
     class ChannelLimitError < Error; end
+
+    # A published message was not confirmed.
+    class PublishError < Error; end
+
+    # The connection was lost after the message was sent and before the broker
+    # answered for it, so the broker may or may not have it. Sending it again
+    # (Publisher::Outcome#resubmit) risks a second copy; not sending it risks
+    # none. Which is right depends on the message, so it is the caller's call.
+    # +reason+ is the error that ended the connection.
+    class UnconfirmedError < PublishError
+      attr :reason
+
+      def initialize(reason)
+        @reason = reason
+        super("The connection was lost before the broker answered for the message, which it may or may not " \
+              "have taken (#{reason.class.name.split('::').last}: #{reason.message})")
+      end
+    end
+
+    # The broker refused the message: the queue is full and rejects what
+    # overflows it, or the broker failed internally. It is in no queue.
+    class NackedError < PublishError; end
+
+    # The message was published +mandatory+ and no queue was bound to take it.
+    # +code+ and +text+ are the broker's (312 NO_ROUTE).
+    class ReturnedError < PublishError
+      attr :code, :text, :exchange, :routing_key
+
+      def initialize(code:, text:, exchange:, routing_key:)
+        @code        = code
+        @text        = text
+        @exchange    = exchange
+        @routing_key = routing_key
+        super("Message returned by the broker: #{code} #{text} " \
+              "(exchange #{exchange.inspect}, routing key #{routing_key.inspect})")
+      end
+    end
   end
 end
