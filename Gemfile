@@ -15,4 +15,6 @@ group :test do
   # optional and not a runtime dependency.
   gem "opentelemetry-api", "~> 1.1"
   gem "opentelemetry-sdk", "~> 1.1"
+  gem "opentelemetry-metrics-api", "~> 0.6"
+  gem "opentelemetry-metrics-sdk", "~> 0.15"
 end
