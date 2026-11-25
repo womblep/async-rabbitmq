@@ -80,7 +80,8 @@ module Async
     # [prefetch]           unsettled messages the broker sends at once.
     #                      Default 100; nil for no limit, which has the broker
     #                      send the whole queue.
-    # [on_connection_loss] :wait (the default) or :end; see above.
+    # [on_connection_loss] :wait (the default) or :end; see above. A consumer
+    #                      of a Cluster may also say :move; see Cluster.
     # [exclusive]          the queue is the consumer's own. Default true when
     #                      no queue is named, false otherwise.
     # [queue_arguments]    arguments for the consumer's own queue.
@@ -101,7 +102,7 @@ module Async
       Lost      = Struct.new(:channel, :error)
       private_constant :WAKE, :Cancelled, :Lost
 
-      LOSS_POLICIES = %i[wait end].freeze
+      LOSS_POLICIES = %i[wait end move].freeze
 
       attr :client, :prefetch
 
@@ -109,12 +110,15 @@ module Async
       attr :consumer_tag
 
       def initialize(client, queue = nil, prefetch: 100, on_connection_loss: :wait, exclusive: nil,
-                     queue_arguments: {}, arguments: {}, register: true)
+                     queue_arguments: {}, arguments: {}, link: nil, relocate: nil)
         unless prefetch.nil? || (prefetch.is_a?(Integer) && prefetch.positive?)
           raise ArgumentError, "prefetch must be a positive Integer or nil (got #{prefetch.inspect})"
         end
         unless LOSS_POLICIES.include?(on_connection_loss)
-          raise ArgumentError, "on_connection_loss must be :wait or :end (got #{on_connection_loss.inspect})"
+          raise ArgumentError, "on_connection_loss must be :wait, :end or :move (got #{on_connection_loss.inspect})"
+        end
+        if on_connection_loss == :move && relocate.nil?
+          raise ArgumentError, "on_connection_loss: :move needs somewhere to move to: it is for a consumer of a Cluster"
         end
 
         name = queue.respond_to?(:name) ? queue.name : queue.to_s
@@ -129,6 +133,11 @@ module Async
         @arguments       = arguments
         @prefetch        = prefetch
         @on_loss         = on_connection_loss
+        # What is registered with the client: this consumer, or the
+        # ManagedConsumer built on it. And, for a consumer of a Cluster, how
+        # to find it another client.
+        @link            = link || self
+        @relocate        = relocate
         @bindings        = []
         @on_attach       = nil
         @channel         = nil
@@ -144,11 +153,11 @@ module Async
         @closed          = false
         @attached_before = false
 
-        client.register(self) if register
+        client.register(@link)
         begin
           channel
         rescue Exception # rubocop:disable Lint/RescueException
-          client.unregister(self) if register
+          client.unregister(@link)
           @closed = true
           raise
         end
@@ -164,7 +173,7 @@ module Async
         @exclusive
       end
 
-      # :wait or :end.
+      # :wait, :end or :move.
       def on_connection_loss
         @on_loss
       end
@@ -272,6 +281,7 @@ module Async
                 result = :connection_lost
                 break
               end
+              move if @on_loss == :move
               subscribe
             end
           end
@@ -312,7 +322,7 @@ module Async
         # returns :closed when its wait ends.
         done = @done
         done.wait if done && @consuming && !@fiber.equal?(Fiber.current)
-        @client.unregister(self)
+        @client.unregister(@link)
         channel, @channel = @channel, nil
         channel&.close
         nil
@@ -424,6 +434,22 @@ module Async
         exchange, routing_key, arguments = binding
         channel.call(P::Queue::Bind.encode(channel.id, @queue_name, exchange, routing_key, false, arguments),
                      P::Queue::BindOk)
+      end
+
+      # Leave the client whose connection was lost for another, if the
+      # cluster has a better one to offer. The channel is opened there by
+      # whoever asks for it next.
+      def move
+        target = @relocate.call(self)
+        return if target.nil? || target.equal?(@client)
+
+        Console.info(self, "Consumer of #{@queue_name} is moving", from: @client.endpoint.to_s,
+                                                                    to: target.endpoint.to_s)
+        target.register(@link)
+        @client.unregister(@link)
+        @client = target
+      rescue ClosedError
+        # The cluster is closing. Stay; the wait for a connection ends it.
       end
 
       def attached

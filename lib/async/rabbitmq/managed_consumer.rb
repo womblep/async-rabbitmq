@@ -65,7 +65,7 @@ module Async
     class ManagedConsumer
       EXCEPTION_SETTLEMENTS = %i[ack nack reject].freeze
 
-      attr :client, :concurrency, :prefetch, :drain_timeout
+      attr :concurrency, :prefetch, :drain_timeout
 
       def initialize(client, queue = nil, concurrency: 1, prefetch: nil, ack_on_success: true,
                      exception: :nack, requeue: false, drain_timeout: 30, **consumer_options)
@@ -79,7 +79,6 @@ module Async
           raise ArgumentError, "drain_timeout must be nil or a non-negative number (got #{drain_timeout.inspect})"
         end
 
-        @client         = client
         @concurrency    = concurrency
         @prefetch       = prefetch || concurrency
         @ack_on_success = ack_on_success ? true : false
@@ -93,14 +92,12 @@ module Async
         @closed         = false
         # Registered here and not by the Consumer: closing the client has to
         # drain the handlers before the channel they settle on is closed.
-        @consumer = Consumer.new(client, queue, prefetch: @prefetch, register: false, **consumer_options)
-        begin
-          client.register(self)
-        rescue Exception # rubocop:disable Lint/RescueException
-          @consumer.close
-          raise
-        end
+        @consumer = Consumer.new(client, queue, prefetch: @prefetch, link: self, **consumer_options)
       end
+
+      # The client the consumer is attached to. In a Cluster it can change.
+      def client = @consumer.client
+      def on_connection_loss = @consumer.on_connection_loss
 
       # The underlying Consumer's: see there.
       def queue_name = @consumer.queue_name
@@ -199,7 +196,6 @@ module Async
         stop
         done = @done
         done.wait if done && @consumer.consumer_tag && !@fiber.equal?(Fiber.current)
-        @client.unregister(self)
         @consumer.close
         nil
       end

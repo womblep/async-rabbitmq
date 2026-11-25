@@ -79,8 +79,10 @@ module Async
 
       attr :topology
 
+      # +topology+ is for a Cluster, whose clients share one record of what
+      # has been declared.
       def initialize(endpoint, reconnect_interval: 1, reconnect_max_interval: 30, reconnect_attempts: nil,
-                     shuffle: true)
+                     shuffle: true, topology: nil)
         @endpoints = (endpoint.is_a?(Array) ? endpoint : [endpoint]).map do |one|
           one.is_a?(Endpoint) ? one : Endpoint.parse(one.to_s)
         end.freeze
@@ -91,7 +93,8 @@ module Async
         @reconnect_interval     = reconnect_interval
         @reconnect_max_interval = reconnect_max_interval
         @reconnect_attempts     = reconnect_attempts
-        @topology   = Topology.new
+        @topology   = topology || Topology.new
+        @parent     = nil
         @connection = nil
         # Resolved with the connection once there is one and the topology is
         # declared on it; replaced by a fresh one when that connection is
@@ -109,14 +112,32 @@ module Async
       # Connect. Raises if the broker cannot be reached or refuses: the first
       # connection is not retried, so that a wrong address or password is
       # reported and not waited on for ever. Returns self.
-      def connect
+      #
+      # With +background: true+ it returns at once and connects from a
+      # background task instead, retrying as it would after a lost
+      # connection: for a Cluster, which starts with whatever nodes are up
+      # and lets the rest join when they can. The client's background tasks
+      # are children of +parent+.
+      def connect(background: false, parent: Async::Task.current)
         raise ClosedError, "This client has been closed" if @closed
         return self if @supervisor
 
-        connection = open_connection
-        establish(connection)
-        @supervisor = Async(transient: true) { supervise(connection) }
+        @parent = parent
+        if background
+          @supervisor = parent.async(transient: true) do
+            connection = reconnect and supervise(connection)
+          end
+        else
+          connection = open_connection(parent)
+          establish(connection)
+          @supervisor = parent.async(transient: true) { supervise(connection) }
+        end
         self
+      end
+
+      # How many publishers and consumers are attached to this client.
+      def link_count
+        @links.size
       end
 
       # True while there is a usable connection.
@@ -436,11 +457,11 @@ module Async
       # shuffle, and the first to answer is the connection. Raises the last
       # failure when none does. A refusal of the credentials ends it at once:
       # the other endpoints are the same broker and would say the same.
-      def open_connection
+      def open_connection(parent = Async::Task.current)
         candidates = @shuffle ? @endpoints.shuffle : @endpoints
         failure    = nil
         candidates.each do |endpoint|
-          return Connection.open(endpoint)
+          return Connection.open(endpoint, parent: parent)
         rescue AuthenticationError
           raise
         rescue Error => error
