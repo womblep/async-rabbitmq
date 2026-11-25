@@ -33,8 +33,19 @@ module Async
     # While there is no connection, anything that needs one waits. It raises
     # only if the client is closed, or gives up after +reconnect_attempts+.
     #
+    # Given several endpoints - the nodes of one cluster, say - the client
+    # connects to whichever will have it, and when that connection is lost it
+    # tries them all again. It is still one connection to one node at a time;
+    # see Cluster for connections to several.
+    #
+    #   Async::RabbitMQ::Client.open(%w[amqp://rabbit1 amqp://rabbit2 amqp://rabbit3])
+    #
     # Options:
     #
+    # [shuffle]                try the endpoints in a new random order each
+    #                          time. Default true, which spreads a fleet of
+    #                          clients across the nodes; false tries them in
+    #                          the order given.
     # [reconnect_interval]     seconds before the first attempt to reconnect.
     #                          It doubles with each failure. Default 1.
     # [reconnect_max_interval] where the doubling stops. Default 30.
@@ -44,8 +55,9 @@ module Async
       P = AMQ::Protocol
       private_constant :P
 
-      # Open a client. With a block, yields it and closes it when the block
-      # returns or raises; without, returns it for the caller to close.
+      # Open a client on +endpoint+: an Endpoint, a URL, or an Array of either.
+      # With a block, yields it and closes it when the block returns or raises;
+      # without, returns it for the caller to close.
       def self.open(endpoint, **options)
         client = new(endpoint, **options)
         client.connect
@@ -58,10 +70,24 @@ module Async
         end
       end
 
-      attr :endpoint, :topology
+      # The endpoint of the current connection, or of the last one; before
+      # there has been any, the first one given.
+      attr :endpoint
 
-      def initialize(endpoint, reconnect_interval: 1, reconnect_max_interval: 30, reconnect_attempts: nil)
-        @endpoint = endpoint.is_a?(Endpoint) ? endpoint : Endpoint.parse(endpoint.to_s)
+      # Every endpoint the client may connect to.
+      attr :endpoints
+
+      attr :topology
+
+      def initialize(endpoint, reconnect_interval: 1, reconnect_max_interval: 30, reconnect_attempts: nil,
+                     shuffle: true)
+        @endpoints = (endpoint.is_a?(Array) ? endpoint : [endpoint]).map do |one|
+          one.is_a?(Endpoint) ? one : Endpoint.parse(one.to_s)
+        end.freeze
+        raise ArgumentError, "A client needs at least one endpoint" if @endpoints.empty?
+
+        @endpoint = @endpoints.first
+        @shuffle  = shuffle
         @reconnect_interval     = reconnect_interval
         @reconnect_max_interval = reconnect_max_interval
         @reconnect_attempts     = reconnect_attempts
@@ -87,7 +113,7 @@ module Async
         raise ClosedError, "This client has been closed" if @closed
         return self if @supervisor
 
-        connection = Connection.open(@endpoint)
+        connection = open_connection
         establish(connection)
         @supervisor = Async(transient: true) { supervise(connection) }
         self
@@ -400,8 +426,28 @@ module Async
       def establish(connection)
         declare_topology(connection)
         @connection = connection
+        @endpoint   = connection.endpoint
         @admin      = nil
         @ready.resolve(connection)
+      end
+
+      # Connect to whichever endpoint will have us: each is tried in turn, in
+      # a new random order each time unless the client was told not to
+      # shuffle, and the first to answer is the connection. Raises the last
+      # failure when none does. A refusal of the credentials ends it at once:
+      # the other endpoints are the same broker and would say the same.
+      def open_connection
+        candidates = @shuffle ? @endpoints.shuffle : @endpoints
+        failure    = nil
+        candidates.each do |endpoint|
+          return Connection.open(endpoint)
+        rescue AuthenticationError
+          raise
+        rescue Error => error
+          failure = error
+          Console.debug(self, "Could not connect", endpoint: endpoint.to_s, exception: error) if candidates.size > 1
+        end
+        raise failure
       end
 
       # Start a new wait, once, for the connection after +connection+.
@@ -434,11 +480,11 @@ module Async
 
           connection = nil
           begin
-            connection = Connection.open(@endpoint)
+            connection = open_connection
             establish(connection)
             Console.info(self, "Reconnected", endpoint: @endpoint.to_s, attempts: attempts + 1)
             return connection
-          rescue Error, SystemCallError, IOError, SocketError => error
+          rescue Error => error
             connection&.close(error)
             return nil if @closed
 

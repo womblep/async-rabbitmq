@@ -5,6 +5,8 @@ require "async/promise"
 require "async/condition"
 require "console"
 require "amq/protocol"
+require "openssl"
+require "socket"
 
 require_relative "version"
 require_relative "error"
@@ -67,6 +69,12 @@ module Async
         rescue Exception => error # rubocop:disable Lint/RescueException
           # Any way out but success, a cancel included, must not leave a socket.
           connection&.close(error.is_a?(StandardError) ? error : nil)
+          # One kind of error for "could not connect", whatever layer said so:
+          # the resolver, the socket or TLS.
+          case error
+          when SystemCallError, IOError, SocketError, OpenSSL::SSL::SSLError
+            raise ConnectionError, "Could not connect to #{endpoint}: #{error.class}: #{error.message}"
+          end
           raise
         end
         connection.start(parent: parent)
