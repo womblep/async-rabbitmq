@@ -211,6 +211,47 @@ are unconfirmed, and `wait_for_confirms` raises `MessageNacked` instead of
 returning false. Unconfirmed messages are held as encoded bytes, which is what
 makes the re-publish on recovery possible.
 
+`publish_confirmed` returns a `PublishOutcome`, an `Async::Promise` for one
+message. It rides in the fourth slot of that message's pending-confirm entry,
+so the ack, the nack, the replay and the abandoned replay each resolve it at
+the point where they already handle the entry, and a publish that asked for no
+outcome pays for one `nil`. An outcome survives a recovery, because its entry
+does; it is rejected only where the channel ends (user close, broker close,
+connection gone for good), and the entry is kept even then so `Channel#reopen`
+can still replay it.
+
+A `basic.return` carries the message but no delivery tag, and the confirm tag
+is renumbered on every reopen anyway, so a mandatory `publish_confirmed` stamps
+the message with a per-channel counter that never restarts, behind a random
+token of the channel's own (`x-async-rabbitmq-publish-id`), and the return is
+matched on that. The token is there because headers travel: a consumer that
+forwards a message with its headers intact would otherwise hand its own channel
+a return naming somebody else's publish. The .NET client does the same with
+`x-dotnet-pub-seq-no`. The broker sends a return before the ack for the same
+message, so the first resolution wins and the ack that follows cannot overturn
+it. A return is the broker's final answer, so the message leaves the
+unconfirmed table there and then: a reconnect that loses the ack does not
+publish it again behind the publisher's back. Returns are honoured even while
+the channel is resynchronising after an RPC timeout, for the same reason
+confirms are.
+
+An outcome is answered on every path. A publish still parked in its write when
+the channel ends has no confirm tag for the teardown to find, so
+`publish_confirmed` checks on the way out whether a teardown ran and fails the
+outcome itself. A replay cut short (the connection went again while it was
+parked behind `connection.blocked`) puts what it did not send back in the
+table, so the next recovery sends it and a teardown can still fail it.
+
+## Messages
+
+`Message` is the delivery triple plus its channel. It keeps its own settlement
+state rather than asking the channel, which is what makes a second `ack` a
+no-op instead of a 406; the mark is taken before the frame is written, because
+the write can yield and a second fiber must find the message already claimed.
+Staleness is not its concern: it hands its `VersionedDeliveryTag` to the
+channel, which drops the frame and returns false, and the message records
+`:stale`.
+
 ## Errors
 
 Soft errors close the channel and leave the connection up. They raise
@@ -332,7 +373,7 @@ over keeps its dashboards.
 
 ## Tests
 
-455 examples, almost all integration tests against a real broker
+622 examples, almost all integration tests against a real broker
 (`rabbitmq:4-management-alpine` plus Toxiproxy, started by `spec/docker-compose.yml`
 or by `spec_helper` if nothing is listening). Each test gets its own vhost, so
 tests cannot contaminate each other. CI runs Ruby 3.4 and 4.0 over

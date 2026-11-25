@@ -273,6 +273,38 @@ sent and `false` when the tag belonged to an earlier generation and was
 dropped. A dropped ack is not a lost message: the broker requeued it when the
 channel went, and it is redelivered on the new connection.
 
+### A message that settles itself
+
+`AsyncRabbitMQ::Message` wraps the three arguments a consumer block receives
+and remembers the channel they arrived on, so settling needs neither the
+channel nor the delivery tag:
+
+```ruby
+ch.basic_qos(prefetch_count: 10)
+ch.basic_consume("q", manual_ack: true) do |delivery, header, body|
+  message = AsyncRabbitMQ::Message.new(ch, delivery, header, body)
+  handle(message.body, message.headers)
+  message.ack                               # or message.nack(requeue: false), message.reject
+end
+```
+
+It reads `body`, `headers`, `properties`, `routing_key`, `exchange`,
+`redelivered?` and the content properties (`correlation_id`, `reply_to`,
+`content_type` and the rest) as methods, and unpacks back into the triple with
+`delivery, header, body = *message`.
+
+A message is settled at most once: the first of `ack`, `nack` and `reject`
+wins, and later calls return `false` without sending anything. Acknowledging a
+delivery twice is otherwise a 406 that closes the channel and takes its
+consumers with it, and it is an easy thing to do when a handler acks and its
+error path then nacks. `message.settlement` says which one happened, or
+`:stale` when the message came from before a reconnect and there was nothing
+to settle. Wrap a delivery from an automatic-ack consumer with
+`manual_ack: false` and the three calls do nothing.
+
+This is the first piece of an API built for `async` rather than mirrored from
+Bunny; the consumers that hand out `Message` objects directly come next.
+
 ### When a handler raises
 
 The delivery is settled for you. What happens to it is the *disposition*, and
@@ -402,6 +434,46 @@ Messages published under confirms are kept until the broker acks them. If
 the connection drops first they are re-published on the recovered channel
 (the usual at-least-once trade-off: a message the broker had already
 accepted may be delivered twice).
+
+### One answer per publish
+
+`wait_for_confirms` answers for the whole channel: everything published on it
+since the last call, by any fiber. `publish_confirmed` returns a
+`PublishOutcome` for the one message it sent:
+
+```ruby
+ch.confirm_select
+outcome = ch.publish_confirmed("hello", routing_key: "orders", mandatory: true)
+outcome.wait                # => :acked
+outcome.wait(timeout: 5)    # ConfirmTimeoutError if the broker has not answered
+```
+
+`Exchange#publish_confirmed` and `Queue#publish_confirmed` do the same.
+`wait` raises the reason the message did not make it:
+
+| Raises | Meaning |
+|---|---|
+| `MessageNacked` | The broker refused it: a full queue with `x-overflow: reject-publish`, or an internal error. |
+| `MessageReturned` | It was `mandatory: true` and no queue was bound to take it. Carries `reply_code`, `reply_text`, `exchange` and `routing_key`. |
+| `ChannelError`, `ConnectionError`, `NotOpenError` | The channel ended before the broker answered, so the broker may or may not have the message. |
+| `ConfirmTimeoutError` | `timeout:` ran out. The outcome is still pending and can be waited on again. |
+
+Fibers sharing a channel each learn the fate of what they published and
+nothing else. Waiting is optional and can happen later, or for many at once
+with `outcomes.each(&:wait)`; `outcome.status` reads `:pending`, `:acked`,
+`:nacked`, `:returned` or `:failed` without blocking.
+
+A connection loss with recovery does not fail an outcome. The message is
+published again on the new connection and the outcome goes on waiting for
+that copy.
+
+Two things to know. A returned message is reported through its outcome and
+not to `on_return`, which still receives returns for anything published with
+`basic_publish`. And to match a return to its publish, a mandatory
+`publish_confirmed` adds one header to the message,
+`x-async-rabbitmq-publish-id`, which consumers will see; a `basic.return`
+carries no delivery tag, so the message itself has to say which publish it
+was. Messages that are not mandatory are sent unchanged.
 
 ### What a returned publish means here
 

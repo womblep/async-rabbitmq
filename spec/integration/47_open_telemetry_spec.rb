@@ -93,6 +93,27 @@ RSpec.describe "OpenTelemetry tracing", :integration do
     end
   end
 
+  it "traces publish_confirmed like basic_publish, with the trace context beside the publish id" do
+    isolated_session do |session, _|
+      channel = session.open_channel
+      channel.confirm_select
+      queue   = channel.durable_queue("test.otel.outcome.#{SecureRandom.hex(4)}")
+
+      outcome = channel.publish_confirmed("traced", routing_key: queue.name, mandatory: true)
+      expect(outcome.wait(timeout: 5)).to eq(:acked)
+
+      publish = span_named("publish")
+      expect(publish).not_to be_nil
+      expect(publish.kind).to eq(:producer)
+
+      _, header, = channel.basic_get(queue.name, manual_ack: false)
+      expect(header.properties[:headers]).to include(
+        "traceparent" => a_string_including(publish.hex_trace_id),
+        AsyncRabbitMQ::Channel::PUBLISH_ID_HEADER => outcome.publish_id
+      )
+    end
+  end
+
   it "calls the default exchange a queue, as Bunny does" do
     isolated_session do |session, _|
       channel = session.open_channel

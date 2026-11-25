@@ -51,6 +51,12 @@ module AsyncRabbitMQ
       @channel.basic_publish(payload, exchange: @name, routing_key: routing_key, **opts)
     end
 
+    # Publish and return a PublishOutcome for this one message. The channel
+    # must be in confirm mode; see Channel#publish_confirmed.
+    def publish_confirmed(payload, routing_key: "", **opts)
+      @channel.publish_confirmed(payload, exchange: @name, routing_key: routing_key, **opts)
+    end
+
     def delete(if_unused: false)
       @channel.exchange_delete(@name, if_unused: if_unused)
     end

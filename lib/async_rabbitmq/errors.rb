@@ -75,6 +75,23 @@ module AsyncRabbitMQ
     end
   end
 
+  # Raised by PublishOutcome#wait when a message published +mandatory: true+
+  # could not be routed to any queue and the broker sent it back. +reply_code+
+  # is 312 (NO_ROUTE) in practice.
+  class MessageReturned < Error
+    attr_reader :reply_code, :reply_text, :exchange, :routing_key, :channel_id
+
+    def initialize(msg = nil, reply_code: nil, reply_text: nil, exchange: nil, routing_key: nil, channel_id: nil)
+      @reply_code  = reply_code
+      @reply_text  = reply_text
+      @exchange    = exchange
+      @routing_key = routing_key
+      @channel_id  = channel_id
+      super(msg || "Broker returned a message published to exchange #{exchange.to_s.inspect} with routing key " \
+                   "#{routing_key.to_s.inspect} on channel #{channel_id}: #{reply_code} #{reply_text}")
+    end
+  end
+
   # Raised when a cluster-wide operation did not succeed on every node, e.g.
   # a credential rotation that some nodes refused. The message names which.
   class ClusterError < Error; end

@@ -67,6 +67,13 @@ module AsyncRabbitMQ
       @channel.basic_publish(payload, routing_key: routing_key, **opts)
     end
 
+    # Publish to this queue through the default exchange and return a
+    # PublishOutcome for the message. The channel must be in confirm mode;
+    # see Channel#publish_confirmed.
+    def publish_confirmed(payload, routing_key: @name, **opts)
+      @channel.publish_confirmed(payload, routing_key: routing_key, **opts)
+    end
+
     def bind(exchange:, routing_key: "", arguments: {})
       @channel.queue_bind(@name, exchange: exchange, routing_key: routing_key, arguments: arguments)
       self

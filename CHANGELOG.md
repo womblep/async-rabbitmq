@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+The first two pieces of an API built for `async` rather than mirrored from Bunny. Both are
+additions: nothing existing changes behaviour.
+
+### Added
+
+- `AsyncRabbitMQ::Message` wraps the `(delivery_info, header, body)` triple with the channel it
+  arrived on. `message.ack`, `message.nack(requeue:)` and `message.reject(requeue:)` settle it
+  without the caller handling a delivery tag, and only the first of them is sent: a second
+  settle returns `false` instead of drawing the 406 that closes the channel. `settlement` reports
+  `:ack`, `:nack`, `:reject` or `:stale` (delivered before a reconnect, so nothing to settle).
+- `Channel#publish_confirmed`, `Exchange#publish_confirmed` and `Queue#publish_confirmed` return
+  a `PublishOutcome` for the one message published. `outcome.wait` returns `:acked` or raises
+  `MessageNacked`, the new `MessageReturned`, the error that ended the channel, or
+  `ConfirmTimeoutError` when `timeout:` runs out. Concurrent publishers on a channel no longer
+  have to share one `wait_for_confirms` answer. An outcome stays pending across a connection
+  recovery and resolves for the re-published copy.
+- A mandatory `publish_confirmed` adds an `x-async-rabbitmq-publish-id` header, which is how a
+  `basic.return` (which carries no delivery tag) is matched to its publish. Its return is
+  reported through the outcome and not to `on_return`.
+- The OpenTelemetry layer traces `publish_confirmed` with the same producer span as
+  `basic_publish`.
+
 ## [0.9.0] - 2026-11-24
 
 A reliability release: three waves of fixes from a full review of 0.8.1, a broadened recovery
