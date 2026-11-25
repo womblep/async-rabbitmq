@@ -107,6 +107,10 @@ module AsyncRabbitMQ
 
     attr_reader :channel_id, :pool_size
 
+    # Internal: for the objects built on a channel (Consumer, ManagedConsumer),
+    # which log and emit events as part of it.
+    attr_reader :logger, :notifier
+
     # How many times this channel has been opened on a connection: 0 until the
     # first reopen, then one more for each connection recovery or #reopen.
     #
@@ -624,6 +628,23 @@ module AsyncRabbitMQ
         { channel: @channel_id, consumer_tag: consumer_tag, queue: cancelled&.dig(:queue_name), reason: :client }
       end
       wake_each_waiters(consumer_tag)
+    end
+
+    # True while +consumer_tag+ names a consumer registered on this channel.
+    def consumer?(consumer_tag)
+      @consumers.key?(consumer_tag)
+    end
+
+    # Internal, for Consumer: +watcher.signal+ is called once when the consumer
+    # is gone for good - cancelled by either side, or its channel closed - and
+    # not when a connection loss is recovered from. The same notice a fiber
+    # blocked in #each gets, for a caller that is waiting on something else.
+    def watch_consumer(consumer_tag, watcher)
+      @each_waiters[consumer_tag] = watcher
+    end
+
+    def unwatch_consumer(consumer_tag)
+      @each_waiters.delete(consumer_tag)
     end
 
     # Ask the broker to redeliver all unacknowledged messages on this channel.
@@ -2437,7 +2458,10 @@ module AsyncRabbitMQ
         outcome = catch(:reregister) do
           @consumers.keys.each do |tag|
             next if dropped.key?(tag)
-            entry = @consumers[tag]
+            # Cancelled since the keys were listed: a basic_cancel that was
+            # parked for the recovery runs as soon as the channel is open,
+            # which is while this loop is still working through the others.
+            entry = @consumers[tag] or next
             begin
               reopen_for_reregister!(replay: replay) unless open?
               basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack],

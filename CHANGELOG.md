@@ -4,8 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-The first two pieces of an API built for `async` rather than mirrored from Bunny. Both are
-additions: nothing existing changes behaviour.
+The first pieces of an API built for `async` rather than mirrored from Bunny: messages that
+settle themselves, an answer per publish, and consumers you pull from. All are additions:
+nothing existing changes behaviour.
+
+### Fixed
+
+- A consumer cancelled while its channel waited out a connection recovery could stop the
+  recovery re-registering the channel's other consumers.
+- A replay of unconfirmed messages that was cut short (the connection going again while it was
+  parked behind `connection.blocked`) dropped the messages it had not yet sent. They are kept
+  for the next recovery.
 
 ### Added
 
@@ -23,6 +32,19 @@ additions: nothing existing changes behaviour.
 - A mandatory `publish_confirmed` adds an `x-async-rabbitmq-publish-id` header, which is how a
   `basic.return` (which carries no delivery tag) is matched to its publish. Its return is
   reported through the outcome and not to `on_return`.
+- `AsyncRabbitMQ::Consumer` (`queue.consumer(prefetch:)`) is a consumer you pull from.
+  `consumer.each { |message| ... }` yields one `Message` at a time in the calling fiber and
+  settles nothing: the block calls `ack`, `nack` or `reject`. It returns `:stopped`,
+  `:cancelled` or `:closed`. On every way out the consumer is cancelled and the messages that
+  had arrived but were not handed out go back on the queue. It keeps consuming across a
+  connection recovery.
+- `AsyncRabbitMQ::ManagedConsumer` (`queue.managed_consumer(concurrency:)`) runs a handler per
+  message with `concurrency`, `prefetch`, `ack_on_success`, `exception` (`:ack`, `:nack`,
+  `:reject`), `requeue` and `drain_timeout`. A handler that raises does not end `run`; the
+  failure is logged, published as the new `consumer.handler_failed` event and passed to
+  `on_error`. Stopping drains: running handlers get `drain_timeout` to finish, and whatever is
+  left is stopped with its message requeued.
+- `Channel#consumer?(tag)`.
 - The OpenTelemetry layer traces `publish_confirmed` with the same producer span as
   `basic_publish`.
 

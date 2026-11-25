@@ -252,6 +252,57 @@ Staleness is not its concern: it hands its `VersionedDeliveryTag` to the
 channel, which drops the frame and returns false, and the message records
 `:stale`.
 
+## Native consumers
+
+`Consumer` and `ManagedConsumer` are built on `basic_consume`, not beside it.
+The block a `Consumer` registers does one thing, push a `Message` onto an
+`Async::Queue`, and `each` pops from that queue in the caller's fiber. So the
+dispatch loop still never blocks, recovery re-registers the consumer like any
+other, and the buffer is bounded by the broker: the consumer is always
+manual-ack, so at most `prefetch` messages can be outstanding.
+
+`each` ends through one of three doors: `stop`, the channel's notice that the
+consumer is gone for good (the notice a fiber in `Channel#each` gets), or the
+block raising. All three run the same exit: mark the subscription closed, so a
+delivery still on its way to the block is nacked back instead of buffered;
+cancel; nack back what is in the buffer. The cancel is attempted whenever the
+channel is not closed, a channel waiting out a recovery included. Skipping it
+there would leave the consumer on the channel's books, recovery would register
+it again with nobody reading, and every message would be requeued and
+redelivered without end.
+
+A message buffered before a reconnect is stale: the broker requeued it. It is
+dropped at the pop and not yielded, since it could not be settled.
+
+`ManagedConsumer` adds a pool of handler fibers, grown on demand up to
+`concurrency` and reused. The fiber in `run` does nothing but move messages
+from the consumer to the pool's own queue, and the pool pulls from that. The
+queue needs no bound: every message in it is one of the at most `prefetch` the
+broker has outstanding. Two simpler designs were measured against `subscribe`
+(about 14.7k msg/s for 512-byte messages on the test machine) and dropped:
+
+- A fiber per message: 8.1k msg/s. Starting a fiber costs more than handling a
+  small message.
+- A pool handed one message at a time, waiting for a free slot before taking
+  the next: 7.6k msg/s at `concurrency: 1`. Every message became a fiber
+  switch each way, and every ack went out in a write of its own instead of
+  batching behind its neighbours.
+
+The pool as built runs level with `subscribe`, as does a bare `Consumer`.
+`Async::Barrier` was the obvious tool for tracking handlers and is wrong here:
+a barrier keeps every task it started until it is waited on, which for a
+consumer is the life of the process.
+
+On the way out the pool is drained: messages waiting for a handler go back on
+the queue, a worker that takes one just as the drain begins puts it back
+rather than start it, and running handlers are waited for.
+
+Stopping a task does not stop its children until the task has finished, so the
+drain in `run`'s `ensure` works the same for `stop` and for a task stop: wait
+up to `drain_timeout` for the handlers, then stop the rest. A stopped handler
+requeues its own message on the way out, which relies on `Message` lifting its
+settlement mark when a settle is interrupted.
+
 ## Errors
 
 Soft errors close the channel and leave the connection up. They raise

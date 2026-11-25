@@ -305,6 +305,84 @@ to settle. Wrap a delivery from an automatic-ack consumer with
 This is the first piece of an API built for `async` rather than mirrored from
 Bunny; the consumers that hand out `Message` objects directly come next.
 
+### Pulling messages: `Consumer`
+
+`subscribe` pushes: the channel calls your block. A `Consumer` is pulled from.
+`each` hands the block one `Message` at a time, in the fiber that called it,
+and the block settles each one itself:
+
+```ruby
+consumer = queue.consumer(prefetch: 10)
+consumer.each do |message|
+  process(message.body)
+  message.ack
+rescue InvalidOrder
+  message.reject(requeue: false)
+end
+```
+
+Nothing is settled for you. A block that returns without calling `ack`, `nack`
+or `reject` leaves the message unacknowledged, which is how you hand a message
+to another fiber to finish later. An exception out of the block ends the loop
+and is raised from `each`, with that message still unacknowledged.
+
+The consumer is always manual-ack and `prefetch` is what bounds it: the broker
+sends no more than that many unsettled messages, so that is the most that can
+be waiting. It is set with `basic.qos`, a setting of the channel, so it also
+applies to consumers started on the same channel afterwards.
+
+`each` returns when the consumer goes away, and says why: `:stopped` after
+`consumer.stop`, `:cancelled` when the broker cancelled it (the queue was
+deleted), `:closed` when the channel closed. However it ends, a `break`, an
+exception and the calling task being stopped included, the consumer is
+cancelled and the messages that had arrived but had not been handed to the
+block go back on the queue. A connection recovery is not an ending: the
+consumer is registered again and `each` keeps waiting.
+
+### Handlers that run concurrently: `ManagedConsumer`
+
+`ManagedConsumer` is the same thing with the usual decisions made for you. It
+runs a handler per message, several at once, acks when the handler returns and
+nacks when it raises:
+
+```ruby
+consumer = queue.managed_consumer(concurrency: 10)
+consumer.run do |message|
+  process(message.body)
+end
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `concurrency` | `1` | Handlers running at once, each in a fiber of its own. |
+| `prefetch` | `concurrency` | Unsettled messages the broker sends at once. A prefetch below `concurrency` caps the handlers at the prefetch. |
+| `ack_on_success` | `true` | Ack when the handler returns. With `false`, a handler that returns without settling leaves the message unacknowledged. |
+| `exception` | `:nack` | What happens to the message when the handler raises: `:ack`, `:nack` or `:reject`. |
+| `requeue` | `false` | For `:nack` and `:reject`, whether the message goes back on the queue. Off by default: a message that raises once will very likely raise again, and requeued it comes straight back. |
+| `drain_timeout` | `30` | Seconds to wait, when stopping, for handlers already running. `nil` waits for as long as they take. |
+
+An exception never ends `run`; the consumer carries on with the next message.
+The failure is logged, published as the `consumer.handler_failed` event, and
+passed to an `on_error` block if you registered one:
+
+```ruby
+consumer.on_error { |error, message| Sentry.capture_exception(error) }
+```
+
+A handler may settle the message itself, in the handler or in `on_error`.
+Whatever it did stands and nothing more is sent for that message.
+
+Stopping is graceful, whether you call `consumer.stop` or stop the task that
+is running `run`, which is what shutting the reactor down does:
+
+1. The consumer is cancelled, so nothing new arrives.
+2. Messages that had arrived but not started go back on the queue.
+3. Handlers already running get `drain_timeout` to finish and settle normally.
+4. Any still running after that are stopped and their messages go back on the
+   queue.
+
+So a stop can take up to `drain_timeout` to return, and never loses a message.
+
 ### When a handler raises
 
 The delivery is settled for you. What happens to it is the *disposition*, and
@@ -673,6 +751,7 @@ logged and skipped; it never breaks the connection.
 | `consumer.cancelled` | `channel`, `consumer_tag`, `queue`, `reason` (`:client`, `:broker`) |
 | `consumer.recovered` | `channel`, `consumer_tag`, `queue`, `attempts` |
 | `consumer.recovery_failed` | `channel`, `consumer_tag`, `queue`, `reason` (`:queue_deleted`, `:error`), `error` |
+| `consumer.handler_failed` | `channel`, `queue`, `consumer_tag`, `error`, `disposition` (`:ack`, `:nack`, `:reject`), `requeue`, `redelivered` (a `ManagedConsumer` handler raised) |
 | `message.published` | `channel`, `exchange`, `routing_key`, `count`, `bytes`, `delivery_tag` |
 | `message.confirmed` | `channel`, `delivery_tag`, `multiple`, `acked` |
 | `message.returned` | `channel`, `exchange`, `routing_key`, `code`, `text`, `bytes` |

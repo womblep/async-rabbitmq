@@ -63,6 +63,20 @@ module AsyncRabbitMQ
       @channel.basic_consume(@name, manual_ack: manual_ack, **opts, &block)
     end
 
+    # A Consumer to pull messages from this queue with, one at a time, each
+    # settled by the caller: +queue.consumer(prefetch: 10).each { |message| ... }+.
+    # Takes the options Consumer.new does.
+    def consumer(**opts)
+      Consumer.new(@channel, @name, **opts)
+    end
+
+    # A ManagedConsumer for this queue: handlers run concurrently, are acked
+    # when they return and nacked when they raise. Takes the options
+    # ManagedConsumer.new does.
+    def managed_consumer(**opts)
+      ManagedConsumer.new(@channel, @name, **opts)
+    end
+
     def publish(payload, routing_key: @name, **opts)
       @channel.basic_publish(payload, routing_key: routing_key, **opts)
     end

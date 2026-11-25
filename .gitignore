@@ -64,3 +64,7 @@ spec/docker/certs/
 
 # Per-machine Claude Code settings, not project configuration
 .claude/
+
+# RubyMine RBS collection artefacts (the second is a Windows path it wrote as a file name)
+.gem_rbs_collection/
+/C*RubyMine*rbs_collection*.yaml
