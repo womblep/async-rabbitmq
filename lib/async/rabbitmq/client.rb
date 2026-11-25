@@ -174,15 +174,22 @@ module Async
       # Declaring
       # -----------------------------------------------------------------------
 
-      # Declare a queue and return it. Durable unless told otherwise: a
-      # current broker refuses a queue that is neither durable nor exclusive.
-      # +type+ is :classic, :quorum or :stream; nil leaves it to the broker.
+      # Declare a queue and return it. A queue declared here is durable, and
+      # +durable: false+ is refused: it would be neither durable nor
+      # exclusive, which RabbitMQ 4 no longer permits and answers by closing
+      # the whole connection. +type+ is :classic, :quorum or :stream; nil
+      # leaves it to the broker.
       #
       # For a queue private to one consumer - exclusive, and gone with it -
       # ask for it on the consumer, which then owns it.
       def queue(name, durable: true, auto_delete: false, type: nil, arguments: {})
         name = name.to_s
         raise ArgumentError, "A queue declared on the client needs a name" if name.empty?
+        unless durable
+          raise ArgumentError, "A queue declared on the client is durable: RabbitMQ 4 refuses one that is " \
+                               "neither durable nor exclusive. For a queue that goes when its consumer does, " \
+                               "let the consumer declare its own (client.consumer with no queue, or exclusive: true)"
+        end
 
         arguments = arguments.merge("x-queue-type" => type.to_s) if type
         admin do |channel|

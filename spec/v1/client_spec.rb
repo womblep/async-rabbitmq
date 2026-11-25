@@ -63,10 +63,26 @@ RSpec.describe Async::RabbitMQ::Client, :integration do
 
   describe "declaring" do
     # RabbitMQ 4 refuses a queue that is neither durable nor exclusive, and
-    # closes the whole connection to say so.
-    it "raises, and does not retry for ever, when a declaration costs the connection each time" do
+    # closes the whole connection to say so. The client will not ask for one.
+    it "refuses a queue that is not durable before the broker can" do
       with_client do |client, _|
-        expect { client.queue("transient", durable: false) }
+        connection = client.connection
+        expect { client.queue("transient", durable: false) }.to raise_error(ArgumentError, /neither durable nor/)
+        expect { client.queue("transient", durable: false, auto_delete: true) }.to raise_error(ArgumentError)
+        expect(client.connection).to equal(connection)
+        expect(client.topology).to be_empty
+      end
+    end
+
+    # The guard above covers the case that is known. This is for the rest:
+    # the same refusal, sent past the guard.
+    it "raises, and does not retry for ever, when a request costs the connection each time" do
+      with_client do |client, _|
+        declare = lambda do |channel|
+          channel.call(AMQ::Protocol::Queue::Declare.encode(channel.id, "transient", false, false, false, false,
+                                                            false, {}), AMQ::Protocol::Queue::DeclareOk)
+        end
+        expect { client.send(:admin, &declare) }
           .to raise_error(Async::RabbitMQ::ConnectionError, /transient_nonexcl_queues/)
         wait_for { client.connected? }
         expect(client.queue("fine").exists?).to be true
@@ -134,7 +150,7 @@ RSpec.describe Async::RabbitMQ::Client, :integration do
     it "raises the broker's refusal, and carries on working afterwards" do
       with_client do |client, _|
         client.queue("orders")
-        expect { client.queue("orders", durable: false) }
+        expect { client.queue("orders", arguments: { "x-message-ttl" => 1000 }) }
           .to raise_error(Async::RabbitMQ::ChannelError) { |error| expect(error).to be_precondition_failed }
         expect(client.queue("other").exists?).to be true
         expect(client).to be_connected
