@@ -20,7 +20,7 @@ module AsyncRabbitMQ
   # take the connection down with it.
   class Notifier
     # The events the client emits. Names are API: they do not change without a
-    # major version. Payload keys are documented in README.md.
+    # major version. Payload keys are documented in docs/legacy-engine.md.
     EVENTS = %w[
       connection.open
       connection.closed

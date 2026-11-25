@@ -1,12 +1,12 @@
-require_relative "lib/async_rabbitmq/version"
+require_relative "lib/async/rabbitmq/version"
 
 Gem::Specification.new do |spec|
   spec.name          = "async-rabbitmq"
-  spec.version       = AsyncRabbitMQ::VERSION
+  spec.version       = Async::RabbitMQ::VERSION
   spec.authors       = ["Russell Penney"]
   spec.summary       = "Fiber-native Ruby AMQP 0-9-1 client built on the Async ecosystem"
   spec.description   = "A RabbitMQ client for the async fiber scheduler: no threads, " \
-                       "channels are duck-typed streams, connection and topology recovery are built in."
+                       "publishes that wait for the broker, consumers you pull from, reconnection built in."
   spec.homepage      = "https://github.com/womblep/async-rabbitmq"
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 3.4"

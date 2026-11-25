@@ -2,13 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.10.0] - unreleased
+
+A second client in the same gem. `Async::RabbitMQ`, loaded with `require "async/rabbitmq"`, is
+written for `async` from the start and shares no code with the original `AsyncRabbitMQ`
+(`require "async_rabbitmq"`), which carries on working unchanged and is now the legacy engine.
+An application uses one or the other. Nothing was removed.
+
+### Upgrading from 0.9
+
+- **Bundler now loads the new client by default.** Bundler requires a gem by its name, and
+  `async-rabbitmq` is read as `async/rabbitmq`, a file that did not exist before. An application
+  staying on the legacy engine without an explicit `require "async_rabbitmq"` of its own should
+  write `gem "async-rabbitmq", require: "async_rabbitmq"`.
+- **New runtime dependency:** `io-stream` `~> 0.11`.
+- The README now documents the new client. The legacy engine's documentation is in
+  `docs/legacy-engine.md`.
+
+### Added: the `Async::RabbitMQ` client
+
+- `Client`: one connection to one broker, kept. It reconnects with jittered exponential backoff
+  and declares its queues, exchanges and bindings again on each new connection. Given several
+  addresses it connects to whichever will have it.
+- `Publisher`: `publish` returns when the broker has confirmed the message and raises
+  `NackedError`, `ReturnedError`, `UnconfirmedError` or `ChannelError` when it did not. `submit`
+  returns an `Outcome` without waiting. A message caught unanswered by a lost connection fails
+  with `UnconfirmedError` and can be sent again with `outcome.resubmit`; `resend: true` does that
+  for every message, in order. Each message is stamped with a `timestamp` property and a
+  `timestamp_in_ms` header unless `timestamps: false`.
+- `Consumer`: `each` yields one `Message` at a time, and the message settles itself. Given no
+  queue it declares an exclusive one of its own and re-declares it after a reconnect.
+  `on_connection_loss:` is `:wait` or `:end`.
+- `ManagedConsumer`: runs a handler per message with `concurrency`, acks on return, nacks on an
+  exception, and drains on stop.
+- `Message#published_at` and `Message#elapsed` read the publisher's timestamps back.
+- `Cluster`: one `Client` per node, with each new publisher and consumer placed on the node that
+  has the fewest. A consumer may ask to `:move` to another node when its own is lost.
+- TLS with client certificates and `EXTERNAL` authentication.
+- Optional OpenTelemetry spans and metrics, with `require "async/rabbitmq/open_telemetry"`.
+
+Not in the new client: channels as a public object, `basic.get`, transactions, the connection
+pool, publishing without confirms, credential rotation, the event notifier and the command-line
+tool. The legacy engine keeps them.
+
+### Legacy engine (`AsyncRabbitMQ`)
 
 The first pieces of an API built for `async` rather than mirrored from Bunny: messages that
 settle themselves, an answer per publish, and consumers you pull from. All are additions:
 nothing existing changes behaviour.
 
-### Fixed
+#### Fixed
 
 - A consumer cancelled while its channel waited out a connection recovery could stop the
   recovery re-registering the channel's other consumers.
@@ -16,7 +59,7 @@ nothing existing changes behaviour.
   parked behind `connection.blocked`) dropped the messages it had not yet sent. They are kept
   for the next recovery.
 
-### Added
+#### Added
 
 - `AsyncRabbitMQ::Message` wraps the `(delivery_info, header, body)` triple with the channel it
   arrived on. `message.ack`, `message.nack(requeue:)` and `message.reject(requeue:)` settle it

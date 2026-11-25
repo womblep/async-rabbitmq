@@ -1,6 +1,9 @@
-# async-rabbitmq — architecture
+# async-rabbitmq — architecture of the legacy engine
 
-How the client is built. It describes what exists, not what was planned. `README.md` is the usage documentation; this document is
+This describes `AsyncRabbitMQ` (`require "async_rabbitmq"`), the original client. For the client that
+replaces it see [async-client.md](async-client.md).
+
+How the client is built. It describes what exists, not what was planned. [legacy-engine.md](../legacy-engine.md) is the usage documentation; this document is
 for people changing the internals.
 
 ## Purpose
@@ -377,7 +380,7 @@ Timing works the same way: `instrument_clock` returns nil when nobody is
 listening, so the clock reads are skipped too. A subscriber that raises is
 caught and logged, because instrumentation must not be able to take a
 connection down. Event names are treated as API and listed in `Notifier::EVENTS`;
-payload keys are documented in the README.
+payload keys are documented in docs/legacy-engine.md.
 
 Tracing is separate, in `lib/async_rabbitmq/telemetry/open_telemetry.rb`, and is
 neither loaded nor depended on by default. It cannot be built on the events
