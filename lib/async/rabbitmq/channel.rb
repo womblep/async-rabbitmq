@@ -204,7 +204,7 @@ module Async
           @reply = nil
           promise.resolve(method)
         else
-          Console.debug(self, "Unexpected method on channel #{@id}", method: method.class.name)
+          @connection.logger.debug(self, "Unexpected method on channel #{@id}", method: method.class.name)
         end
       end
 
@@ -252,7 +252,7 @@ module Async
       def notify
         yield
       rescue StandardError => error
-        Console.error(self, "Channel #{@id}: delegate raised", exception: error)
+        @connection.logger.error(self, "Channel #{@id}: delegate raised", exception: error)
       end
 
       # No reply in time. The request may yet be answered, and that answer

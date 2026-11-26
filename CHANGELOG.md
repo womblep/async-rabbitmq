@@ -23,7 +23,11 @@ An application uses one or the other. Nothing was removed.
 
 - `Client`: one connection to one broker, kept. It reconnects with jittered exponential backoff
   and declares its queues, exchanges and bindings again on each new connection. Given several
-  addresses it connects to whichever will have it.
+  addresses it connects to whichever will have it. `on_connection_lost`,
+  `on_reconnect_failed`, `on_reconnected`, `on_blocked`, `on_unblocked` and `on_gave_up` tell
+  the application what happens to the connection. An event with a hook is the application's to
+  report: the client's own log line for it drops to debug, as does a handler failure when the
+  `ManagedConsumer` has an `on_error`.
 - `Publisher`: `publish` returns when the broker has confirmed the message and raises
   `NackedError`, `ReturnedError`, `UnconfirmedError` or `ChannelError` when it did not. `submit`
   returns an `Outcome` without waiting. A message caught unanswered by a lost connection fails
@@ -32,13 +36,19 @@ An application uses one or the other. Nothing was removed.
   `timestamp_in_ms` header unless `timestamps: false`.
 - `Consumer`: `each` yields one `Message` at a time, and the message settles itself. Given no
   queue it declares an exclusive one of its own and re-declares it after a reconnect.
-  `on_connection_loss:` is `:wait` or `:end`.
+  `on_connection_loss:` is `:wait` or `:end`. `on_cancel: :resubscribe` has a consumer the
+  broker cancelled consume again for as long as its queue exists, without declaring it; the
+  default ends `each` with `:cancelled`, as does a queue that is gone when a lost connection
+  comes back. `on_cancelled` and `on_resubscribed` tell the application of each. A broker that
+  goes on refusing is warned of once for each cancel, not on every attempt.
 - `ManagedConsumer`: runs a handler per message with `concurrency`, acks on return, nacks on an
   exception, and drains on stop.
 - `Message#published_at` and `Message#elapsed` read the publisher's timestamps back.
 - `Cluster`: one `Client` per node, with each new publisher and consumer placed on the node that
   has the fewest. A consumer may ask to `:move` to another node when its own is lost.
 - TLS with client certificates and `EXTERNAL` authentication.
+- Logging through Console, or through any `Logger`-compatible object given as `logger:`; `nil`
+  is silent. `Async::RabbitMQ.log_level` (default `:warn`) caps what any client logs.
 - Optional OpenTelemetry spans and metrics, with `require "async/rabbitmq/open_telemetry"`.
 
 Not in the new client: channels as a public object, `basic.get`, transactions, the connection

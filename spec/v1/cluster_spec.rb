@@ -150,6 +150,20 @@ RSpec.describe Async::RabbitMQ::Cluster, :integration do
     end
   end
 
+  it "sets a connection hook on every node, and says which node it was" do
+    with_cluster do |cluster, direct, proxied, _|
+      lost = []
+      back = []
+      expect(cluster.on_connection_lost { |_error, client| lost << client }).to equal(cluster)
+      cluster.on_reconnected { |_attempts, client| back << client }
+      sever!(proxied.instance_variable_get(:@connection))
+      wait_for { back == [proxied] }
+
+      expect(lost).to eq([proxied])
+      expect(direct).to be_connected
+    end
+  end
+
   describe "when a node goes away" do
     it "keeps a consumer with its node by default, and it consumes again when the node is back" do
       with_cluster do |cluster, direct, proxied, _|
