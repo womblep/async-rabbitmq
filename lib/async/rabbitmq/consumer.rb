@@ -106,7 +106,7 @@ module Async
     # [on_connection_loss] :wait (the default) or :end; see above. A consumer
     #                      of a Cluster may also say :move; see Cluster.
     # [on_cancel]          :end (the default) or :resubscribe; see above.
-    # [exclusive]         the queue is the consumer's own. Default true when
+    # [exclusive]          the queue is the consumer's own. Default true when
     #                      no queue is named, false otherwise.
     # [queue_arguments]    arguments for the consumer's own queue.
     # [arguments]          arguments for basic.consume.
@@ -279,9 +279,10 @@ module Async
         self
       end
 
-      # Have +block+ called, with the consumer, each time it is consuming
-      # again after the broker cancelled it. Only a consumer made with
-      # +on_cancel: :resubscribe+ ever is.
+      # Have +block+ called each time the consumer is consuming again after
+      # the broker cancelled it, with the number of attempts it took (1 if
+      # the first was accepted) and then the consumer. Only a consumer made
+      # with +on_cancel: :resubscribe+ ever is.
       #
       # With either block set, the cancel and the recovery are the
       # application's to report, and the consumer's own lines about them are
@@ -526,8 +527,8 @@ module Async
       end
 
       # Call one of the consumer's blocks. What it raises is its own problem.
-      def told(name, block)
-        block&.call(@link)
+      def told(name, block, *arguments)
+        block&.call(*arguments, @link)
       rescue StandardError => error
         @client.logger.error(self, "#{name} for #{@queue_name} raised", exception: error)
       end
@@ -571,7 +572,7 @@ module Async
             @client.logger.public_send(@on_resubscribed ? :debug : :info, self,
                                        "Consumer of #{@queue_name} was cancelled by the broker, and is consuming again",
                                        attempts: failures + 1)
-            told(:on_resubscribed, @on_resubscribed)
+            told(:on_resubscribed, @on_resubscribed, failures + 1)
             return true
           rescue ChannelError => error
             return false if error.not_found?
@@ -581,7 +582,8 @@ module Async
             failures += 1
             level = failures == 1 && !@on_cancelled && !@on_resubscribed ? :warn : :debug
             @client.logger.public_send(level, self,
-                                       "Consumer of #{@queue_name} was cancelled by the broker and cannot consume "                                        "again yet; it will keep trying", exception: error)
+                                       "Consumer of #{@queue_name} was cancelled by the broker and cannot " \
+                                       "consume again yet; it will keep trying", exception: error)
           end
           pause(delay)
           delay = [delay * 2, 30].min

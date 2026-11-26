@@ -437,7 +437,7 @@ RSpec.describe "Consumers", :integration do
           got      = []
           told     = []
           consumer.on_cancelled { |c| told << [:cancelled, c, c.consumer_tag] }
-          consumer.on_resubscribed { |c| told << [:resubscribed, c, c.consumer_tag.nil?] }
+          consumer.on_resubscribed { |attempts, c| told << [:resubscribed, attempts, c, c.consumer_tag.nil?] }
           running  = Async do
             consumer.each do |message|
               got << message.body
@@ -452,7 +452,7 @@ RSpec.describe "Consumers", :integration do
 
           wait_for { got == %w[m0 again0] }
           expect(running).to be_running
-          expect(told).to eq([[:cancelled, consumer, first_tag], [:resubscribed, consumer, false]])
+          expect(told).to eq([[:cancelled, consumer, first_tag], [:resubscribed, 1, consumer, false]])
           expect(consumer.on_cancel).to eq(:resubscribe)
           consumer.stop
           expect(running.wait).to eq(:stopped)
@@ -481,6 +481,8 @@ RSpec.describe "Consumers", :integration do
           queue    = queue_with(client, 0)
           consumer = queue.consumer(on_cancel: :resubscribe)
           got      = []
+          attempts = []
+          consumer.on_resubscribed { |count, _| attempts << count }
           running  = Async do
             consumer.each do |message|
               got << message.body
@@ -506,6 +508,7 @@ RSpec.describe "Consumers", :integration do
                      AMQ::Protocol::Basic::CancelOk)
           publish(client, queue, 1)
           wait_for(timeout: 5) { got == %w[m0] }
+          expect(attempts).to eq([2])
 
           # And again, this time stopped in the middle of the wait.
           channel = consumer.instance_variable_get(:@channel)
@@ -528,7 +531,7 @@ RSpec.describe "Consumers", :integration do
           managed = queue.managed_consumer(on_cancel: :resubscribe)
           got     = []
           told    = []
-          managed.on_cancelled { |c| told << c }.on_resubscribed { |c| told << c }
+          managed.on_cancelled { |c| told << c }.on_resubscribed { |_attempts, c| told << c }
           running = Async { managed.run { |message| got << message.body } }
           wait_for { managed.consumer_tag }
           first_tag = managed.consumer_tag

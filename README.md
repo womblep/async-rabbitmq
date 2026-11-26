@@ -367,11 +367,12 @@ To hear of it yourself:
 
 ```ruby
 consumer.on_cancelled    { |consumer| events.record(:amqp_consumer_cancelled, consumer.queue_name) }
-consumer.on_resubscribed { |consumer| events.record(:amqp_consumer_recovered, consumer.queue_name) }
+consumer.on_resubscribed { |attempts, consumer| events.record(:amqp_consumer_recovered, consumer.queue_name, attempts) }
 ```
 
 `on_cancelled` is called each time the broker cancels the consumer, whatever
-`on_cancel` says, and `on_resubscribed` each time it is consuming again.
+`on_cancel` says, and `on_resubscribed` each time it is consuming again,
+with the number of attempts that took and then the consumer.
 Both run in the fiber that called `each` or `run`. With either set, the
 consumer's own lines about the cancel are logged at debug only.
 

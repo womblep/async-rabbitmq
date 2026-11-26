@@ -95,7 +95,8 @@ A `basic.cancel` from the broker ends `each` with `:cancelled` unless the consum
 exists, and sends `basic.consume` again if it does, backing off from 1s to 30s while the broker
 refuses. It never declares, so a deleted queue stays deleted. The first refusal after a cancel is
 a warning and the rest are debug. `on_cancelled` and `on_resubscribed` are single blocks on the
-consumer, like `on_attach`, called in the fiber running `each`.
+consumer, like `on_attach`, called in the fiber running `each`. `on_resubscribed` is given the
+number of attempts before the consumer, as the client's hooks put the client last.
 
 A consumer's own queue is declared `exclusive` by the consumer on its own channel, and re-declared
 and re-bound each time it attaches.

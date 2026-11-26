@@ -39,8 +39,9 @@ An application uses one or the other. Nothing was removed.
   `on_connection_loss:` is `:wait` or `:end`. `on_cancel: :resubscribe` has a consumer the
   broker cancelled consume again for as long as its queue exists, without declaring it; the
   default ends `each` with `:cancelled`, as does a queue that is gone when a lost connection
-  comes back. `on_cancelled` and `on_resubscribed` tell the application of each. A broker that
-  goes on refusing is warned of once for each cancel, not on every attempt.
+  comes back. `on_cancelled` and `on_resubscribed` tell the application of each, the second
+  with the number of attempts it took. A broker that goes on refusing is warned of once for
+  each cancel, not on every attempt.
 - `ManagedConsumer`: runs a handler per message with `concurrency`, acks on return, nacks on an
   exception, and drains on stop.
 - `Message#published_at` and `Message#elapsed` read the publisher's timestamps back.
