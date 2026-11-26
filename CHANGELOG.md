@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.10.0] - unreleased
+## [0.10.0] - 2026-11-26
 
 A second client in the same gem. `Async::RabbitMQ`, loaded with `require "async/rabbitmq"`, is
 written for `async` from the start and shares no code with the original `AsyncRabbitMQ`
