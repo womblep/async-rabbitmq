@@ -1,818 +1,602 @@
 # async-rabbitmq
 
-A fiber-native RabbitMQ (AMQP 0-9-1) client for Ruby, built on the amazing work
-of [Bunny](https://github.com/ruby-amqp/bunny) and [Async](https://github.com/socketry/async).
+A RabbitMQ (AMQP 0-9-1) client for Ruby's fiber scheduler, built on
+[Async](https://github.com/socketry/async) and
+[amq-protocol](https://github.com/ruby-amqp/amq-protocol). No threads: the
+reader, the heartbeat and every handler are fibers, so it fits Falcon and
+anything else that runs under `async`.
+
+```ruby
+require "async"
+require "async/rabbitmq"
+
+Sync do
+  Async::RabbitMQ::Client.open("amqp://guest:guest@localhost") do |client|
+    events = client.exchange("events", :topic)
+    audit  = client.queue("events.audit").bind(events, routing_key: "audit.#")
+
+    events.publisher do |publisher|
+      publisher.publish("user 42 logged in", routing_key: "audit.login")
+    end
+
+    audit.consumer do |consumer|
+      consumer.each do |message|
+        puts message.body
+        message.ack
+        consumer.stop
+      end
+    end
+  end
+end
+```
+
+## Contents
+
+- [Installing](#installing)
+- [Two clients in one gem](#two-clients-in-one-gem)
+- [How it is put together](#how-it-is-put-together)
+- [Connecting](#connecting)
+- [Queues, exchanges and bindings](#queues-exchanges-and-bindings)
+- [Publishing](#publishing)
+- [Consuming](#consuming)
+- [When the connection is lost](#when-the-connection-is-lost)
+- [A cluster](#a-cluster)
+- [Errors](#errors)
+- [Logging](#logging)
+- [OpenTelemetry](#opentelemetry)
+- [What is not here](#what-is-not-here)
+- [Development](#development)
 
 ## Installing
 
 ```ruby
 # Gemfile
-gem "async-rabbitmq", "~> 0.9"
+gem "async-rabbitmq", "~> 0.10"
 ```
 
-or
+Requires Ruby 3.4+ and RabbitMQ 3.13+ (tested against 4.x). Everything here
+runs inside a reactor: `Sync do ... end`, an `Async` task, or a Falcon
+application.
 
-```bash
-gem install async-rabbitmq
-```
+## Two clients in one gem
 
-Requires Ruby 3.4+ and RabbitMQ 3.13+ (tested against 4.x). The gem also
-installs an `async-rabbitmq` command for publishing, consuming, inspecting and
-purging from a terminal.
+The gem holds two clients. An application uses one or the other, chosen by
+what it requires:
 
-## Bunny is the gold standard
+| | This client | The legacy engine |
+|---|---|---|
+| Require | `require "async/rabbitmq"` | `require "async_rabbitmq"` |
+| Namespace | `Async::RabbitMQ` | `AsyncRabbitMQ` |
+| Shape | Built for `async` | Mirrors Bunny's API |
+| Status | Where new work goes | Kept working, no new features |
+| Documentation | This file | [docs/legacy-engine.md](docs/legacy-engine.md) |
 
-Bunny is the client Ruby learned RabbitMQ on. Its API is the one Ruby developers
-already know, its defaults are the ones a decade of production traffic settled,
-and its source is the reference this library was written against. None of that
-is improved on here, and none of it is meant to be.
+Neither loads any of the other's code.
 
-**Parity with Bunny is a design goal**, chosen deliberately over fiber-native
-maximalism: the audience for this gem is people who already know Bunny, and
-surprising them is a bug. Where Bunny has an answer, that is the answer here.
-`pool_size` defaults to 1 and serialises handlers because `ConsumerWorkPool`
-does. A consumer backlog is an unbounded queue drained by a fixed set of workers
-because that is what `ConsumerWorkPool` is. `basic_get` acknowledges manually by
-default because Bunny's does. `spec/integration/25_bunny_api_parity_spec.rb`
-exists to keep it honest.
-
-Where this client does diverge, the README says so and says why - see the two
-publishing differences below, and `basic_qos`, which also resizes the handler
-pool where Bunny's leaves it alone.
-
-If you are not running under the fiber scheduler, use Bunny. It is excellent,
-and this gem has no advantage over it outside an async application.
-
-## What this adds
-
-The runtime, not the API. Built on the
-[async](https://github.com/socketry/async) ecosystem and
-[amq-protocol](https://github.com/ruby-amqp/amq-protocol), with no threads: the
-reader, writer, heartbeat and every consumer handler are fibers, so it fits
-Falcon, async-http and anything else running under the fiber scheduler.
-
-Requires Ruby 3.4+ (CI runs 3.4 and 4.0) and RabbitMQ 3.13+ (tested against 4.x).
+Bundler requires a gem by its name, and `async-rabbitmq` is read as
+`async/rabbitmq`. An application that stays on the legacy engine should say
+which it wants:
 
 ```ruby
-require "async"
-require "async_rabbitmq"
-
-Sync do
-  session = AsyncRabbitMQ::Session.from_uri("amqp://guest:guest@localhost/%2F")
-  session.connect
-
-  channel  = session.open_channel
-  exchange = channel.topic("events", durable: true)
-  queue    = channel.durable_queue("events.audit")
-  queue.bind(exchange: exchange.name, routing_key: "audit.#")
-
-  exchange.publish("user 42 logged in", routing_key: "audit.login", persistent: true)
-
-  queue.subscribe(manual_ack: true) do |delivery, header, body|
-    puts "#{header.properties[:content_type]}: #{body}"
-    channel.basic_ack(delivery.delivery_tag)
-  end
-
-  sleep 1
-  session.close
-end
+gem "async-rabbitmq", "~> 0.10", require: "async_rabbitmq"
 ```
+
+## How it is put together
+
+There are four things to know, and the rest follows from them.
+
+- **A `Client` is one connection to one broker, and it keeps it.** When the
+  connection is lost the client opens another and declares again whatever it
+  was asked to declare.
+- **A `Publisher` publishes and a consumer consumes.** Each has an AMQP
+  channel to itself, which you never see, and each moves itself to the
+  client's next connection when one is lost.
+- **`publish` returns when the broker has taken the message**, and raises if
+  it did not. Publisher confirms are always on.
+- **A consumer is pulled from.** `each` hands your block one message at a
+  time, and the message settles itself: `message.ack`.
+
+While there is no connection, anything that needs one waits for it. Nothing
+raises because of an outage unless you ask for that.
 
 ## Connecting
 
 ```ruby
-AsyncRabbitMQ::Session.new(
-  host: "localhost", port: 5672, vhost: "/", username: "guest", password: "guest",
-  hosts: ["rabbit1", "rabbit2"],            # or addresses: ["rabbit1:5672", "rabbit2:5673"]
-  tls: false,                               # implied by any of the four below
-  tls_cert: nil, tls_key: nil,              # client certificate and key: a path or PEM text
-  tls_ca_certificates: nil,                 # CA path(s) or PEM text; default is the system store
-  verify_peer: true, tls_min_version: :TLS1_2,
-  tls_context: nil,                         # or an OpenSSL::SSL::SSLContext you built, for anything else
-  heartbeat: 60, frame_max: 131_072, channel_max: 2047,
-  connect_timeout: 30, rpc_timeout: 15,     # seconds; rpc_timeout: nil waits forever
-  auth_mechanism: nil,                      # "PLAIN" / "EXTERNAL", negotiated by default
-  connection_name: "orders-worker",
-  auto_recover: true, recovery_attempts: nil, recovery_interval: 1.0, recovery_max_interval: 30.0,
-  recover_topology: true, topology_recovery_filter: nil,
-  instrumenter: nil,                        # ->(event_name, payload) { ... }
-  notifier: nil,                            # or one Notifier shared between sessions
-  logger: Console                           # or Rails.logger, a Logger, or nil to discard
-)
+client = Async::RabbitMQ::Client.open("amqps://app:secret@rabbit.example.com/orders")
+# ...
+client.close
 ```
 
-`Session.from_uri` accepts one or more `amqp://` / `amqps://` URIs and the
-standard query parameters (`heartbeat`, `connection_timeout`, `channel_max`,
-`auth_mechanism`; on `amqps://` also `verify`, `cacertfile`, `certfile`,
-`keyfile`). Several URIs form a failover list. Keyword arguments override the
-URI.
+With a block, `open` closes the client when the block returns or raises.
+Closing a client closes every publisher and consumer made through it.
 
-`Session#update_secret(new_secret, reason)` rotates the credential on a live
-connection (for refreshed OAuth 2 tokens); the new value is used for reconnects.
-`Session#store_secret` records it without sending it, for a session that is
-down while the secret rotates.
+The address is a URL, or an `Endpoint` when there is more to say:
+
+```ruby
+endpoint = Async::RabbitMQ::Endpoint.parse("amqp://rabbit.example.com/orders",
+                                           heartbeat: 30, connection_name: "billing-worker")
+client   = Async::RabbitMQ::Client.open(endpoint)
+```
+
+| Endpoint option | Default | Meaning |
+|---|---|---|
+| `heartbeat` | 60 | Seconds; 0 asks for none |
+| `timeout` | 10 | Seconds to connect and complete the handshake |
+| `call_timeout` | 15 | Seconds to wait for the broker to answer a request; `nil` waits for ever |
+| `connection_name` | none | Shown in the broker's management UI |
+| `channel_max` | 2047 | Most channels, and so most publishers and consumers, on the connection |
+| `frame_max` | 131072 | Largest frame, in bytes |
+| `auth_mechanism` | negotiated | `"PLAIN"` or `"EXTERNAL"` to force one |
+| `tcp_user_timeout` | from the heartbeat | Milliseconds before the kernel gives up on unacknowledged data |
+
+A URL may carry `heartbeat`, `channel_max`, `connection_timeout` and
+`auth_mechanism` as query parameters. A keyword argument wins over the URL.
+
+| Client option | Default | Meaning |
+|---|---|---|
+| `reconnect_interval` | 1 | Seconds before the first attempt to reconnect; doubles with each failure, with jitter |
+| `reconnect_max_interval` | 30 | Where the doubling stops |
+| `reconnect_attempts` | `nil` | Failures in a row that end the client; `nil` never gives up |
+| `shuffle` | `true` | With several endpoints, try them in a new random order each time |
+
+### Several addresses
+
+Given a list, the client connects to whichever will have it, and tries them
+all again when that connection is lost. It is still one connection to one
+node at a time. For a connection to every node, see [A cluster](#a-cluster).
+
+```ruby
+Async::RabbitMQ::Client.open(%w[amqp://rabbit1 amqp://rabbit2 amqp://rabbit3])
+```
 
 ### TLS
 
-The ordinary case needs no OpenSSL: give it the CA that signed the broker's
-certificate, and a client certificate and key if the broker asks for one. Each
-value is a file path or PEM text, so material from a secrets manager works as
-is. A certificate value may carry the leaf followed by its chain, and a CA
-value may hold several certificates.
+An `amqps://` URL verifies the broker against the system's trust store. For a
+private CA or a client certificate, build a context:
 
 ```ruby
-AsyncRabbitMQ::Session.new(host: "rabbit", port: 5671,
-                           tls_ca_certificates: "/etc/ssl/rabbit-ca.pem")
-AsyncRabbitMQ::Session.new(host: "rabbit", port: 5671,
-                           tls_cert: ENV["RABBIT_CERT"], tls_key: ENV["RABBIT_KEY"],
-                           tls_ca_certificates: [ENV["RABBIT_CA"]])
+context  = Async::RabbitMQ::TLS.context(cert: "client.pem", key: "client.key",
+                                        ca_certificates: ["ca.pem"])
+endpoint = Async::RabbitMQ::Endpoint.parse("amqps://rabbit.example.com", ssl_context: context)
 ```
 
-Peers and their hostnames are verified unless `verify_peer: false`, and TLS 1.2
-is the floor unless `tls_min_version:` says otherwise. `amqps://` URIs take the
-same things as `cacertfile`, `certfile`, `keyfile` and `verify`. For anything
-this does not cover, pass `tls_context:` and it is used as given.
+Each of `cert`, `key` and `ca_certificates` takes a file path or PEM text, so
+material from a secrets manager works as well as a file. The same can be said
+in the URL with `cacertfile`, `certfile`, `keyfile` and `verify=false`.
 
-### Logging
+With a client certificate the client offers `EXTERNAL` authentication, where
+the broker takes the user from the certificate, and falls back to `PLAIN`.
+`EXTERNAL` needs the `rabbitmq_auth_mechanism_ssl` plugin on the broker. It
+is not covered by this gem's integration tests, because the test broker does
+not have the plugin.
 
-By default the client logs warnings and errors through
-[Console](https://github.com/socketry/console), like the rest of the async stack.
-How much it says is set in one place, whichever logger a session was given:
+## Queues, exchanges and bindings
 
 ```ruby
-AsyncRabbitMQ.log_level = :warn    # the default: warnings and errors
-AsyncRabbitMQ.log_level = :debug   # everything, when troubleshooting a connection
-AsyncRabbitMQ.log_level = :off     # nothing, from any session
+orders = client.queue("orders")                            # durable
+events = client.exchange("events", :topic)                 # durable
+orders.bind(events, routing_key: "order.*")
+
+quorum = client.queue("payments", type: :quorum)
+ttl    = client.queue("scratch", arguments: { "x-message-ttl" => 60_000 })
 ```
 
-```bash
-ASYNC_RABBITMQ_LOG_LEVEL=debug bundle exec ruby worker.rb
-```
+Whatever is declared through the client is remembered, and declared again on
+every new connection before anything else is let onto it. `client.forget(queue)`
+drops one from that record; `queue.delete` and `exchange.delete` do so too.
 
-The level is checked before a message reaches any logger, so an application that
-runs Console or Rails' logger at info does not get this client's info and debug
-lines unless it asks for them. It is process-wide and can be changed at any time.
+| On a queue | |
+|---|---|
+| `bind(exchange, routing_key:, arguments:)`, `unbind(...)` | Returns the queue, so it chains |
+| `message_count`, `consumer_count`, `exists?` | Asked of the broker each time |
+| `purge`, `delete(if_unused:, if_empty:)` | |
+| `consumer(**options)`, `managed_consumer(**options)` | A consumer of this queue |
 
-Every message names the object that logged it (the `Session`, a `Channel`, the
-`FrameIO` connection layer, a `Cluster`), so Console's own controls can narrow it
-further, per component. They act within `AsyncRabbitMQ.log_level`, never past it:
+| On an exchange | |
+|---|---|
+| `bind(source, routing_key:, arguments:)`, `unbind(...)` | Exchange-to-exchange |
+| `exists?`, `delete(if_unused:)` | |
+| `publisher(**options)` | A publisher to this exchange |
+
+`client.queue?("name")` and `client.exchange?("name")` ask whether one exists
+without declaring it. `client.default_exchange` is the default exchange.
+
+A queue declared on the client is always durable. RabbitMQ 4 refuses a queue
+that is neither durable nor exclusive, and closes the whole connection to say
+so, so `durable: false` raises `ArgumentError` before it is sent. For a queue
+that should go when you do, let a consumer declare its own: see [A queue of the consumer's own](#a-queue-of-the-consumers-own).
+
+## Publishing
 
 ```ruby
-AsyncRabbitMQ.log_level = :debug
-Console.logger.filter(AsyncRabbitMQ::Channel, Console::Logger::DEBUG)  # debug from channels
+publisher = client.publisher("events")          # an exchange, by name or object
+publisher.publish("hello", routing_key: "order.created")
+
+publisher = client.publisher                    # the default exchange:
+publisher.publish("hello", routing_key: "orders")   # the routing key is the queue
 ```
 
-Console's logger is per fiber, so a `Console.logger = ...` set before `connect`
-also reaches every background task the session starts (the reader, heartbeat,
-recovery loop and channel dispatchers).
+`publish` returns `true` once the broker has confirmed the message. Many
+fibers can publish through one publisher at once, and each waits only for its
+own message.
 
-To send this client's messages somewhere else, pass `logger:`. It takes anything
-that responds to `debug`, `info`, `warn` and `error`, so use whatever your
-application already has. Unlike reassigning `Console.logger`, this applies to one
-session only, not to every Console user in the process. `nil` discards
-everything.
+It raises when the message was not taken:
 
-```ruby
-AsyncRabbitMQ::Session.new(logger: Rails.logger)
-AsyncRabbitMQ::Session.new(logger: Logger.new($stdout, level: Logger::INFO))
-AsyncRabbitMQ::Session.new(logger: AsyncRabbitMQ::Log.new($stdout, level: :debug))
-AsyncRabbitMQ::Session.new(logger: nil)                                # say nothing
-```
+| Raises | When |
+|---|---|
+| `NackedError` | The broker refused it |
+| `ReturnedError` | It was `mandatory` and no queue took it |
+| `UnconfirmedError` | The connection was lost before the broker answered |
+| `ChannelError` | The broker closed the channel, for example over an exchange that does not exist |
+| `ClosedError` | The publisher was closed first |
 
-`AsyncRabbitMQ::Log` is a minimal logger of that kind (warnings and errors, one
-line each, to `$stderr`), for when you want a plain destination without the
-`logger` gem, which stopped being a default gem in Ruby 4.0. Structured events
-(see below) are the better hook for metrics and tracing; the log is for the
-things a human should read.
+The message's AMQP properties are keyword arguments: `content_type`,
+`content_encoding`, `headers`, `priority`, `correlation_id`, `reply_to`,
+`expiration`, `message_id`, `timestamp`, `type`, `user_id`, `app_id`. So are
+`exchange`, `mandatory` and `persistent`, to override the publisher's own for
+one message. A body is a `String`.
 
-## Channels
-
-Everything synchronous (`queue`, `exchange`, `basic_consume`, ...) is a
-request/reply that blocks only the calling fiber and gives up after
-`rpc_timeout` with `RpcTimeoutError`. A channel may be shared by many fibers:
-requests are serialised per channel and a publish's frames always reach the
-wire contiguously.
-
-```ruby
-ch = session.open_channel(pool_size: 4)   # up to 4 consumer handlers at once on this channel
-session.with_channel { |ch| ... }         # closed afterwards
-
-ch.queue("name", durable: true, exclusive: false, auto_delete: false, arguments: {})
-ch.durable_queue("name")                  # classic, durable, non-exclusive, non-auto-delete
-ch.quorum_queue("name")                   # x-queue-type: quorum
-ch.stream("name")                         # x-queue-type: stream
-ch.temporary_queue                        # server-named, exclusive, auto-delete
-ch.queue("name", passive: true)           # assert it exists (404 ChannelError otherwise)
-
-ch.exchange("name", type: :topic, durable: true)   # or ch.direct / fanout / topic / headers
-ch.default_exchange
-
-ch.basic_publish(body, exchange: "", routing_key: "q", persistent: true, content_type: "text/plain",
-                 headers: {}, correlation_id: "...", reply_to: "...", expiration: "60000", ...)
-ch.basic_publish_batch([b1, b2, b3], routing_key: "q")   # one write, best throughput
-
-ch.basic_get("q")                          # => [delivery_info, header, body] or nil; manual ack by default
-ch.basic_get("q", manual_ack: false)
-ch.basic_ack(tag) / basic_nack(tag, requeue: true) / basic_reject(tag, requeue: true)
-ch.basic_qos(prefetch_count: 10)           # also sizes the handler pool
-tag = ch.basic_consume("q", manual_ack: true) { |delivery, header, body| ... }
-ch.basic_cancel(tag)
-ch.each("q") { |delivery, header, body| ... }   # blocks until the consumer or channel goes away
-```
-
-Each channel runs `pool_size` long-lived handler fibers (default 1, serialized,
-Bunny parity) draining a queue of deliveries, so a backlog costs the messages it
-holds rather than a fiber per message. `ch.backlog` reports how many deliveries
-are waiting, as Bunny's `ConsumerWorkPool#backlog` does.
-
-What bounds that backlog depends on the ack mode. With `manual_ack: true`, set
-`basic_qos` before `basic_consume` and the broker holds everything past the
-prefetch window. With automatic acks there is no backpressure to be had:
-RabbitMQ applies prefetch only to *unacknowledged* messages, so the broker
-treats each one as acked on send and keeps sending whatever you set. The client
-warns once per channel in either case, and says which of the two you are in.
-
-If you have read that warning and accepted the trade - an auto-ack consumer on a
-queue you know stays shallow, say - switch it off during boot:
-
-```ruby
-AsyncRabbitMQ.warn_unbounded_consumers = false
-```
-
-It is deliberately one process-wide setting rather than a per-channel option: an
-application either accepts unbounded consumers or it does not. The point of
-having it at all is that the alternative is turning the logger down, which would
-also lose stale delivery tags, broker-cancelled consumers and handler
-exceptions.
-
-### Acknowledging, and delivery tags across a reconnect
-
-`delivery.delivery_tag` is a `VersionedDeliveryTag`: the broker's tag plus the
-generation of the channel it arrived on. It converts (`to_int`), compares,
-sorts, hashes and prints as the integer it wraps, so passing it to
-`basic_ack`, comparing it or putting it in a collection all work unchanged.
-Call `.to_i` if you need a real `Integer` — to serialise it, or where something
-tests `is_a?(Integer)`.
-
-The generation is what makes an ack safe across a reconnect. Delivery tags are
-scoped to a channel on a connection, and the broker restarts numbering at 1
-when a channel is reopened, so a handler that was still running when the
-connection dropped would otherwise acknowledge whichever message now holds that
-number:
-
-```ruby
-ch.basic_qos(prefetch_count: 10)
-ch.basic_consume("q", manual_ack: true) do |delivery, _header, body|
-  handle(body)                              # may outlive the connection
-  ch.basic_ack(delivery.delivery_tag)       # => false if the connection went; nothing is sent
-end
-```
-
-`basic_ack`, `basic_nack` and `basic_reject` return `true` when the frame was
-sent and `false` when the tag belonged to an earlier generation and was
-dropped. A dropped ack is not a lost message: the broker requeued it when the
-channel went, and it is redelivered on the new connection.
-
-### When a handler raises
-
-The delivery is settled for you. What happens to it is the *disposition*, and
-there are three:
-
-| | what it does | when |
+| Publisher option | Default | Meaning |
 |---|---|---|
-| `:dead_letter` (default) | `reject(requeue: false)` | one attempt, then the queue's dead-letter route. Safe on any queue. |
-| `:retry` | `reject(requeue: true)` | the message failed — hand it back and let the broker count it. See below. |
-| `:release` | `nack(requeue: true)` | *not* the message's fault — hand it back without counting it. |
-| `:leave` | nothing | you settle it yourself. This is Bunny's behaviour. |
+| `persistent` | `true` | Messages survive a broker restart, in a durable queue |
+| `mandatory` | `false` | The broker returns a message no queue takes, and `publish` raises |
+| `timestamps` | `true` | Stamp each message with when it was published; see [Message age](#message-age) |
+| `max_unconfirmed` | 1000 | Messages sent and not yet answered; a publish beyond that waits |
+| `resend` | `false` | Send unanswered messages again after a lost connection; see below |
 
-`:retry` and `:release` both return the message; the difference is blame.
-RabbitMQ counts a delivery as failed only on `basic.reject` (AMQP 1.0
-`modified` with `delivery-failed`), not on `basic.nack` (AMQP 1.0 `released`).
-So use `:retry` for a message that cannot be processed, and `:release` when the
-message is innocent and you simply cannot handle it now — shutting down,
-shedding load, a downstream outage. Rejecting during a gateway outage would
-walk your whole backlog to the dead-letter queue in `x-delivery-limit`
-attempts; releasing it costs the messages nothing.
+### Not waiting: `submit`
 
-The trade is that `:release` has no backstop: nothing advances towards
-`x-delivery-limit`, so a genuinely poison message is redelivered forever. Use it
-when you know the failure is yours, not the message's.
-
-Set it per consumer, or channel-wide for all of them:
+`submit` sends the message and returns an `Outcome` without waiting for the
+broker. This is how to publish a batch and then collect the answers:
 
 ```ruby
-ch.on_error_disposition = :retry                       # channel default
-ch.basic_consume("q", manual_ack: true, on_error: :leave) { |d, h, b| ... }
+outcomes = orders.map { |order| publisher.submit(order.to_json, routing_key: "orders") }
+outcomes.each(&:wait)        # raises for the first that was not taken
 ```
 
-A delivery the handler already settled itself is left alone, so acking and then
-raising in whatever follows is safe.
+`outcome.wait(timeout: 5)` raises `TimeoutError` if no answer comes in time,
+and can be called again. `outcome.status` is `:pending`, `:acked`, `:nacked`,
+`:returned` or `:failed`, and `outcome.error` is what `wait` would raise.
 
-`on_handler_error` runs **before** the delivery is settled, so what it returns
-can decide this one message's fate. Return a disposition to override; return
-anything else, or nothing, to take the configured default:
+### A message caught by a lost connection
+
+A message that had been sent, and not answered for, when the connection went
+is a problem with no clean answer: the broker may have it or may not, and
+nothing will ever say which. By default it fails with `UnconfirmedError` and
+you decide. `resubmit` sends it again, at the risk of a second copy, and the
+same outcome then answers for the new one:
 
 ```ruby
-ch.on_handler_error do |error, delivery, queue_name|
-  Sentry.capture_exception(error, extra: { queue: queue_name })
-  case error
-  when GatewayDown           then :release      # innocent, do not count it
-  when TransientUpstreamError then :retry       # failed, count towards the limit
-  else                            :dead_letter
-  end
+outcome = publisher.submit(body, routing_key: "orders")
+begin
+  outcome.wait
+rescue Async::RabbitMQ::UnconfirmedError
+  outcome.resubmit
+  retry
 end
 ```
 
-A hook that raises is logged and the configured default applies, so a broken
-hook cannot strand a delivery.
+A publisher made with `resend: true` makes that choice for every message. On
+the new connection it sends again everything unanswered, in the order it was
+first sent, and fibers waiting in `publish` go on waiting. Use it when
+consumers can stand to see a message twice.
 
-### Letting the broker do the retrying
+A message published while there is no connection has not been sent at all. It
+waits for the next connection, under either setting.
 
-`:retry` is built for quorum queues, which count failed deliveries themselves:
+### Message age
+
+With `timestamps` on, each message carries the standard `timestamp` property
+(seconds) and a `timestamp_in_ms` header. A consumer reads them back:
 
 ```ruby
-ch.quorum_queue("orders.commands", arguments: {
-  "x-delivery-limit"          => 5,          # retire after 5 failures
-  "x-delayed-retry-type"      => "failed",   # back off between attempts
-  "x-delayed-retry-min"       => 1_000,
-  "x-delayed-retry-max"       => 30_000,
-  "x-dead-letter-exchange"    => "",
-  "x-dead-letter-routing-key" => "orders.commands.parked",
-})
+message.published_at    # a Time, to the millisecond
+message.elapsed         # seconds since it was published, as a Float
 ```
 
-The broker spaces the attempts (`min(min_delay × delivery_count, max_delay)`),
-counts them in the `x-delivery-count` header, and dead-letters the message once
-`x-delivery-limit` is reached. There is no second delay queue to declare and no
-attempt counting to write.
+Both are `nil` for a message that carries neither. Setting the two fields
+costs a few microseconds a message; `timestamps: false` leaves them out.
 
-Two things that are easy to get wrong:
+## Consuming
 
-**It has to be `reject`, not `nack`.** RabbitMQ only treats a delivery as
-*failed* on `basic.reject`; after `basic.nack` the `x-delivery-count` does not
-move, so a nacked message is redelivered forever and never reaches the limit.
-This client always rejects, which is why `:retry` works at all. If you settle
-deliveries yourself, use `basic_reject`.
+There are two consumers. `Consumer` gives you each message and leaves the
+rest to you. `ManagedConsumer` runs your handler and looks after
+concurrency, acknowledging and stopping.
 
-**Reconnects spend the same budget.** A channel closing with the delivery
-unacknowledged — a disconnect, a recovery, a broker-side channel error — counts
-as a failed delivery too. A message can therefore be dead-lettered by three
-reconnects without your handler ever failing. Size `x-delivery-limit` for
-handler failures *plus* the reconnects you expect, and read the dead-letter
-queue as "failed or unlucky".
-
-Without `x-delivery-limit`, `:retry` is an infinite loop for a message that
-always fails. That is why the default is `:dead_letter`: it is safe on any
-queue, and a default should not depend on configuration the client cannot see.
-
-### RabbitMQ 4.2+ and transient queues
-
-RabbitMQ 4.2 and later refuse to declare a queue that is both non-durable
-and non-exclusive; the broker answers with a **connection-level** error
-(`541 INTERNAL_ERROR`, "Feature transient_nonexcl_queues is deprecated")
-and this client reconnects. The AMQP default (`durable: false,
-exclusive: false`) is therefore rejected by a current broker. Use
-`durable: true` (add `"x-expires"` to have idle queues clean themselves up),
-or `exclusive: true` / `temporary_queue` for a queue that should live only as
-long as the connection.
-
-## Publisher confirms
+### `Consumer`
 
 ```ruby
-ch.confirm_select
-ch.basic_publish(...)                      # => delivery tag
-ch.wait_for_confirms                       # true, or false if the broker nacked something
-ch.nacked_tags                             # tags rejected since confirm_select
-ch.unconfirmed_tags
-
-ch.confirm_select(tracking: true, outstanding_limit: 1000)
-# publishes park while 1000 messages are unconfirmed (backpressure);
-# wait_for_confirms raises AsyncRabbitMQ::MessageNacked on a nack.
-
-ch.wait_for_confirms(timeout: 5)           # ConfirmTimeoutError instead of waiting forever
-ch.unconfirmed_messages                    # what the broker has not resolved: payload, routing and options
-```
-
-`wait_for_confirms` waits indefinitely by default. Pass `timeout:` if a broker
-that accepts a publish and then never confirms it should raise
-`ConfirmTimeoutError` (which carries `unconfirmed_tags`) rather than park the
-fiber for good.
-
-Messages published under confirms are kept until the broker acks them. If
-the connection drops first they are re-published on the recovered channel
-(the usual at-least-once trade-off: a message the broker had already
-accepted may be delivered twice).
-
-### What a returned publish means here
-
-Two differences from Bunny on the sending side, both deliberate.
-
-**`basic_publish` returns when the frames are queued for the writer fiber,
-not when they are on the socket.** Bunny writes inline on the calling thread,
-so there a returned publish means the bytes reached the kernel. Neither is a
-delivery guarantee: RabbitMQ's own guidance is that a client which has written
-frames to its socket still cannot assume the broker received or processed
-them. Publisher confirms are the only thing that tells you. What the queue
-does change is the size of the window. Closing a session with a backlog
-discards whatever the writer has not reached yet, because the close handshake
-is bounded at five seconds; the client logs a warning naming the number of
-queued writes it dropped, since a publisher without confirms has no other way
-to find out. If it matters, `confirm_select` and `wait_for_confirms` before
-`close`.
-
-**A channel may be published to from many fibers at once.** RabbitMQ's
-documentation says concurrent publishing on a shared channel is not supported
-by client libraries, and for most clients that is true. Here publishes and
-request/reply calls are serialised per channel, so a message's frames always
-reach the wire contiguously and confirm tags follow wire order. Sharing a
-channel is still a throughput bottleneck, and synchronous calls queue behind a
-publish backlog, so give a busy publisher its own channel when latency on
-declares matters.
-
-## Transactions
-
-`ch.tx_select`, `ch.tx_commit`, `ch.tx_rollback`, `ch.using_tx?`. A channel
-cannot be both transactional and in confirm mode.
-
-### The reactor does not stay alive on its own
-
-The client's background work — the frame reader and writer, channel dispatch,
-heartbeats, recovery — runs in transient tasks, so it never holds the reactor
-open by itself. A program that connects, subscribes and then lets its main task
-finish exits immediately, without running the consumer and without an error:
-
-```ruby
-Async do
-  session.connect
-  ch = session.open_channel
-  ch.basic_qos(prefetch_count: 10)
-  ch.basic_consume("q") { |delivery, header, body| ... }
-end   # returns at once; nothing was waiting
-```
-
-Block on something you own instead:
-
-```ruby
-Async do
-  session.connect
-  ch = session.open_channel
-  ch.basic_qos(prefetch_count: 10)
-  ch.each("q") { |delivery, header, body| ... }   # blocks until the consumer or channel goes away
+consumer = client.consumer("orders", prefetch: 10)
+consumer.each do |message|
+  process(message.body)
+  message.ack
+rescue InvalidOrder
+  message.reject(requeue: false)
 end
 ```
 
-`Async::Condition#wait`, a `sleep`, or your own supervisor task work equally
-well.
+`each` runs the block in the fiber that called it, one message at a time.
+Nothing is settled for you: a block that returns without `ack`, `nack` or
+`reject` leaves the message unacknowledged, which is how a message is handed
+to another fiber to finish later. An exception out of the block ends the loop
+and is raised from `each`.
 
-## Connection recovery
+`each` returns when the consumer goes away, and says why:
 
-When the connection is lost the session reconnects with exponential backoff
-(`recovery_interval` doubling up to `recovery_max_interval`, ±25% jitter,
-`recovery_attempts: nil` = forever), trying every address in the list.
-Meanwhile each channel is in the *recovering* state: operations already
-waiting for a reply raise `ConnectionError`, and new publishes and requests
-**park** until the channel is reopened, so nothing issued during the outage
-is lost. After reconnect the session
+| Returns | When |
+|---|---|
+| `:stopped` | `consumer.stop` was called |
+| `:cancelled` | The broker cancelled the consumer, as when the queue is deleted |
+| `:closed` | The consumer or its client was closed |
+| `:connection_lost` | The connection was lost and the consumer was made with `on_connection_loss: :end` |
 
-1. reopens every channel with its prefetch, confirm and tx settings,
-2. replays the recorded topology (`recover_topology`): exchanges, queues
-   (server-named queues come back under a new name, which is propagated to
-   their bindings, consumers and `Queue` objects), then bindings,
-3. re-registers consumers and releases the parked callers,
-4. calls `on_recovery`.
+However it ends, messages that had arrived but had not reached the block go
+back on the queue. `stop` is safe from any fiber. It does not interrupt a
+block that is running; `each` returns when the block finishes.
 
-Passive declares are not recorded; deleted or unbound entities are not
-recovered. The registry follows what the broker does rather than which channel
-declared what: a durable or exclusive queue outlives the channel that declared
-it and is still recovered, while an auto-delete queue is forgotten, with its
-bindings, the moment its last consumer goes, whether by `basic_cancel`, a
-broker-side cancel or the channel closing, and an auto-delete exchange goes
-when its last binding does. A worker that opens a channel and a temporary
-queue per unit of work therefore leaves nothing behind for the next reconnect
-to re-declare. `topology_recovery_filter:` takes an object implementing any of
-`filter_exchanges`, `filter_queues`, `filter_queue_bindings`,
-`filter_exchange_bindings`. If recovery is disabled, exhausted
-(`on_recovery_exhausted`) or the broker refuses the credentials, channels are
-closed and parked callers raise.
+| Consumer option | Default | Meaning |
+|---|---|---|
+| `prefetch` | 100 | Unsettled messages the broker sends at once; `nil` for no limit |
+| `on_connection_loss` | `:wait` | `:wait` or `:end`; in a cluster also `:move` |
+| `exclusive` | `true` with no queue named | The queue is the consumer's own |
+| `queue_arguments` | `{}` | Arguments for the consumer's own queue |
+| `arguments` | `{}` | Arguments for `basic.consume` |
 
-Callbacks: `on_connection_lost` (the connection dropped; fires before recovery
-starts), `on_blocked` / `on_unblocked` (connection.blocked),
-`on_recovery_attempt`, `on_recovery`, `on_recovery_exhausted`;
-`Channel#on_return` (mandatory messages the broker could not route),
-`on_cancel` (broker cancelled a consumer), `on_error` (broker closed the
-channel). A broker-closed channel can be reopened in place with
-`Channel#reopen`. Every one of these runs in a task of its own, so a callback
-may issue RPCs — re-consume, reopen, declare — and a callback that raises is
-logged rather than taken out on the channel.
+### A message
 
-### A consumer the broker cancels
+| | |
+|---|---|
+| `body`, `headers`, `routing_key`, `exchange` | |
+| `message_id`, `correlation_id`, `reply_to`, `content_type`, and the other AMQP properties | |
+| `redelivered?`, `persistent?` | |
+| `published_at`, `elapsed` | See [Message age](#message-age) |
+| `ack`, `nack(requeue: true)`, `reject(requeue: true)` | Settle it. Only the first of these is sent |
+| `settled?`, `settlement` | Whether, and how, it was settled |
+| `stale?` | Its connection has gone; the broker has requeued it |
 
-RabbitMQ cancels a consumer when it can no longer serve the queue to it. The
-connection is untouched, so none of the recovery above runs — a `basic.cancel`
-frame is the only notice there is, and without `on_cancel` the worker goes on
-publishing and heartbeating while consuming nothing.
-
-Nothing is re-subscribed by default, which matches Bunny, the Java client and
-the .NET client. `recover_cancelled_consumers: true`, on the session or on one
-channel, re-subscribes under the same consumer tag, backing off from 1s to 30s
-for as long as the queue exists, through however many reconnects that takes. It
-gives up only when the channel or the session is finished for good.
-
-**Recovery never declares anything.** One of the reasons a consumer gets
-cancelled is somebody deleting the queue, and a client that answered that by
-re-declaring would hand back a queue nobody could get rid of while a consumer
-was attached. So the client asks the broker, on a channel of its own, whether
-the queue is still there, and re-consumes only if it is. Re-declaring is the
-application's call, and `on_cancel` is where to make it: that callback is run
-to completion before the client goes asking, so a queue declared there is
-there when it looks.
-
-Three things follow from that, and each of them is a bug in some client:
-
-- **The queue is held out of topology recovery until the client knows.**
-  Otherwise the two race — a reconnect re-declares the whole registry — and the
-  queue somebody deleted comes back. Deleting a quorum queue is exactly that
-  race arriving as one event: the cancel, and then a connection-level `541
-  INTERNAL_ERROR ... noproc` in answer to the re-subscribe.
-- **The question is asked before every attempt, never the attempt instead of
-  the question.** A `basic_consume` the broker answers `404` closes the
-  channel, and takes the consumers still working on it down with it.
-- **`NOT_FOUND` is two answers.** `no queue 'q' in vhost '/'` is a deletion;
-  `queue 'q' in vhost '/' process is stopped by supervisor`, which is what a
-  classic queue on a stopped node gives, is a queue that comes back with its
-  node. The second is waited for, not forgotten.
+### `ManagedConsumer`
 
 ```ruby
-session = AsyncRabbitMQ::Session.new(..., recover_cancelled_consumers: true)
-channel.on_cancel { |tag| logger.warn("consumer #{tag} cancelled by the broker") }
+consumer = client.managed_consumer("orders", concurrency: 10)
+consumer.run do |message|
+  process(message.body)
+end
 ```
+
+`run` blocks until the consumer goes away, and returns what `each` would.
+Handlers run in fibers of their own, up to `concurrency` at a time. A handler
+that returns has its message acked. One that raises has it nacked without
+requeue, so it is dead-lettered if the queue has a dead-letter exchange and
+discarded if not, and the consumer carries on. A handler's exception never
+ends `run`. A handler may settle the message itself, and what it did stands.
+
+| ManagedConsumer option | Default | Meaning |
+|---|---|---|
+| `concurrency` | 1 | Handlers running at once |
+| `prefetch` | `concurrency` | Unsettled messages the broker sends at once |
+| `ack_on_success` | `true` | Ack when the handler returns |
+| `exception` | `:nack` | What to do when the handler raises: `:ack`, `:nack` or `:reject` |
+| `requeue` | `false` | For `:nack` and `:reject`, whether the message goes back on the queue |
+| `drain_timeout` | 30 | Seconds a stop waits for running handlers; `nil` waits for ever |
+
+It takes `Consumer`'s options too.
+
+Stopping is graceful, whether by `stop`, by `close`, or by stopping the task
+that is running `run`. Nothing new arrives, messages that had not started go
+back on the queue, and running handlers get `drain_timeout` to finish. Any
+still running after that are stopped and their messages requeued. A stop
+never loses a message.
+
+`consumer.on_error { |error, message| ... }` is called when a handler raises,
+before the message is settled.
+
+### A queue of the consumer's own
+
+Given no queue, the consumer declares one that is its alone: exclusive to its
+connection, and gone when that connection goes.
+
+```ruby
+replies = client.consumer(prefetch: 50)
+replies.queue_name                               # the name the broker chose
+replies.bind("events", routing_key: "order.*")
+```
+
+After a lost connection the queue is declared and bound again on the next
+one. Whatever was in it went with the old connection, and a queue the broker
+named has a new name. `on_attach` is how to hear of it:
+
+```ruby
+replies.on_attach { |consumer| announce(consumer.queue_name) }
+```
+
+The queue can be named instead, by passing a name with `exclusive: true`. The
+same name is then declared again after every reconnect.
+
+- **On a single node this is fine.** The old queue is gone by the time the
+  new connection declares it.
+- **In a cluster it can fail.** An exclusive queue is deleted when its
+  connection closes, and the nodes do not all learn of that at once. A
+  declaration that arrives before the old queue is gone everywhere is
+  refused, and `each` raises `ChannelError` with `resource_locked?` true.
+
+In a cluster, let the broker name the queue. A name it chooses is new each
+time, so it cannot collide with the old one.
+
+## When the connection is lost
+
+The client reconnects, with a delay that starts at `reconnect_interval`,
+doubles to `reconnect_max_interval`, and is jittered so a fleet does not come
+back in one instant. On the new connection it declares its queues, exchanges
+and bindings again. Then each publisher and consumer attaches itself.
+
+| | What happens |
+|---|---|
+| A declaration or a query in progress | Sent again on the new connection |
+| A `publish` not yet sent | Waits, and is sent on the new connection |
+| A `publish` sent and not answered | Raises `UnconfirmedError`, or is sent again with `resend: true` |
+| A consumer | Consumes again on the new connection |
+| A message delivered on the old connection | Stale: the broker requeues it and sends it again. Settling it does nothing, and one not yet handed to the block is dropped |
+| A consumer's own queue | Declared and bound again, empty |
+
+A consumer made with `on_connection_loss: :end` does not wait: `each` returns
+`:connection_lost`.
+
+With `reconnect_attempts` set, the client gives up after that many failures
+in a row. Everything waiting on it then raises `ConnectionError`.
+
+When the broker blocks publishing (a memory or disk alarm), publishes wait
+until it unblocks.
+
+## A cluster
+
+A `Client` is one connection to one node, and everything made through it
+lives on that node. An application that makes many consumers, each with a
+queue of its own, puts all those queues on the one node it happens to be
+connected to. A `Cluster` holds a `Client` for every node and shares the load
+out.
+
+```ruby
+nodes = %w[amqp://rabbit1 amqp://rabbit2 amqp://rabbit3]
+Async::RabbitMQ::Cluster.open(nodes) do |cluster|
+  replies = cluster.consumer(prefetch: 50)     # on the node with the fewest
+  replies.queue_name
+end
+```
+
+A cluster has the same methods as a client: `queue`, `exchange`,
+`publisher`, `consumer`, `managed_consumer`. It takes the client's options,
+which apply to every node.
+
+- **Placement.** A new publisher or consumer goes to the connected node with
+  the fewest publishers and consumers already, at random between ties.
+- **Declarations** are sent to one node and remembered by all.
+- **Starting.** `open` returns once every node has answered or failed. Those
+  that failed join in the background. It raises only if no node could be
+  reached, or if one refused the credentials.
+
+When a node goes away, nothing moves by default. A queue lives on a node, and
+a consumer moved elsewhere has a new, empty queue, so the application has to
+be ready for that. A consumer chooses with `on_connection_loss:`:
+
+| Setting | What happens |
+|---|---|
+| `:wait` (default) | Stays with its node and consumes again when it is back |
+| `:end` | `each` returns `:connection_lost` |
+| `:move` | Goes to the least-loaded connected node. Its own queue is declared and bound again there, empty, and `on_attach` is called |
+
+A consumer that moved does not move back. With nowhere to go, it waits where
+it is. A publisher always stays with its node and waits for it; one that
+should publish through whichever node is up belongs on a `Client` given all
+the addresses.
+
+The cluster is tested against one broker reached by two routes, not against
+a real multi-node cluster.
 
 ## Errors
 
-All errors derive from `AsyncRabbitMQ::Error`: `ConnectionTimeoutError`
-(could not connect), `AuthenticationError` (credentials or vhost refused,
-`code` 403), `ConnectionError` (`code`, `text`; broker closed the
-connection or it was lost), `ChannelError` (`code`, `text`, `channel_id`,
-`close_method`, plus `delivery_ack_timeout?`, `unknown_delivery_tag?`,
-`message_too_large?`), `NotOpenError`, `RpcTimeoutError`, `MessageNacked`
-(`nacked_tags`), `ConfirmTimeoutError` (`unconfirmed_tags`, `channel_id`),
-`ClusterError` (a cluster-wide operation that did not succeed on every node),
-`HeartbeatTimeoutError`, `ChannelLimitError` (every id up to
-the negotiated `channel_max` is in use; the broker would otherwise have closed
-the connection). Channel ids are reused as channels close, so opening a
-channel per unit of work is fine for the life of the connection.
+Everything raised is an `Async::RabbitMQ::Error`.
 
-## Events
-
-`Session#on_event` subscribes to structured events for metrics, tracing and
-debugging. Nothing is emitted until something subscribes: the payload is built
-inside a block that only runs when a subscriber is listening.
-
-```ruby
-session.on_event { |name, payload| logger.info("#{name} #{payload}") }
-session.on_event("message.")    { |name, _|  statsd.increment(name) }
-session.on_event("channel.rpc") { |_, p|     histogram.record(p[:duration]) }
-session.on_event(/^recovery\./) { |name, p|  pager.note(name, p) }
-
-# or hand the whole stream to something at construction
-AsyncRabbitMQ::Session.new(instrumenter: ->(name, payload) { ... })
-```
-
-The pattern is `nil` for everything, a String for one event name or, ending in
-a dot, a prefix, or a Regexp. `on_event` returns a handle that
-`session.notifier.unsubscribe(handle)` takes back. A subscriber that raises is
-logged and skipped; it never breaks the connection.
-
-| Event | Payload |
+| Error | Meaning |
 |---|---|
-| `connection.open` | `host`, `port`, `vhost`, `tls`, `heartbeat`, `frame_max`, `channel_max`, `duration` |
-| `connection.closed` | `reason` (`:user`), `host`, `port` |
-| `connection.lost` | `host`, `port`, `error`, `message`, `recovering` |
-| `connection.blocked` | `reason` |
-| `connection.unblocked` | — |
-| `recovery.attempt` | `attempt`, `delay` |
-| `recovery.succeeded` | `attempts`, `host`, `port`, `channels`, `duration` |
-| `recovery.exhausted` | `attempts`, `reason` (`:attempts_exceeded`, `:authentication_failed`) |
-| `heartbeat.sent` | `interval` |
-| `channel.open` | `channel` |
-| `channel.closed` | `channel`, `reason` (`:user`, `:broker`, `:dropped`), `code`, `text` |
-| `channel.rpc` | `channel`, `method` (`"queue.declare-ok"`), `duration` |
-| `consumer.registered` | `channel`, `queue`, `consumer_tag`, `manual_ack` |
-| `consumer.cancelled` | `channel`, `consumer_tag`, `queue`, `reason` (`:client`, `:broker`) |
-| `consumer.recovered` | `channel`, `consumer_tag`, `queue`, `attempts` |
-| `consumer.recovery_failed` | `channel`, `consumer_tag`, `queue`, `reason` (`:queue_deleted`, `:error`), `error` |
-| `message.published` | `channel`, `exchange`, `routing_key`, `count`, `bytes`, `delivery_tag` |
-| `message.confirmed` | `channel`, `delivery_tag`, `multiple`, `acked` |
-| `message.returned` | `channel`, `exchange`, `routing_key`, `code`, `text`, `bytes` |
-| `message.consumed` | `channel`, `queue`, `consumer_tag`, `bytes`, `redelivered`, `duration` |
+| `ConnectionError` | The connection failed or was lost. Has `code` and `text` when the broker closed it |
+| `ConnectTimeoutError`, `AuthenticationError`, `HeartbeatTimeoutError`, `ProtocolError` | Kinds of `ConnectionError` |
+| `ChannelError` | The broker refused a request. Has `code`, `text`, and `not_found?`, `access_refused?`, `resource_locked?`, `precondition_failed?` |
+| `PublishError` | A message was not taken: `NackedError`, `ReturnedError`, `UnconfirmedError` |
+| `ClosedError` | The client, publisher or consumer has been closed |
+| `TimeoutError` | A wait ran out of time |
+| `ChannelLimitError` | The connection has no channel left for another publisher or consumer |
 
-Durations are seconds as a Float. `bytes` on `message.published` is the encoded
-frames, including the header and properties; elsewhere it is the body. A batch
-published with `basic_publish_batch` is one event with `count` set and the last
-delivery tag. Event names are API and do not change without a major version;
-`AsyncRabbitMQ::Notifier::EVENTS` lists them.
+A `ChannelError` from a declaration is the broker's answer and is raised to
+the caller. The client stays usable.
 
-### OpenTelemetry
+## Logging
 
-Tracing is a separate, optional layer. Add `opentelemetry-api` to your bundle,
-then:
+The client logs through [Console](https://github.com/socketry/console), like
+the rest of the async stack: a warning when a connection is lost, a line when
+it is back, an error when a handler raises. Set the level with
+`CONSOLE_LEVEL=debug`, or configure Console as you would for any async
+application. There is no `logger:` option.
+
+## OpenTelemetry
+
+Spans and metrics are optional, and not loaded unless you ask:
 
 ```ruby
-require "async_rabbitmq/telemetry/open_telemetry"
-AsyncRabbitMQ::Telemetry::OpenTelemetry.install
+require "async/rabbitmq/open_telemetry"
+Async::RabbitMQ::OpenTelemetry.install      # after OpenTelemetry is configured
 ```
 
-Spans and attributes match `opentelemetry-instrumentation-bunny`, so a service
-moving over from Bunny keeps the traces and dashboards it had. Publishing opens
-a PRODUCER span `"<exchange>.<routing key> publish"` and injects the W3C trace
-context into the message headers; `basic_get` opens a CONSUMER span
-`"<destination> receive"`; and a consumer handler runs inside a CONSUMER span
-`"<destination> process"` whose parent is the context extracted from the
-headers, so one trace spans both sides of the broker. Attributes are
-`messaging.system`, `messaging.destination`, `messaging.destination_kind`,
-`messaging.protocol`, `messaging.protocol_version`,
-`messaging.rabbitmq.routing_key`, `messaging.operation`, `net.peer.name` and
-`net.peer.port`, plus `messaging.batch.message_count` on a batch publish.
+This needs `opentelemetry-api` in your bundle, and `opentelemetry-metrics-api`
+for the metrics. `install(tracer_provider:, meter_provider:)` takes either as
+`nil` to leave that half off.
 
-`install` takes `tracer_provider:`, `tracer_name:` and `tracer_version:`.
-`uninstall` stops tracing. One difference from Bunny: a pushed delivery here
-goes straight to the handler, so there is one process span per delivery rather
-than a receive span with a process span under it.
+| Span | Kind | Around |
+|---|---|---|
+| `publish <exchange>` | producer | `submit` and `publish`. Ends when the message is written, not when it is confirmed |
+| `process <queue>` | consumer | The block of `Consumer#each`, or the handler of `ManagedConsumer#run` |
 
-## Connection pool
+The trace context travels in the message's headers, and the process span is a
+child of the publish span, so a trace crosses the broker. A handler's
+exception is recorded on its span. Attributes follow OpenTelemetry's
+messaging conventions.
 
-Add `gem "async-pool"` to your Gemfile: it is not a dependency of this gem, so
-that an application that never pools does not install it.
+| Metric | Type | |
+|---|---|---|
+| `messaging.client.sent.messages` | counter | One per answer from the broker, with `error.type` when it was not an ack |
+| `messaging.client.operation.duration` | histogram, s | From `submit` to the broker's answer |
+| `messaging.client.consumed.messages` | counter | With `error.type` when the block or handler raised |
+| `messaging.process.duration` | histogram, s | Time in the block or handler |
+| `async.rabbitmq.message.age` | histogram, s | Publish to delivery, for messages with a timestamp |
+| `async.rabbitmq.client.connections` | counter | Connections made |
+| `async.rabbitmq.client.connection.losses` | counter | Connections lost |
 
-```ruby
-require "async_rabbitmq/pool"
-pool = AsyncRabbitMQ::Pool.new(max: 5, host: "localhost")
-pool.acquire { |session| session.with_channel { |ch| ch.basic_publish(...) } }
-pool.close
-```
+Tracing is not free. On a development machine, spans and metrics together
+roughly halved the publish and consume rates of small messages.
 
-Backed by `Async::Pool`; a session is shared by up to `channel_max` fibers
-before another connection is opened.
+## What is not here
 
-## One connection per cluster node
+Left out on purpose. The legacy engine has most of them.
 
-A `Session` is on one node. Every channel it opens is there, and so is every
-exclusive queue declared through it, because the broker always places those on
-the connecting node, whatever `queue_leader_locator` says. A process that holds
-a channel and a temporary queue per client therefore puts all of its clients on
-one node, and loses them together when that node goes.
-
-`AsyncRabbitMQ::Cluster` takes the same options as `Session` and presents the
-same methods, so it drops in where a `Session` was. It pins one connection to
-each address, opens each new channel on the node with the fewest, and retries a
-node that is down until it is back, after which new channels drift to it until
-the counts are level. Nothing is ever moved: a channel stays on its node for
-life.
-
-```ruby
-cluster = AsyncRabbitMQ::Cluster.new(
-  addresses: %w[rabbit1:5672 rabbit2:5672 rabbit3:5672],   # one connection each
-  username: "app", password: secret,
-  on_node_down: :drop,            # :park (default), :drop, or ->(session, channels, error) { ... }
-  clear_topology_on_drop: true    # with :drop, forget the lost connection's transient topology
-)
-cluster.connect                   # every node, concurrently; the ones that are down are retried in the background
-channel = cluster.open_channel    # on the node with the fewest channels
-cluster.on_node_down { |session, channels, error| ... }
-# declare a fourth parameter to also receive the publishes the broker never
-# confirmed, so they can be sent again on another node:
-cluster.on_node_down do |session, channels, error, unconfirmed|
-  unconfirmed.each { |m| elsewhere.basic_publish(m.payload, exchange: m.exchange, routing_key: m.routing_key, **m.options) }
-end
-cluster.on_node_up   { |session| ... }
-```
-
-`on_node_down:` decides what happens to the channels on a node whose connection
-is lost. `:park` is what a `Session` does: they wait, and resume on the same
-node when it returns. `:drop` closes them at once: calls in flight raise
-`ConnectionError`, consumer loops return, later calls raise `NotOpenError`, and
-the fibers using them can open a new channel, which lands on a node that is up.
-A callable receives the node's session, its channels and the error while the
-channels are parked, and closes the ones it wants dropped; the rest wait. With
-`:drop` the lost connection's transient topology is forgotten as well
-(`clear_topology_on_drop: true`): exclusive, auto-delete and server-named
-queues, auto-delete exchanges, and the bindings that referred to them. Durable
-exchanges, queues and bindings are kept, so a node that comes back from an
-empty data directory still has them re-declared; `false` keeps the usual
-registry rules. Publishing and shared durable
-topology are expected to live on a plain `Session` alongside: the cluster is
-for the mass of per-client channels.
-
-`connect` connects every node concurrently and returns once each one is either
-connected or has failed a first attempt, so the channels opened next are spread
-over every node that is reachable. The wait is bounded by one `connect_timeout`
-however many nodes are down. It raises only if none can be reached, or at once
-with `AuthenticationError` if a node refuses the credentials. Nodes that are
-down at startup, or later, are retried with the recovery backoff.
-`open?` is true while any node is; `close` closes them all. `open_channel`,
-`with_channel`, `queue_exists?` and `exchange_exists?` use the least loaded
-node; `update_secret` stores the new secret on every node first and then updates each
-one that is up, so a node that refuses it cannot leave the nodes after it on
-the old credential; failures are raised together as `ClusterError`.
-The `on_*` callbacks fire for every node with that node's `Session`, `on_event`
-sees every node's events (each carries `host` and `port`), `topology` is a
-read-only view over every node's registry, and `host` and `port` are the first
-address. `sessions`, `on_node_down` and `on_node_up` are the additions.
-
-## Command line
-
-Installing the gem puts an `async-rabbitmq` command on your path, written on
-this API, for the things you would otherwise open a console for.
-
-```bash
-export RABBITMQ_URL=amqp://guest:guest@localhost:5672   # or pass --url
-
-async-rabbitmq publish orders '{"id":1}' --count 10 --persistent
-async-rabbitmq publish orders --file payload.json
-echo '{"id":2}' | async-rabbitmq publish orders
-async-rabbitmq publish events.audit --exchange events   # queue name becomes the routing key
-
-async-rabbitmq inspect orders          # orders: 12 messages, 2 consumers
-async-rabbitmq consume orders --count 5
-async-rabbitmq consume orders --peek   # print without acknowledging: nothing is removed
-async-rabbitmq purge orders
-```
-
-`publish` uses confirms and mandatory routing, so it exits non-zero and says so
-when the broker nacks a message or sends it back unroutable. `consume`
-acknowledges what it prints, stops after `--count` or `--timeout` seconds of
-quiet, and leaves anything beyond the count on the queue. `--quiet` prints the
-messages and nothing else, for piping. Options go after the command.
-
-## Performance and integrity harness
-
-`examples/` holds a sender and a receiver that load the broker and check what
-comes out the other end. They are meant for the failure modes a throughput
-number hides: a message lost, doubled or delivered out of sequence, a body
-handed over with another message's header, a delivery on the wrong queue, a
-reply given to the wrong caller.
-
-```bash
-ruby -Ilib examples/perf_consumer.rb  --streams 4                     # start first
-ruby -Ilib examples/perf_publisher.rb --streams 4 --messages 50000
-```
-
-Every message is deterministic in `(run, stream, seq, size)` and states its
-identity twice, in the AMQP properties and inside the body, so the receiver can
-rebuild the bytes it should have been given and compare. One queue per
-publisher stream, one consumer, one handler: that is where AMQP promises order,
-so out-of-sequence delivery there is a real fault, and the report says so.
-`--consumers` or `--handlers` above 1 makes deliveries concurrent and the
-report downgrades ordering to an observation.
-
-The sender publishes from several fibers over **one shared channel** by default
-(`--channels per-stream` for one each), which is the case worth stressing: it
-checks that confirm delivery tags are unique and cover every publish, that
-nothing came back unroutable, and, with `--rpc-probe N`, that passive declares
-issued from other fibers while the channel is saturated each get their own
-reply. Useful switches: `--batch`, `--confirms none|simple|tracking`,
-`--persistent`, `--rate`, `--size`. The receiver takes `--mode get` to exercise
-the `basic_get` path instead of a consumer, plus `--prefetch` and
-`--[no-]manual-ack`. Both exit non-zero when anything failed, so they can gate
-a build.
-
-`examples/perf_fault_inject.rb` publishes one of each fault on purpose; run it
-against a receiver to see the checks fire rather than trusting them.
-
-Two things the numbers do not say. Latency is measured from a monotonic clock,
-so both programs must run on the same host, and it only means anything while
-the receiver keeps up (pace the sender with `--rate`). And with `--confirms
-none`, nothing proves the broker received anything: see *What a returned
-publish means here* above.
+- Channels. Each publisher and consumer has its own, out of sight.
+- `basic.get`. Use a consumer.
+- Transactions. Use confirms, which are always on.
+- A connection pool. One client serves many fibers.
+- Publishing without confirms.
+- A command-line tool. The `async-rabbitmq` command belongs to the legacy
+  engine.
+- Changing credentials on a live client.
 
 ## Development
 
-The suite runs against a real RabbitMQ (with Toxiproxy for network faults):
+The suite runs against a real RabbitMQ, with Toxiproxy for network faults:
 
 ```bash
 docker compose -f spec/docker-compose.yml up -d --wait
-bundle exec rspec
+bundle exec rspec             # both clients, about nine minutes
+bundle exec rspec spec/v1     # this client only
 ```
 
 `spec_helper` starts the containers itself if nothing listens on the
 configured port, and generates the TLS certificates with
 `spec/docker/gen-certs.sh`. Ports and hosts come from `.env`.
 
-## Releasing
+How the client is built is in
+[docs/designs/async-client.md](docs/designs/async-client.md).
 
-The version lives in `lib/async_rabbitmq/version.rb` and nowhere else. To cut a
-release: bump it, date the section in `CHANGELOG.md`, run the suite against a
-real broker, then
+### Releasing
+
+The version is in `lib/async/rabbitmq/version.rb` and
+`lib/async_rabbitmq/version.rb`, which must agree; a spec checks it. To cut a
+release: bump both, date the section in `CHANGELOG.md`, run the suite, then
 
 ```bash
-gem build async-rabbitmq.gemspec        # writes async-rabbitmq-<version>.gem
-gem install ./async-rabbitmq-<version>.gem   # optional: check it installs and the command runs
-gem push async-rabbitmq-<version>.gem   # asks for your RubyGems OTP
+gem build async-rabbitmq.gemspec
+gem push async-rabbitmq-<version>.gem
 git tag -a v<version> -m "v<version>" && git push origin v<version>
 ```
 
-The gemspec sets `rubygems_mfa_required`, so publishing and yanking need
-multi-factor authentication on the RubyGems account.
+The gemspec sets `rubygems_mfa_required`, so publishing needs multi-factor
+authentication on the RubyGems account.
 
 ## License
 

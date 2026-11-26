@@ -128,6 +128,21 @@ module AsyncRabbitMQ
           end
         end
 
+        # The same span as #basic_publish. It ends when the message has been
+        # written, not when the broker confirms it: the outcome is the caller's
+        # to wait on, and may never be waited on at all.
+        def publish_confirmed(payload, exchange: "", routing_key: "", **opts)
+          tracer = OpenTelemetry.tracer
+          return super unless tracer
+
+          tracer.in_span("#{Helpers.destination(exchange, routing_key)} publish",
+                         attributes: otel_attributes(exchange, routing_key), kind: :producer) do
+            headers = (opts[:headers] || {}).dup
+            ::OpenTelemetry.propagation.inject(headers)
+            super(payload, exchange: exchange, routing_key: routing_key, **opts.merge(headers: headers))
+          end
+        end
+
         def basic_publish_batch(payloads, exchange: "", routing_key: "", **opts)
           tracer = OpenTelemetry.tracer
           return super unless tracer

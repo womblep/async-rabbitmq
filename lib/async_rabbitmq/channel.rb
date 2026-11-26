@@ -2,6 +2,7 @@ require "async"
 require "async/condition"
 require "async/promise"
 require "async/semaphore"
+require "securerandom"
 require_relative "errors"
 
 module AsyncRabbitMQ
@@ -87,6 +88,17 @@ module AsyncRabbitMQ
     # same thing. See #queue_missing?.
     QUEUE_UNAVAILABLE = /process is stopped|is down or inaccessible/
 
+    # The header a mandatory #publish_confirmed stamps on its message. A
+    # basic.return carries no delivery tag, only the message itself, so the
+    # message has to say which publish it was. The value is a counter of this
+    # channel's that never restarts - unlike the confirm tag, which the broker
+    # renumbers on every reopen and which a replayed message would get wrong -
+    # behind a token drawn at random for this Channel object. The token is
+    # there because headers travel: a consumer that forwards a message with
+    # its headers intact would otherwise hand its own channel a return that
+    # names somebody else's publish, and a bare counter would match it.
+    PUBLISH_ID_HEADER = "x-async-rabbitmq-publish-id"
+
     # Pushed onto the work queue to retire one handler worker. Compared by
     # identity, so it can never collide with a delivery.
     WORKER_STOP = Object.new.freeze
@@ -94,6 +106,10 @@ module AsyncRabbitMQ
     include Instrumented
 
     attr_reader :channel_id, :pool_size
+
+    # Internal: for the objects built on a channel (Consumer, ManagedConsumer),
+    # which log and emit events as part of it.
+    attr_reader :logger, :notifier
 
     # How many times this channel has been opened on a connection: 0 until the
     # first reopen, then one more for each connection recovery or #reopen.
@@ -126,7 +142,12 @@ module AsyncRabbitMQ
       @each_waiters      = {}        # consumer_tag => Async::Condition, fibers blocked in #each
       @return_handler    = nil
       @delivery_tag      = 0
-      @pending_confirms  = {}        # delivery_tag => [frames, payload, PublishContext]
+      @pending_confirms  = {}        # delivery_tag => [frames, payload, PublishContext, PublishOutcome or nil]
+      @publish_seq       = 0         # source of PUBLISH_ID_HEADER values; never reset
+      @publish_token     = SecureRandom.hex(6) # see PUBLISH_ID_HEADER
+      @outcome_epoch     = 0         # counts fail_outcomes! calls; see #publish_confirmed
+      @outcomes_error    = nil       # what the last fail_outcomes! failed them with
+      @returnable        = {}        # publish id => PublishOutcome of a mandatory publish still unconfirmed
       @nacked_tags       = []        # tags the broker rejected since confirm_select (Bunny: nacked_set)
       @only_acks         = true      # false once a nack arrives; read and reset by wait_for_confirms
       @confirms_enabled  = false
@@ -274,6 +295,7 @@ module AsyncRabbitMQ
       # wait_for_confirms or parked on an outstanding slot has to hear that
       # from us, or it waits forever.
       fail_waiters!(NotOpenError.new("Channel #{@channel_id} was closed"))
+      fail_outcomes!(NotOpenError.new("Channel #{@channel_id} was closed"))
       # Closing the channel cancelled its consumers on the broker side; an
       # auto-delete queue that just lost its last one is gone with it.
       forget_consumers_in_topology
@@ -430,27 +452,57 @@ module AsyncRabbitMQ
     # plus a raw properties: hash. Returns the confirm delivery tag when the
     # channel is in confirm mode, nil otherwise.
     def basic_publish(payload, exchange: "", routing_key: "", **opts)
-      bytes   = encode_publish(payload, exchange: exchange, routing_key: routing_key, **opts)
-      context = @confirms_enabled ? publish_context(exchange, routing_key, opts) : nil
-      # One publish's frames must reach the wire contiguously and confirm tags
-      # must follow wire order, so the write and the tag assignment happen
-      # under one semaphore (write_frame can yield on a full queue or the
-      # connection.blocked gate).
-      tag = @publish_sem.acquire do
-        assert_open!
-        wait_for_outstanding_slot(1)
-        @frame_io.write_frame(bytes, publish: true)
-        reserve_confirm_tag(bytes, payload, context) if @confirms_enabled
-      end
-      instrument("message.published") do
-        { channel: @channel_id, exchange: exchange, routing_key: routing_key, count: 1,
-          bytes: bytes.bytesize, delivery_tag: tag }
-      end
-      tag
+      publish_message(payload, exchange, routing_key, opts)
     end
 
     # Duck-typed #write for stream composability.
     alias write basic_publish
+
+    # Publish one message and return a PublishOutcome for it: +outcome.wait+
+    # returns :acked once the broker has taken the message, and raises
+    # MessageNacked if it refused it or MessageReturned if it was published
+    # +mandatory: true+ and could not be routed. Takes the options
+    # #basic_publish does. The channel must be in confirm mode.
+    #
+    # Unlike #wait_for_confirms, which answers for the whole channel, an
+    # outcome answers for its own message, so fibers sharing a channel each
+    # learn the fate of what they published and nothing else. A returned
+    # message is reported through its outcome and not to #on_return.
+    #
+    # A mandatory message carries one extra header, PUBLISH_ID_HEADER, which
+    # consumers will see.
+    def publish_confirmed(payload, exchange: "", routing_key: "", **opts)
+      unless @confirms_enabled
+        raise Error, "publish_confirmed needs publisher confirms: call confirm_select on channel #{@channel_id} first"
+      end
+
+      publish_id = nil
+      if opts[:mandatory]
+        publish_id = "#{@publish_token}.#{@publish_seq += 1}"
+        opts = with_publish_id(opts, publish_id)
+      end
+      epoch = @outcome_epoch
+      outcome = PublishOutcome.new(channel_id: @channel_id, exchange: exchange, routing_key: routing_key,
+                                   publish_id: publish_id)
+      @returnable[publish_id] = outcome if publish_id
+      begin
+        publish_message(payload, exchange, routing_key, opts, outcome)
+      rescue Exception # rubocop:disable Lint/RescueException
+        # Never written, or written without a confirm tag: nothing will ever
+        # resolve this outcome, so it must not stay registered.
+        @returnable.delete(publish_id) if publish_id && outcome.delivery_tag.nil?
+        raise
+      end
+      # The write can park, on a full write queue or behind connection.blocked,
+      # and the channel can end while it does. The teardown that fails pending
+      # outcomes ran before this one was registered, and nothing else will ever
+      # answer it, so it is failed here with the same error.
+      unless epoch == @outcome_epoch
+        @returnable.delete(publish_id) if publish_id
+        outcome.fail!(@outcomes_error)
+      end
+      outcome
+    end
 
     # Publish many messages with one write. All payloads share +opts+ (see
     # basic_publish). The frames are encoded into a single buffer and handed
@@ -578,6 +630,33 @@ module AsyncRabbitMQ
       wake_each_waiters(consumer_tag)
     end
 
+    # True while +consumer_tag+ names a consumer registered on this channel.
+    def consumer?(consumer_tag)
+      @consumers.key?(consumer_tag)
+    end
+
+    # Internal, for Consumer: +watcher.signal+ is called once when the consumer
+    # is gone for good - cancelled by either side, or its channel closed - and
+    # not when a connection loss is recovered from. The same notice a fiber
+    # blocked in #each gets, for a caller that is waiting on something else.
+    def watch_consumer(consumer_tag, watcher)
+      @each_waiters[consumer_tag] = watcher
+    end
+
+    def unwatch_consumer(consumer_tag)
+      @each_waiters.delete(consumer_tag)
+    end
+
+    # Internal, for Consumer: drop a consumer from this channel's books
+    # without a basic.cancel, for a channel that is closed and so has nothing
+    # to cancel on. It will not be restored by reopen(recover_consumers: true)
+    # or by a connection recovery.
+    def forget_consumer(consumer_tag)
+      @consumers.delete(consumer_tag)
+      topology&.delete_consumer(consumer_tag)
+      nil
+    end
+
     # Ask the broker to redeliver all unacknowledged messages on this channel.
     # RabbitMQ only supports requeue: true; requeue: false raises a channel error.
     def basic_recover(requeue: true)
@@ -602,6 +681,9 @@ module AsyncRabbitMQ
       end
 
       rpc(AMQ::Protocol::Confirm::Select.encode(@channel_id, false), AMQ::Protocol::Confirm::SelectOk)
+      # The tables below are about to be emptied; an outcome left in them would
+      # never be resolved by anything.
+      fail_outcomes!(Error.new("confirm_select was called again on channel #{@channel_id} before this publish was confirmed"))
       @confirms_enabled  = true
       @tracking          = tracking
       @outstanding_limit = tracking ? (outstanding_limit || DEFAULT_OUTSTANDING_LIMIT) : nil
@@ -861,6 +943,7 @@ module AsyncRabbitMQ
     def mark_closed!(error)
       @state = :closed
       interrupt_wait!(error)
+      fail_outcomes!(error)
       resume_parked!(error)
       wake_each_waiters
     end
@@ -908,6 +991,27 @@ module AsyncRabbitMQ
       promise&.resolve(error)
     end
     private :fail_waiters!
+
+    # Reject every pending PublishOutcome with +error+. Only for the paths
+    # that end the channel - a user close, a broker close, the connection gone
+    # for good. A connection loss with recovery is deliberately not one of
+    # them: the messages are published again and their outcomes resolve then.
+    #
+    # The entries themselves stay in @pending_confirms, as they always have,
+    # so that #reopen can still replay them; they just no longer carry an
+    # outcome, which has now given its answer.
+    def fail_outcomes!(error)
+      error ||= NotOpenError.new("Channel #{@channel_id} is not open")
+      @outcome_epoch += 1
+      @outcomes_error = error
+      @pending_confirms.each_value do |entry|
+        outcome = entry[3] or next
+        entry[3] = nil
+        outcome.fail!(error)
+      end
+      @returnable.clear
+    end
+    private :fail_outcomes!
 
     # -------------------------------------------------------------------------
     # Internal: called by Session after reconnect
@@ -1411,7 +1515,16 @@ module AsyncRabbitMQ
           handle_confirm_ack(method)
         when AMQ::Protocol::Basic::Nack
           handle_confirm_nack(method)
-        when AMQ::Protocol::Basic::Deliver, AMQ::Protocol::Basic::Return
+        when AMQ::Protocol::Basic::Return
+          # Like the confirms above, a return for a message published before
+          # the close is still the truth about that message. Its ack follows
+          # it; dropped here, the outcome would read :acked for a message the
+          # broker threw away.
+          _, header, = @queue.pop
+          unless resolve_returned(method, header)
+            @logger.debug(self, "Channel #{@channel_id}: discarded #{method.class} while resynchronising")
+          end
+        when AMQ::Protocol::Basic::Deliver
           # Content frames follow on this channel; take them off with the
           # method so the stream does not skew.
           @queue.pop
@@ -1456,7 +1569,10 @@ module AsyncRabbitMQ
           { channel: @channel_id, exchange: method.exchange, routing_key: method.routing_key,
             code: method.reply_code, text: method.reply_text, bytes: body.to_s.bytesize }
         end
-        if @return_handler
+        if resolve_returned(method, header)
+          # The publisher holds an outcome for exactly this message: that is
+          # where the return is reported, not the channel-wide handler.
+        elsif @return_handler
           Async { @return_handler.call(method, header, body) }
         else
           @logger.warn(self, "Unhandled basic.return on channel #{@channel_id} — register on_return to handle")
@@ -1502,15 +1618,80 @@ module AsyncRabbitMQ
     def handle_confirm_ack(method)
       @mutex.acquire do
         if method.multiple
-          @pending_confirms.reject! { |tag, _| tag <= method.delivery_tag }
+          @pending_confirms.reject! do |tag, entry|
+            next false unless tag <= method.delivery_tag
+
+            resolve_outcome(entry, &:ack!) if entry[3]
+            true
+          end
         else
-          @pending_confirms.delete(method.delivery_tag)
+          # Checked here rather than inside the call: this runs for every
+          # confirm, and nearly every entry has no outcome to resolve.
+          entry = @pending_confirms.delete(method.delivery_tag)
+          resolve_outcome(entry, &:ack!) if entry && entry[3]
         end
         @confirm_condition&.signal
         release_outstanding_slots
       end
       instrument("message.confirmed") do
         { channel: @channel_id, delivery_tag: method.delivery_tag, multiple: method.multiple, acked: true }
+      end
+    end
+
+    # Hand a confirmed entry's PublishOutcome, if it has one, to the block.
+    # Most entries have none: only #publish_confirmed creates them.
+    def resolve_outcome(entry)
+      outcome = entry && entry[3]
+      return unless outcome
+
+      # The broker sends a return before the ack for the same message, so by
+      # the time any confirm arrives the return can no longer be on its way.
+      @returnable.delete(outcome.publish_id) if outcome.publish_id
+      yield outcome
+    end
+
+    # Report a basic.return to the PublishOutcome of the publish it answers.
+    # False when the message was not published by #publish_confirmed.
+    def resolve_returned(method, header)
+      outcome = returned_outcome(header) or return false
+
+      outcome.return!(MessageReturned.new(reply_code: method.reply_code, reply_text: method.reply_text,
+                                          exchange: method.exchange, routing_key: method.routing_key,
+                                          channel_id: @channel_id))
+      # The broker has given its final answer for this message, so it must not
+      # be published again if the connection drops before the ack that follows
+      # the return gets here: the publisher has been told it was returned, and
+      # a replay could deliver it behind their back. The ack, when it comes,
+      # finds nothing under its tag, which is harmless.
+      if (tag = outcome.delivery_tag) && @pending_confirms[tag]&.[](3).equal?(outcome)
+        @pending_confirms.delete(tag)
+        @confirm_condition&.signal
+        release_outstanding_slots
+      end
+      true
+    end
+
+    # The outcome of the mandatory publish this returned message came from, or
+    # nil when it was published some other way.
+    def returned_outcome(header)
+      return nil if @returnable.empty?
+      return nil unless header.respond_to?(:properties) && header.properties
+
+      id = header.properties[:headers]&.[](PUBLISH_ID_HEADER)
+      id && @returnable.delete(id)
+    end
+
+    # +opts+ with PUBLISH_ID_HEADER added, without touching the caller's
+    # hashes. A raw properties: hash that sets :headers replaces the headers:
+    # option wholesale (see #encode_publish), so the id has to go wherever the
+    # headers that will actually be sent are.
+    def with_publish_id(opts, publish_id)
+      properties = opts[:properties]
+      if properties.is_a?(Hash) && properties.key?(:headers)
+        headers = (properties[:headers] || {}).merge(PUBLISH_ID_HEADER => publish_id)
+        opts.merge(properties: properties.merge(headers: headers))
+      else
+        opts.merge(headers: (opts[:headers] || {}).merge(PUBLISH_ID_HEADER => publish_id))
       end
     end
 
@@ -1523,7 +1704,11 @@ module AsyncRabbitMQ
         else
           [method.delivery_tag]
         end
-        rejected.each { |tag| @pending_confirms.delete(tag) }
+        rejected.each do |tag|
+          resolve_outcome(@pending_confirms.delete(tag)) do |outcome|
+            outcome.nack!(MessageNacked.new(nacked_tags: [tag], channel_id: @channel_id))
+          end
+        end
         @nacked_tags.concat(rejected)
         @nacked_this_cycle.concat(rejected)
         @only_acks = false
@@ -1558,6 +1743,7 @@ module AsyncRabbitMQ
       # here was a permanent hang for a confirm wait with no timeout (the
       # default), and a 15s stall holding the publish semaphore for the slot.
       fail_waiters!(error)
+      fail_outcomes!(error)
       # Stop dispatch_loop
       @queue&.push(nil)
       stop_workers(discard: true)
@@ -2026,6 +2212,29 @@ module AsyncRabbitMQ
       @session.reopen_channel(self)
     end
 
+    # The body of #basic_publish and #publish_confirmed. +outcome+ is the
+    # PublishOutcome to resolve when this message is confirmed, if the caller
+    # wants one. Returns the confirm delivery tag, or nil outside confirm mode.
+    def publish_message(payload, exchange, routing_key, opts, outcome = nil)
+      bytes   = encode_publish(payload, exchange: exchange, routing_key: routing_key, **opts)
+      context = @confirms_enabled ? publish_context(exchange, routing_key, opts) : nil
+      # One publish's frames must reach the wire contiguously and confirm tags
+      # must follow wire order, so the write and the tag assignment happen
+      # under one semaphore (write_frame can yield on a full queue or the
+      # connection.blocked gate).
+      tag = @publish_sem.acquire do
+        assert_open!
+        wait_for_outstanding_slot(1)
+        @frame_io.write_frame(bytes, publish: true)
+        reserve_confirm_tag(bytes, payload, context, outcome) if @confirms_enabled
+      end
+      instrument("message.published") do
+        { channel: @channel_id, exchange: exchange, routing_key: routing_key, count: 1,
+          bytes: bytes.bytesize, delivery_tag: tag }
+      end
+      tag
+    end
+
     # Encode one basic.publish (method + header + body frames) into a single
     # byte string, so a message always hits the write queue in one piece.
     def encode_publish(payload, exchange:, routing_key:, mandatory: false, persistent: true,
@@ -2058,7 +2267,7 @@ module AsyncRabbitMQ
 
     # Under confirms: take the next delivery tag and keep the encoded message
     # until the broker acks it, so it can be re-published after a reconnect.
-    def reserve_confirm_tag(bytes, payload = nil, context = nil)
+    def reserve_confirm_tag(bytes, payload = nil, context = nil, outcome = nil)
       @delivery_tag += 1
       # Snapshot the payload: the caller may reuse or mutate its string after
       # publishing (publish_context copies headers for the same reason), and
@@ -2067,7 +2276,8 @@ module AsyncRabbitMQ
       # a node failure — must see the bytes as they were sent, not as the
       # buffer looks now. Frozen strings skip the copy.
       payload = payload.dup if payload.is_a?(String) && !payload.frozen?
-      @pending_confirms[@delivery_tag] = [bytes, payload, context]
+      @pending_confirms[@delivery_tag] = [bytes, payload, context, outcome]
+      outcome.delivery_tag = @delivery_tag if outcome
       # The encoded frames carry this channel's id, so they can only be replayed
       # on this channel. Keep the payload and where it was going alongside, so a
       # caller handed these on a node failure can republish them somewhere else
@@ -2123,6 +2333,7 @@ module AsyncRabbitMQ
       @pending_confirms  = {}
       @delivery_tag      = 0
       @confirm_condition ||= Async::Condition.new   # keep one an early waiter created
+      sent = 0
       pending.each do |entry|
         # Re-encode from the kept payload and context instead of replaying the
         # bytes recorded at publish time: the context may have been rewritten
@@ -2137,9 +2348,22 @@ module AsyncRabbitMQ
         end
         @frame_io.write_frame(bytes, publish: true)
         @delivery_tag += 1
-        @pending_confirms[@delivery_tag] = [bytes, entry[1], entry[2]]
+        @pending_confirms[@delivery_tag] = [bytes, entry[1], entry[2], entry[3]]
+        entry[3].delivery_tag = @delivery_tag if entry[3]
+        sent += 1
       end
       @logger.info(self, "Channel #{@channel_id}: re-published #{pending.size} unconfirmed message(s) after recovery") unless pending.empty?
+    ensure
+      # The replay was cut short: the write raised (the connection went again
+      # while it was parked behind connection.blocked) or this fiber was
+      # stopped. What was not sent goes back in the table, after what was, so
+      # that the next recovery replays it and a teardown can still find its
+      # outcomes. Left out, those messages would be lost without a word and
+      # their outcomes would never be answered. The tags are placeholders; the
+      # next replay renumbers everything.
+      if pending && sent && sent < pending.size
+        pending.drop(sent).each { |entry| @pending_confirms[@delivery_tag += 1] = entry }
+      end
     end
 
     # Park until the current episode resolves. The promise is a latch: a waiter
@@ -2244,7 +2468,10 @@ module AsyncRabbitMQ
         outcome = catch(:reregister) do
           @consumers.keys.each do |tag|
             next if dropped.key?(tag)
-            entry = @consumers[tag]
+            # Cancelled since the keys were listed: a basic_cancel that was
+            # parked for the recovery runs as soon as the channel is open,
+            # which is while this loop is still working through the others.
+            entry = @consumers[tag] or next
             begin
               reopen_for_reregister!(replay: replay) unless open?
               basic_consume(entry[:queue_name], consumer_tag: tag, manual_ack: entry[:manual_ack],
@@ -2360,10 +2587,17 @@ module AsyncRabbitMQ
     # false (or raises MessageNacked when tracking) and nacked_tags names
     # them — and reset the counter to match the broker's fresh numbering.
     def abandon_unconfirmed!
-      abandoned = @pending_confirms.keys
+      entries   = @pending_confirms
+      abandoned = entries.keys
       @pending_confirms = {}
       @delivery_tag     = 0
       return if abandoned.empty?
+
+      entries.each do |tag, entry|
+        resolve_outcome(entry) do |outcome|
+          outcome.nack!(MessageNacked.new(nacked_tags: [tag], channel_id: @channel_id))
+        end
+      end
 
       @logger.warn(self, "Channel #{@channel_id}: #{abandoned.size} unconfirmed message(s) could not be re-published " \
                          "and are reported as nacked")

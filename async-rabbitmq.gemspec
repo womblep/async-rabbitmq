@@ -1,12 +1,12 @@
-require_relative "lib/async_rabbitmq/version"
+require_relative "lib/async/rabbitmq/version"
 
 Gem::Specification.new do |spec|
   spec.name          = "async-rabbitmq"
-  spec.version       = AsyncRabbitMQ::VERSION
+  spec.version       = Async::RabbitMQ::VERSION
   spec.authors       = ["Russell Penney"]
   spec.summary       = "Fiber-native Ruby AMQP 0-9-1 client built on the Async ecosystem"
   spec.description   = "A RabbitMQ client for the async fiber scheduler: no threads, " \
-                       "channels are duck-typed streams, connection and topology recovery are built in."
+                       "publishes that wait for the broker, consumers you pull from, reconnection built in."
   spec.homepage      = "https://github.com/womblep/async-rabbitmq"
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 3.4"
@@ -37,6 +37,8 @@ Gem::Specification.new do |spec|
   # Connection establishment (TCP, TLS, address resolution) - the same layer
   # async-http and the rest of the socketry stack build on.
   spec.add_dependency "io-endpoint",  "~> 0.19"
+  # Buffered reads and writes over the socket, for the 1.0 connection layer.
+  spec.add_dependency "io-stream",    "~> 0.11"
 
   spec.add_development_dependency "rspec",      "~> 3.13"
   spec.add_development_dependency "simplecov",  "~> 0.22"
@@ -44,4 +46,6 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "toxiproxy",  "~> 2.0"
   spec.add_development_dependency "opentelemetry-api", "~> 1.1"
   spec.add_development_dependency "opentelemetry-sdk", "~> 1.1"
+  spec.add_development_dependency "opentelemetry-metrics-api", "~> 0.6"
+  spec.add_development_dependency "opentelemetry-metrics-sdk", "~> 0.15"
 end

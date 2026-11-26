@@ -1,6 +1,9 @@
-# async-rabbitmq — architecture
+# async-rabbitmq — architecture of the legacy engine
 
-How the client is built. It describes what exists, not what was planned. `README.md` is the usage documentation; this document is
+This describes `AsyncRabbitMQ` (`require "async_rabbitmq"`), the original client. For the client that
+replaces it see [async-client.md](async-client.md).
+
+How the client is built. It describes what exists, not what was planned. [legacy-engine.md](../legacy-engine.md) is the usage documentation; this document is
 for people changing the internals.
 
 ## Purpose
@@ -211,6 +214,98 @@ are unconfirmed, and `wait_for_confirms` raises `MessageNacked` instead of
 returning false. Unconfirmed messages are held as encoded bytes, which is what
 makes the re-publish on recovery possible.
 
+`publish_confirmed` returns a `PublishOutcome`, an `Async::Promise` for one
+message. It rides in the fourth slot of that message's pending-confirm entry,
+so the ack, the nack, the replay and the abandoned replay each resolve it at
+the point where they already handle the entry, and a publish that asked for no
+outcome pays for one `nil`. An outcome survives a recovery, because its entry
+does; it is rejected only where the channel ends (user close, broker close,
+connection gone for good), and the entry is kept even then so `Channel#reopen`
+can still replay it.
+
+A `basic.return` carries the message but no delivery tag, and the confirm tag
+is renumbered on every reopen anyway, so a mandatory `publish_confirmed` stamps
+the message with a per-channel counter that never restarts, behind a random
+token of the channel's own (`x-async-rabbitmq-publish-id`), and the return is
+matched on that. The token is there because headers travel: a consumer that
+forwards a message with its headers intact would otherwise hand its own channel
+a return naming somebody else's publish. The .NET client does the same with
+`x-dotnet-pub-seq-no`. The broker sends a return before the ack for the same
+message, so the first resolution wins and the ack that follows cannot overturn
+it. A return is the broker's final answer, so the message leaves the
+unconfirmed table there and then: a reconnect that loses the ack does not
+publish it again behind the publisher's back. Returns are honoured even while
+the channel is resynchronising after an RPC timeout, for the same reason
+confirms are.
+
+An outcome is answered on every path. A publish still parked in its write when
+the channel ends has no confirm tag for the teardown to find, so
+`publish_confirmed` checks on the way out whether a teardown ran and fails the
+outcome itself. A replay cut short (the connection went again while it was
+parked behind `connection.blocked`) puts what it did not send back in the
+table, so the next recovery sends it and a teardown can still fail it.
+
+## Messages
+
+`Message` is the delivery triple plus its channel. It keeps its own settlement
+state rather than asking the channel, which is what makes a second `ack` a
+no-op instead of a 406; the mark is taken before the frame is written, because
+the write can yield and a second fiber must find the message already claimed.
+Staleness is not its concern: it hands its `VersionedDeliveryTag` to the
+channel, which drops the frame and returns false, and the message records
+`:stale`.
+
+## Native consumers
+
+`Consumer` and `ManagedConsumer` are built on `basic_consume`, not beside it.
+The block a `Consumer` registers does one thing, push a `Message` onto an
+`Async::Queue`, and `each` pops from that queue in the caller's fiber. So the
+dispatch loop still never blocks, recovery re-registers the consumer like any
+other, and the buffer is bounded by the broker: the consumer is always
+manual-ack, so at most `prefetch` messages can be outstanding.
+
+`each` ends through one of three doors: `stop`, the channel's notice that the
+consumer is gone for good (the notice a fiber in `Channel#each` gets), or the
+block raising. All three run the same exit: mark the subscription closed, so a
+delivery still on its way to the block is nacked back instead of buffered;
+cancel; nack back what is in the buffer. The cancel is attempted whenever the
+channel is not closed, a channel waiting out a recovery included. Skipping it
+there would leave the consumer on the channel's books, recovery would register
+it again with nobody reading, and every message would be requeued and
+redelivered without end.
+
+A message buffered before a reconnect is stale: the broker requeued it. It is
+dropped at the pop and not yielded, since it could not be settled.
+
+`ManagedConsumer` adds a pool of handler fibers, grown on demand up to
+`concurrency` and reused. The fiber in `run` does nothing but move messages
+from the consumer to the pool's own queue, and the pool pulls from that. The
+queue needs no bound: every message in it is one of the at most `prefetch` the
+broker has outstanding. Two simpler designs were measured against `subscribe`
+(about 14.7k msg/s for 512-byte messages on the test machine) and dropped:
+
+- A fiber per message: 8.1k msg/s. Starting a fiber costs more than handling a
+  small message.
+- A pool handed one message at a time, waiting for a free slot before taking
+  the next: 7.6k msg/s at `concurrency: 1`. Every message became a fiber
+  switch each way, and every ack went out in a write of its own instead of
+  batching behind its neighbours.
+
+The pool as built runs level with `subscribe`, as does a bare `Consumer`.
+`Async::Barrier` was the obvious tool for tracking handlers and is wrong here:
+a barrier keeps every task it started until it is waited on, which for a
+consumer is the life of the process.
+
+On the way out the pool is drained: messages waiting for a handler go back on
+the queue, a worker that takes one just as the drain begins puts it back
+rather than start it, and running handlers are waited for.
+
+Stopping a task does not stop its children until the task has finished, so the
+drain in `run`'s `ensure` works the same for `stop` and for a task stop: wait
+up to `drain_timeout` for the handlers, then stop the rest. A stopped handler
+requeues its own message on the way out, which relies on `Message` lifting its
+settlement mark when a settle is interrupted.
+
 ## Errors
 
 Soft errors close the channel and leave the connection up. They raise
@@ -285,7 +380,7 @@ Timing works the same way: `instrument_clock` returns nil when nobody is
 listening, so the clock reads are skipped too. A subscriber that raises is
 caught and logged, because instrumentation must not be able to take a
 connection down. Event names are treated as API and listed in `Notifier::EVENTS`;
-payload keys are documented in the README.
+payload keys are documented in docs/legacy-engine.md.
 
 Tracing is separate, in `lib/async_rabbitmq/telemetry/open_telemetry.rb`, and is
 neither loaded nor depended on by default. It cannot be built on the events
@@ -332,7 +427,7 @@ over keeps its dashboards.
 
 ## Tests
 
-455 examples, almost all integration tests against a real broker
+622 examples, almost all integration tests against a real broker
 (`rabbitmq:4-management-alpine` plus Toxiproxy, started by `spec/docker-compose.yml`
 or by `spec_helper` if nothing is listening). Each test gets its own vhost, so
 tests cannot contaminate each other. CI runs Ruby 3.4 and 4.0 over
