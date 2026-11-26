@@ -10,6 +10,7 @@ require "socket"
 
 require_relative "version"
 require_relative "error"
+require_relative "logging"
 require_relative "sasl"
 require_relative "channel"
 require_relative "channel_id_allocator"
@@ -56,11 +57,11 @@ module Async
       # endpoint's +timeout+. The reader and heartbeat tasks are children of
       # +parent+ and transient: they never keep it alive, and they end when
       # the connection closes.
-      def self.open(endpoint, parent: Async::Task.current)
+      def self.open(endpoint, parent: Async::Task.current, logger: ::Console)
         connection = nil
         begin
           Async::Task.current.with_timeout(endpoint.timeout) do
-            connection = new(endpoint, endpoint.connect)
+            connection = new(endpoint, endpoint.connect, logger: logger)
             connection.handshake
           end
         rescue Async::TimeoutError
@@ -92,8 +93,9 @@ module Async
       # Why the connection closed; nil while it is open or when it was closed here.
       attr :error
 
-      def initialize(endpoint, socket)
+      def initialize(endpoint, socket, logger: ::Console)
         @endpoint  = endpoint
+        @logger    = Logging.resolve(logger)
         @framer    = Protocol::Framer.new(socket)
         @channels  = {}
         @ids       = nil
@@ -103,6 +105,7 @@ module Async
         @close_ok  = nil
         @blocked   = nil # the broker's reason while it has publishing blocked
         @unblocked = nil # Promise for one blocked episode
+        @blocked_change = nil
         @reader    = nil
         @heartbeater = nil
         @flusher   = nil
@@ -110,6 +113,9 @@ module Async
         @flush_pending = false
         @last_read = now
       end
+
+      # Where the connection, and the channels on it, log. See Logging.
+      attr :logger
 
       def open?
         @state == :open
@@ -137,6 +143,14 @@ module Async
 
       def blocked?
         !@blocked.nil?
+      end
+
+      # Have the block called with the reason when the broker blocks
+      # publishing, and with nil when it unblocks. It runs on the reader
+      # fiber, so it must not wait. If it returns true it has reported the
+      # change itself, and the connection's own line is logged at debug.
+      def on_blocked_change(&block)
+        @blocked_change = block
       end
 
       # Block until the connection has closed. Returns why: the error, or nil
@@ -337,7 +351,7 @@ module Async
       rescue Error => error
         failure = error
       rescue StandardError => error
-        Console.error(self, "Reader failed", exception: error)
+        @logger.error(self, "Reader failed", exception: error)
         failure = ConnectionError.new("Connection to #{@endpoint} failed: #{error.class}: #{error.message}")
       ensure
         # However the reader ends, the connection is over: nothing else would
@@ -378,11 +392,13 @@ module Async
           @close_ok&.resolve(true)
         when AMQ::Protocol::Connection::Blocked
           @blocked = method.reason.to_s
-          Console.warn(self, "Broker has blocked publishing", endpoint: @endpoint.to_s, reason: @blocked)
+          level = @blocked_change&.call(@blocked) ? :debug : :warn
+          @logger.public_send(level, self, "Broker has blocked publishing", endpoint: @endpoint.to_s, reason: @blocked)
         when AMQ::Protocol::Connection::Unblocked
           @blocked = nil
           release_blocked(nil)
-          Console.info(self, "Broker has unblocked publishing", endpoint: @endpoint.to_s)
+          level = @blocked_change&.call(nil) ? :debug : :info
+          @logger.public_send(level, self, "Broker has unblocked publishing", endpoint: @endpoint.to_s)
         end
       end
 

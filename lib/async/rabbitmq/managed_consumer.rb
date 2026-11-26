@@ -60,8 +60,8 @@ module Async
     # put back on the queue. So a stop can take up to +drain_timeout+ to
     # return, and never loses a message.
     #
-    # A handler failure is logged, and passed to the #on_error block if there
-    # is one.
+    # A handler failure is logged as an error, unless there is an #on_error
+    # block: then it is passed to the block, and logged at debug only.
     class ManagedConsumer
       EXCEPTION_SETTLEMENTS = %i[ack nack reject].freeze
 
@@ -98,6 +98,7 @@ module Async
       # The client the consumer is attached to. In a Cluster it can change.
       def client = @consumer.client
       def on_connection_loss = @consumer.on_connection_loss
+      def on_cancel = @consumer.on_cancel
 
       # The underlying Consumer's: see there.
       def queue_name = @consumer.queue_name
@@ -116,10 +117,12 @@ module Async
         self
       end
 
-      def on_attach(&block)
-        consumer = self
-        @consumer.on_attach { block.call(consumer) }
-        self
+      # The underlying Consumer's, called with this consumer: see there.
+      %i[on_attach on_cancelled on_resubscribed].each do |name|
+        define_method(name) do |&block|
+          @consumer.public_send(name, &block)
+          self
+        end
       end
 
       def ack_on_success?
@@ -252,12 +255,14 @@ module Async
       end
 
       def failed(error, message)
-        Console.error(self, "Handler for #{queue_name} raised; message will be #{disposition_text}",
-                      exception: error)
+        # With an on_error block the failure is the application's to report.
+        client.logger.public_send(@on_error ? :debug : :error, self,
+                                  "Handler for #{queue_name} raised; message will be #{disposition_text}",
+                                  exception: error)
         begin
           @on_error&.call(error, message)
         rescue StandardError => hook_error
-          Console.error(self, "on_error for #{queue_name} raised", exception: hook_error)
+          client.logger.error(self, "on_error for #{queue_name} raised", exception: hook_error)
         end
         settle(message, @exception)
       end
@@ -279,13 +284,13 @@ module Async
         when :reject then message.reject(requeue: @requeue)
         end
       rescue StandardError => error
-        Console.debug(self, "Could not #{how} a message from #{queue_name}", exception: error)
+        client.logger.debug(self, "Could not #{how} a message from #{queue_name}", exception: error)
       end
 
       def requeue(message)
         message.nack(requeue: true) unless message.settled?
       rescue StandardError => error
-        Console.debug(self, "Could not requeue a message from #{queue_name}", exception: error)
+        client.logger.debug(self, "Could not requeue a message from #{queue_name}", exception: error)
       end
 
       # By now the consumer is cancelled and what it had not handed over is
@@ -304,7 +309,7 @@ module Async
             @idle.wait until @busy.zero?
           end
         rescue Async::TimeoutError
-          Console.warn(self, "#{@busy} handler(s) for #{queue_name} still running after #{@drain_timeout}s; " \
+          client.logger.warn(self, "#{@busy} handler(s) for #{queue_name} still running after #{@drain_timeout}s; " \
                              "stopping them and requeueing their messages")
         end
       ensure

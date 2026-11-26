@@ -326,7 +326,7 @@ and is raised from `each`.
 | Returns | When |
 |---|---|
 | `:stopped` | `consumer.stop` was called |
-| `:cancelled` | The broker cancelled the consumer, as when the queue is deleted |
+| `:cancelled` | The broker cancelled the consumer, as when the queue is deleted, or the queue was gone when a lost connection came back |
 | `:closed` | The consumer or its client was closed |
 | `:connection_lost` | The connection was lost and the consumer was made with `on_connection_loss: :end` |
 
@@ -338,9 +338,48 @@ block that is running; `each` returns when the block finishes.
 |---|---|---|
 | `prefetch` | 100 | Unsettled messages the broker sends at once; `nil` for no limit |
 | `on_connection_loss` | `:wait` | `:wait` or `:end`; in a cluster also `:move` |
+| `on_cancel` | `:end` | `:end` or `:resubscribe`; see below |
 | `exclusive` | `true` with no queue named | The queue is the consumer's own |
 | `queue_arguments` | `{}` | Arguments for the consumer's own queue |
 | `arguments` | `{}` | Arguments for `basic.consume` |
+
+#### A consumer the broker cancels
+
+The broker cancels a consumer when its queue is deleted. It can also cancel
+one and leave the queue where it was, as when a quorum queue loses its
+leader. By default either ends `each` with `:cancelled`.
+
+```ruby
+consumer = client.consumer("orders", on_cancel: :resubscribe)
+```
+
+With `on_cancel: :resubscribe` the consumer asks the broker whether the
+queue is still there. If it is, the consumer consumes from it again and
+`each` carries on. If the broker refuses, it tries again at intervals that
+grow from one second to thirty, for as long as the queue exists. `each`
+returns `:cancelled` only when the queue is gone.
+
+While the broker goes on refusing, the consumer says so once, as a warning,
+and logs the attempts after that at debug: a long outage is one warning,
+not one every thirty seconds.
+
+To hear of it yourself:
+
+```ruby
+consumer.on_cancelled    { |consumer| events.record(:amqp_consumer_cancelled, consumer.queue_name) }
+consumer.on_resubscribed { |attempts, consumer| events.record(:amqp_consumer_recovered, consumer.queue_name, attempts) }
+```
+
+`on_cancelled` is called each time the broker cancels the consumer, whatever
+`on_cancel` says, and `on_resubscribed` each time it is consuming again,
+with the number of attempts that took and then the consumer.
+Both run in the fiber that called `each` or `run`. With either set, the
+consumer's own lines about the cancel are logged at debug only.
+
+Nothing is declared along the way, so a queue somebody deleted is not put
+back. That holds for a lost connection only if the client is not going to
+declare the queue itself: a queue made with `client.queue` is declared again
+on every reconnect unless you call `client.forget(queue)`.
 
 ### A message
 
@@ -388,7 +427,9 @@ still running after that are stopped and their messages requeued. A stop
 never loses a message.
 
 `consumer.on_error { |error, message| ... }` is called when a handler raises,
-before the message is settled.
+before the message is settled. Without it a handler failure is logged as an
+error. With it the failure is yours to report, and the client logs it at
+debug only.
 
 ### A queue of the consumer's own
 
@@ -446,6 +487,60 @@ in a row. Everything waiting on it then raises `ConnectionError`.
 
 When the broker blocks publishing (a memory or disk alarm), publishes wait
 until it unblocks.
+
+### Being told
+
+All of this is logged. An application that wants to count it, or report it
+somewhere of its own, can be told as well:
+
+```ruby
+client.on_connection_lost  { |error| events.record(:amqp_connection_lost, error) }
+client.on_reconnect_failed { |error, attempt| events.record(:amqp_connection_failed, error, attempt) }
+client.on_reconnected      { |attempts| events.record(:amqp_recovered, attempts) }
+client.on_blocked          { |reason| events.record(:amqp_blocked, reason) }
+client.on_unblocked        { events.record(:amqp_unblocked) }
+client.on_gave_up          { |error, attempts| events.record(:amqp_gave_up, error, attempts) }
+```
+
+| Hook | Called | With |
+|---|---|---|
+| `on_connection_lost` | Each time the connection is lost, before reconnecting | The error |
+| `on_reconnect_failed` | Each time an attempt to reconnect fails, the last before giving up included | The error, and how many attempts have failed in a row |
+| `on_reconnected` | Each time there is a connection again, with the topology declared on it. Not for the first connection | How many attempts it took |
+| `on_blocked` | When the broker blocks publishing | The broker's reason |
+| `on_unblocked` | When it lifts the block | |
+| `on_gave_up` | When `reconnect_attempts` failures in a row end the client | The last error, and how many attempts were made |
+
+Each hook can be given more than once, and every block is called. Every
+block is also passed the client as a last argument, which a `Cluster` uses:
+the same hooks on a cluster are set on each of its clients, and the last
+argument says which node it was.
+
+A block runs in the middle of the client's own work, so it should record
+what it was told and return. It must not wait on the client. A block that
+raises is logged and otherwise ignored.
+
+An event you have a hook for is yours to report. The client's own line about
+it drops to debug, so it does not appear beside yours, and what is logged
+as a warning or an error is your decision:
+
+| Without a hook, the client logs | At | Hook that takes it over |
+|---|---|---|
+| Connection lost; reconnecting | warn | `on_connection_lost` |
+| Reconnected | info | `on_reconnected` |
+| Broker has blocked publishing | warn | `on_blocked` |
+| Broker has unblocked publishing | info | `on_unblocked` |
+| Gave up reconnecting | error | `on_gave_up` |
+| A cancelled consumer cannot consume again yet | warn | `on_cancelled` or `on_resubscribed` on the consumer |
+| A cancelled consumer is consuming again | info | `on_resubscribed` on the consumer |
+| Handler raised | error | `on_error` on the `ManagedConsumer` |
+
+A failed attempt to reconnect is only ever logged at debug. What the client
+still logs as an error on its own account is a hook or handler callback of
+yours that raised, and a fault inside the client itself.
+
+To register hooks before the first connection, make the client with
+`Client.new`, add them, and call `connect`.
 
 ## A cluster
 
@@ -515,7 +610,44 @@ The client logs through [Console](https://github.com/socketry/console), like
 the rest of the async stack: a warning when a connection is lost, a line when
 it is back, an error when a handler raises. Set the level with
 `CONSOLE_LEVEL=debug`, or configure Console as you would for any async
-application. There is no `logger:` option.
+application.
+
+To send it somewhere else, give the client a `logger:`. It applies to the
+client and to every publisher and consumer built on it, and a `Cluster`
+passes it to each of its clients.
+
+```ruby
+client = Async::RabbitMQ::Client.open("amqp://localhost", logger: Rails.logger)
+```
+
+| `logger:` | What happens |
+|---|---|
+| `Console` (the default), or a `Console::Logger` | Forwarded as it is, with the object that logged and its fields |
+| A stdlib `Logger`, `Rails.logger`, or anything with `debug`, `info`, `warn` and `error` | Given one line: the message, the fields, then the exception |
+| `nil` | Nothing is logged |
+
+A line written to a plain logger looks like this:
+
+```
+Connection lost; reconnecting (endpoint=amqp://guest@localhost:5672/): Async::RabbitMQ::ConnectionError: Connection to amqp://guest@localhost:5672/ lost
+```
+
+Wherever it goes, `Async::RabbitMQ.log_level` decides first what the client
+logs at all. It is `:warn` unless you change it, so an application running
+its logger at info is not sent this client's info and debug lines:
+
+```ruby
+Async::RabbitMQ.log_level = :debug   # everything, to troubleshoot a connection
+Async::RabbitMQ.log_level = :info    # reconnections and the like as well
+Async::RabbitMQ.log_level = :off     # nothing, from any client
+```
+
+The environment variable `ASYNC_RABBITMQ_LOG_LEVEL` sets it at load. The
+logger's own level, or `CONSOLE_LEVEL`, still applies after it.
+
+Three debug lines are not tied to a client and always go to Console: a
+socket option that could not be set, and a span or metric that could not be
+recorded.
 
 ## OpenTelemetry
 

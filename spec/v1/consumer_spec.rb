@@ -397,7 +397,7 @@ RSpec.describe "Consumers", :integration do
         end
       end
 
-      it "raises ChannelError if the queue is gone when it comes back" do
+      it "returns :cancelled if the queue is gone when it comes back" do
         with_client do |client, vhost|
           client.queue("work")
           client.forget("work")
@@ -414,7 +414,137 @@ RSpec.describe "Consumers", :integration do
           http_delete("/api/queues/#{URI.encode_www_form_component(vhost)}/work")
           sever!(first)
 
-          expect(running.wait).to be_a(Async::RabbitMQ::ChannelError).and(be_not_found)
+          expect(running.wait).to eq(:cancelled)
+          expect(consumer).not_to be_running
+        end
+      end
+    end
+
+    describe "when the broker cancels it, and it was asked to resubscribe" do
+      # What the broker does when it cancels a consumer and leaves the queue:
+      # the consumer is gone at the broker, and the client is told.
+      def broker_cancels(consumer)
+        channel = consumer.instance_variable_get(:@channel)
+        channel.call(AMQ::Protocol::Basic::Cancel.encode(channel.id, consumer.consumer_tag, false),
+                     AMQ::Protocol::Basic::CancelOk)
+        consumer.cancelled(nil)
+      end
+
+      it "consumes again from a queue that is still there, and declares nothing" do
+        with_client do |client, _|
+          queue    = queue_with(client, 1)
+          consumer = queue.consumer(on_cancel: :resubscribe)
+          got      = []
+          told     = []
+          consumer.on_cancelled { |c| told << [:cancelled, c, c.consumer_tag] }
+          consumer.on_resubscribed { |attempts, c| told << [:resubscribed, attempts, c, c.consumer_tag.nil?] }
+          running  = Async do
+            consumer.each do |message|
+              got << message.body
+              message.ack
+            end
+          end
+          wait_for { got == %w[m0] }
+          first_tag = consumer.consumer_tag
+          broker_cancels(consumer)
+          wait_for { consumer.consumer_tag && consumer.consumer_tag != first_tag }
+          publish(client, queue, 1, prefix: "again")
+
+          wait_for { got == %w[m0 again0] }
+          expect(running).to be_running
+          expect(told).to eq([[:cancelled, consumer, first_tag], [:resubscribed, 1, consumer, false]])
+          expect(consumer.on_cancel).to eq(:resubscribe)
+          consumer.stop
+          expect(running.wait).to eq(:stopped)
+        end
+      end
+
+      it "returns :cancelled when the queue has been deleted" do
+        with_client do |client, vhost|
+          queue    = queue_with(client, 0)
+          consumer = queue.consumer(on_cancel: :resubscribe)
+          told     = []
+          consumer.on_cancelled { told << :cancelled }
+          consumer.on_resubscribed { told << :resubscribed }
+          running  = Async { consumer.each(&:ack) }
+          wait_for { consumer.consumer_tag }
+
+          http_delete("/api/queues/#{URI.encode_www_form_component(vhost)}/work")
+          expect(running.wait).to eq(:cancelled)
+          expect(told).to eq([:cancelled])
+          expect(client.queue?("work")).to be(false)
+        end
+      end
+
+      it "keeps trying while the broker refuses, and can be stopped while it waits" do
+        with_client do |client, _|
+          queue    = queue_with(client, 0)
+          consumer = queue.consumer(on_cancel: :resubscribe)
+          got      = []
+          attempts = []
+          consumer.on_resubscribed { |count, _| attempts << count }
+          running  = Async do
+            consumer.each do |message|
+              got << message.body
+              message.ack
+            end
+          end
+          wait_for { consumer.consumer_tag }
+
+          # Someone else takes the queue for themselves, so consuming again
+          # is refused for as long as they hold it.
+          channel = consumer.instance_variable_get(:@channel)
+          channel.call(AMQ::Protocol::Basic::Cancel.encode(channel.id, consumer.consumer_tag, false),
+                       AMQ::Protocol::Basic::CancelOk)
+          other = client.open_channel
+          taken = other.call(AMQ::Protocol::Basic::Consume.encode(other.id, "work", "", false, false, true, false, {}),
+                             AMQ::Protocol::Basic::ConsumeOk)
+          consumer.cancelled(nil)
+          sleep 0.3
+          expect(running).to be_running
+          expect(consumer.consumer_tag).to be_nil
+
+          other.call(AMQ::Protocol::Basic::Cancel.encode(other.id, taken.consumer_tag, false),
+                     AMQ::Protocol::Basic::CancelOk)
+          publish(client, queue, 1)
+          wait_for(timeout: 5) { got == %w[m0] }
+          expect(attempts).to eq([2])
+
+          # And again, this time stopped in the middle of the wait.
+          channel = consumer.instance_variable_get(:@channel)
+          channel.call(AMQ::Protocol::Basic::Cancel.encode(channel.id, consumer.consumer_tag, false),
+                       AMQ::Protocol::Basic::CancelOk)
+          other.call(AMQ::Protocol::Basic::Consume.encode(other.id, "work", "", false, false, true, false, {}),
+                     AMQ::Protocol::Basic::ConsumeOk)
+          consumer.cancelled(nil)
+          sleep 0.3
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          consumer.stop
+          expect(running.wait).to eq(:stopped)
+          expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 0.5
+        end
+      end
+
+      it "is an option of a managed consumer too, and only :end or :resubscribe" do
+        with_client do |client, _|
+          queue   = queue_with(client, 0)
+          managed = queue.managed_consumer(on_cancel: :resubscribe)
+          got     = []
+          told    = []
+          managed.on_cancelled { |c| told << c }.on_resubscribed { |_attempts, c| told << c }
+          running = Async { managed.run { |message| got << message.body } }
+          wait_for { managed.consumer_tag }
+          first_tag = managed.consumer_tag
+          broker_cancels(managed.instance_variable_get(:@consumer))
+          wait_for { managed.consumer_tag && managed.consumer_tag != first_tag }
+          publish(client, queue, 1)
+
+          wait_for { got == %w[m0] }
+          expect(managed.on_cancel).to eq(:resubscribe)
+          expect(told).to eq([managed, managed])
+          managed.stop
+          expect(running.wait).to eq(:stopped)
+          expect { client.consumer("work", on_cancel: :retry) }.to raise_error(ArgumentError, /on_cancel/)
         end
       end
     end

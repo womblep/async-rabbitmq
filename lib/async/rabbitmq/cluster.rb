@@ -96,6 +96,7 @@ module Async
 
         @topology  = Topology.new
         @clients   = endpoints.map { |endpoint| Client.new(endpoint, topology: @topology, **options) }.freeze
+        @logger    = @clients.first.logger
         @connected = false
         @closed    = false
       end
@@ -127,7 +128,7 @@ module Async
         @clients.zip(failures).each do |client, failure|
           next unless failure
 
-          Console.warn(self, "Node not reachable; it will join when it is", endpoint: client.endpoint.to_s,
+          @logger.warn(self, "Node not reachable; it will join when it is", endpoint: client.endpoint.to_s,
                                                                             exception: failure)
           client.connect(background: true, parent: parent)
         end
@@ -152,7 +153,7 @@ module Async
         @clients.each do |client|
           client.close
         rescue StandardError => error
-          Console.warn(self, "A node did not close cleanly", endpoint: client.endpoint.to_s, exception: error)
+          @logger.warn(self, "A node did not close cleanly", endpoint: client.endpoint.to_s, exception: error)
         end
         nil
       end
@@ -204,6 +205,15 @@ module Async
       def queue?(name) = any.queue?(name)
       def exchange?(name) = any.exchange?(name)
       def forget(entity) = any.forget(entity)
+
+      # As Client's, for every node: each block is called for whichever
+      # client it happened to, with that client as its last argument.
+      %i[on_connection_lost on_reconnect_failed on_reconnected on_blocked on_unblocked on_gave_up].each do |name|
+        define_method(name) do |&block|
+          @clients.each { |client| client.public_send(name, &block) }
+          self
+        end
+      end
 
       def inspect
         up = @clients.count(&:connected?)

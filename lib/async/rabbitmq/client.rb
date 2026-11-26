@@ -6,6 +6,7 @@ require "async/semaphore"
 require "console"
 
 require_relative "error"
+require_relative "logging"
 require_relative "endpoint"
 require_relative "connection"
 require_relative "topology"
@@ -51,6 +52,31 @@ module Async
     # [reconnect_max_interval] where the doubling stops. Default 30.
     # [reconnect_attempts]     how many failures in a row end the client; nil,
     #                          the default, never gives up.
+    # [logger]                 where the client, and everything built on it,
+    #                          logs. Console by default; a Logger-compatible
+    #                          object, or nil for silence. See Logging.
+    #
+    # == Hearing what happens to the connection
+    #
+    # The client logs what happens to its connection, and an application that
+    # wants to count it or report it elsewhere can be told as well:
+    #
+    #   client.on_connection_lost  { |error| ... }
+    #   client.on_reconnect_failed { |error, attempt| ... }
+    #   client.on_reconnected      { |attempts| ... }
+    #   client.on_blocked          { |reason| ... }
+    #   client.on_unblocked        { ... }
+    #   client.on_gave_up          { |error, attempts| ... }
+    #
+    # Each may be given more than once, and every block is called. Each block
+    # is also passed the client as a last argument, for one block shared
+    # between the clients of a Cluster. They run on the fiber that noticed, in
+    # the middle of its work: a block should record what it was told and
+    # return, and must not wait on the client. One that raises is logged and
+    # otherwise ignored.
+    #
+    # An event the application has a hook for is the application's to
+    # report: the client's own line about it is logged at debug only.
     class Client
       P = AMQ::Protocol
       private_constant :P
@@ -79,10 +105,13 @@ module Async
 
       attr :topology
 
+      # Where the client logs: what Logging.resolve made of +logger:+.
+      attr :logger
+
       # +topology+ is for a Cluster, whose clients share one record of what
       # has been declared.
       def initialize(endpoint, reconnect_interval: 1, reconnect_max_interval: 30, reconnect_attempts: nil,
-                     shuffle: true, topology: nil)
+                     shuffle: true, topology: nil, logger: ::Console)
         @endpoints = (endpoint.is_a?(Array) ? endpoint : [endpoint]).map do |one|
           one.is_a?(Endpoint) ? one : Endpoint.parse(one.to_s)
         end.freeze
@@ -94,6 +123,7 @@ module Async
         @reconnect_max_interval = reconnect_max_interval
         @reconnect_attempts     = reconnect_attempts
         @topology   = topology || Topology.new
+        @logger     = Logging.resolve(logger)
         @parent     = nil
         @connection = nil
         # Resolved with the connection once there is one and the topology is
@@ -107,6 +137,8 @@ module Async
         @links      = []
         @closed     = false
         @failure    = nil
+        @hooks      = Hash.new { |hooks, event| hooks[event] = [] }
+        @connected_before = false
       end
 
       # Connect. Raises if the broker cannot be reached or refuses: the first
@@ -130,6 +162,7 @@ module Async
         else
           connection = open_connection(parent)
           establish(connection)
+          @connected_before = true
           @supervisor = parent.async(transient: true) { supervise(connection) }
         end
         self
@@ -152,6 +185,33 @@ module Async
       # Why the client gave up reconnecting; nil unless it has.
       attr :failure
 
+      # Call the block with the error each time the connection is lost. The
+      # client is about to reconnect; a connection the client closed itself is
+      # not a loss.
+      def on_connection_lost(&block) = hook(:connection_lost, block)
+
+      # Call the block with the error, and how many attempts have now failed
+      # in a row, each time an attempt to connect again fails. The last one
+      # before the client gives up is reported too.
+      def on_reconnect_failed(&block) = hook(:reconnect_failed, block)
+
+      # Call the block each time there is a connection again after a loss,
+      # with how many attempts it took. The topology has been declared on it
+      # by then. The first connection is not a reconnection.
+      def on_reconnected(&block) = hook(:reconnected, block)
+
+      # Call the block with the broker's reason when it blocks publishing on
+      # this connection (a resource alarm), and when it lifts the block. A
+      # connection lost while blocked is reported as lost, not as unblocked.
+      def on_blocked(&block)   = hook(:blocked, block)
+      def on_unblocked(&block) = hook(:unblocked, block)
+
+      # Call the block with the last error, and how many attempts were made,
+      # when the client gives up reconnecting: it was given
+      # +reconnect_attempts+ and that many have failed in a row. #failure is
+      # set by then, and everything waiting on the client has been told.
+      def on_gave_up(&block) = hook(:gave_up, block)
+
       # Close the client: everything built on it, then the connection.
       def close
         return if @closed
@@ -161,7 +221,7 @@ module Async
         links.each do |link|
           link.close
         rescue StandardError => error
-          Console.warn(self, "A #{link.class.name} did not close cleanly", exception: error)
+          @logger.warn(self, "A #{link.class.name} did not close cleanly", exception: error)
         end
         stop_supervisor
         @ready.reject(ClosedError.new("This client has been closed")) unless @ready.resolved?
@@ -456,12 +516,52 @@ module Async
         end
       end
 
+      def hook(event, block)
+        raise ArgumentError, "on_#{event} needs a block" unless block
+
+        @hooks[event] << block
+        self
+      end
+
+      # Tell everyone who asked to hear of +event+. What a block raises is
+      # its own problem, and must not become the connection's.
+      def notify(event, *arguments)
+        return unless @hooks.key?(event)
+
+        @hooks[event].each do |block|
+          block.call(*arguments, self)
+        rescue StandardError => error
+          @logger.error(self, "on_#{event} raised", exception: error)
+        end
+      end
+
+      def hooked?(event)
+        @hooks.key?(event)
+      end
+
+      # The client's own line about +event+. An application that has a hook
+      # for the event reports it itself, in its own words and at the level it
+      # chooses, so the client's line is then only for debugging.
+      def report(event, level, message, **fields)
+        @logger.public_send(hooked?(event) ? :debug : level, self, message, **fields)
+      end
+
       def establish(connection)
         declare_topology(connection)
         @connection = connection
         @endpoint   = connection.endpoint
         @admin      = nil
+        # The block says whether the application is reporting this itself.
+        connection.on_blocked_change do |reason|
+          next false unless @connection.equal?(connection)
+
+          reason ? notify(:blocked, reason) : notify(:unblocked)
+          hooked?(reason ? :blocked : :unblocked)
+        end
         @ready.resolve(connection)
+        # Blocked while the topology was being declared, before anyone was
+        # listening.
+        notify(:blocked, connection.blocked) if connection.blocked?
       end
 
       # Connect to whichever endpoint will have us: each is tried in turn, in
@@ -473,12 +573,12 @@ module Async
         candidates = @shuffle ? @endpoints.shuffle : @endpoints
         failure    = nil
         candidates.each do |endpoint|
-          return Connection.open(endpoint, parent: parent)
+          return Connection.open(endpoint, parent: parent, logger: @logger)
         rescue AuthenticationError
           raise
         rescue Error => error
           failure = error
-          Console.debug(self, "Could not connect", endpoint: endpoint.to_s, exception: error) if candidates.size > 1
+          @logger.debug(self, "Could not connect", endpoint: endpoint.to_s, exception: error) if candidates.size > 1
         end
         raise failure
       end
@@ -498,7 +598,8 @@ module Async
           break if @closed
 
           lost(connection)
-          Console.warn(self, "Connection lost; reconnecting", endpoint: @endpoint.to_s, exception: error)
+          report(:connection_lost, :warn, "Connection lost; reconnecting", endpoint: @endpoint.to_s, exception: error)
+          notify(:connection_lost, error)
           connection = reconnect or break
         end
       end
@@ -515,16 +616,19 @@ module Async
           begin
             connection = open_connection
             establish(connection)
-            Console.info(self, "Reconnected", endpoint: @endpoint.to_s, attempts: attempts + 1)
+            report(:reconnected, :info, "Reconnected", endpoint: @endpoint.to_s, attempts: attempts + 1)
+            notify(:reconnected, attempts + 1) if @connected_before
+            @connected_before = true
             return connection
           rescue Error => error
             connection&.close(error)
             return nil if @closed
 
             attempts += 1
+            notify(:reconnect_failed, error, attempts)
             return give_up(error, attempts) if @reconnect_attempts && attempts >= @reconnect_attempts
 
-            Console.debug(self, "Reconnect failed", endpoint: @endpoint.to_s, attempt: attempts, exception: error)
+            @logger.debug(self, "Reconnect failed", endpoint: @endpoint.to_s, attempt: attempts, exception: error)
             # Jittered, so that many clients that lost the same broker do not
             # all come back at it in the same instant.
             sleep(delay * (0.8 + (rand * 0.4)))
@@ -536,8 +640,9 @@ module Async
       def give_up(error, attempts)
         @failure = ConnectionError.new("Gave up reconnecting to #{@endpoint} after #{attempts} attempt(s): " \
                                        "#{error.class}: #{error.message}")
-        Console.error(self, "Gave up reconnecting", endpoint: @endpoint.to_s, attempts: attempts, exception: error)
+        report(:gave_up, :error, "Gave up reconnecting", endpoint: @endpoint.to_s, attempts: attempts, exception: error)
         @ready.reject(@failure) unless @ready.resolved?
+        notify(:gave_up, error, attempts)
         nil
       end
 
@@ -554,7 +659,7 @@ module Async
           channel = connection.open_channel unless channel&.open?
           channel.call(frame.call(channel.id), reply)
         rescue ChannelError => error
-          Console.warn(self, "Could not declare #{what} again", endpoint: @endpoint.to_s, exception: error)
+          @logger.warn(self, "Could not declare #{what} again", endpoint: @endpoint.to_s, exception: error)
         end
 
         @topology.exchanges.each do |x|

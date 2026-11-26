@@ -411,7 +411,7 @@ module Async
           error = @lost.wait
           return if @closed
 
-          Console.debug(self, "Publisher lost its channel; attaching again", exception: error)
+          @client.logger.debug(self, "Publisher lost its channel; attaching again", exception: error)
           attach
         end
       rescue Error => error
@@ -438,7 +438,7 @@ module Async
             raise if first && !error.is_a?(ConnectionError)
 
             channel&.close
-            Console.debug(self, "Publisher could not attach; trying again", exception: error)
+            @client.logger.debug(self, "Publisher could not attach; trying again", exception: error)
             sleep(delay)
             delay = [delay * 2, 1].min
             next
@@ -469,7 +469,7 @@ module Async
           outcome.tag = @tag
           write_message(channel, outcome)
         end
-        Console.info(self, "Sent #{@unconfirmed.size} waiting message(s) on the new channel") unless pending.empty?
+        @client.logger.info(self, "Sent #{@unconfirmed.size} waiting message(s) on the new channel") unless pending.empty?
       ensure
         # Cut short: what was not reached goes back, after what was, for the
         # next attempt. The tags are placeholders until then.

@@ -61,6 +61,11 @@ Declarations and queries go through one "admin" channel, opened when needed. A r
 lost connection is sent again on the next one, since all of them can be repeated without harm. One
 that loses the connection three times running is taken to be the cause, and raises.
 
+The `on_*` hooks are lists of blocks on the client, called in line by whichever fiber noticed:
+the supervisor for a loss and for each reconnect attempt, the connection's reader for blocked
+and unblocked (the client gives each connection a block to call). They are not tasks of their
+own, so the order they are called in is the order things happened in.
+
 ## Links
 
 A link registers with the client so that closing the client closes it. Each holds a channel and
@@ -82,7 +87,16 @@ Each message is an `Outcome` held in a hash keyed by its confirm tag, in the ord
 caller's fiber. The broker's prefetch bounds the queue. A `Message` holds the channel it arrived
 on, and is stale once that channel has closed: settling it does nothing, and one still in the queue
 is dropped, because the broker has requeued it. On a lost connection `each` either waits and
-subscribes again, returns, or (in a cluster) asks to be moved.
+subscribes again, returns, or (in a cluster) asks to be moved. If the queue is not there to
+subscribe to again, `each` returns `:cancelled`.
+
+A `basic.cancel` from the broker ends `each` with `:cancelled` unless the consumer was made with
+`on_cancel: :resubscribe`. Then `each` asks on the client's admin channel whether the queue
+exists, and sends `basic.consume` again if it does, backing off from 1s to 30s while the broker
+refuses. It never declares, so a deleted queue stays deleted. The first refusal after a cancel is
+a warning and the rest are debug. `on_cancelled` and `on_resubscribed` are single blocks on the
+consumer, like `on_attach`, called in the fiber running `each`. `on_resubscribed` is given the
+number of attempts before the consumer, as the client's hooks put the client last.
 
 A consumer's own queue is declared `exclusive` by the consumer on its own channel, and re-declared
 and re-bound each time it attaches.
@@ -97,6 +111,14 @@ A `Cluster` holds one `Client` per node, all sharing one `Topology`. Placement i
 client with the fewest links, at random between ties. A consumer made with
 `on_connection_loss: :move` is given a callback that returns another connected client; the consumer
 then registers there and attaches as it would after any reconnect.
+
+## Logging
+
+Every log call has Console's shape, `logger.warn(self, "message", key: value, exception: error)`.
+The client resolves its `logger:` once (`logging.rb`) into something that takes that call:
+a forwarder to Console, a shim that flattens the call to one line for a stdlib-style logger,
+or a null. The first two check `Async::RabbitMQ.log_level` before they pass anything on. Links log through their client's logger, and a channel through its connection's,
+which the client passes in when it opens the connection.
 
 ## Telemetry
 

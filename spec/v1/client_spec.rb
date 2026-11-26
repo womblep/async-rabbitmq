@@ -272,6 +272,69 @@ RSpec.describe Async::RabbitMQ::Client, :integration do
     end
   end
 
+  describe "telling the application what happens to the connection" do
+    it "says when the connection is lost and when it is back, and not for the first connection" do
+      with_client do |client, _|
+        events = []
+        client.on_connection_lost { |error, from| events << [:lost, error.class, from] }
+        client.on_reconnected { |attempts, from| events << [:reconnected, attempts, from] }
+        first = current_connection(client)
+        sever!(first)
+        client.open_channel
+
+        expect(events).to eq([[:lost, Async::RabbitMQ::ConnectionError, client], [:reconnected, 1, client]])
+      end
+    end
+
+    it "says each time an attempt to reconnect fails, the last one before giving up included" do
+      skip "toxiproxy not available" unless toxiproxy_available?
+
+      with_client(port: TOXIPROXY_PORT, endpoint_options: { timeout: 1 }, reconnect_attempts: 2) do |client, _|
+        failed = []
+        back   = []
+        client.on_reconnect_failed { |error, attempt| failed << [error.class.ancestors.include?(Async::RabbitMQ::Error), attempt] }
+        client.on_reconnected { |attempts| back << attempts }
+        gave_up = []
+        client.on_gave_up { |error, attempts, from| gave_up << [error.is_a?(Async::RabbitMQ::Error), attempts, from.failure.class] }
+        toxiproxy_rabbitmq.down do
+          expect { client.open_channel }.to raise_error(Async::RabbitMQ::ConnectionError, /Gave up/)
+        end
+
+        expect(failed).to eq([[true, 1], [true, 2]])
+        expect(gave_up).to eq([[true, 2, Async::RabbitMQ::ConnectionError]])
+        expect(back).to be_empty
+      end
+    end
+
+    it "says when the broker blocks publishing and when it stops" do
+      with_client do |client, _|
+        events = []
+        client.on_blocked { |reason| events << [:blocked, reason] }
+        client.on_unblocked { |from| events << [:unblocked, from] }
+        connection = current_connection(client)
+        # A resource alarm, as the broker would announce it.
+        connection.send(:receive_connection_method, AMQ::Protocol::Connection::Blocked.new("low on memory"))
+        connection.send(:receive_connection_method, AMQ::Protocol::Connection::Unblocked.new)
+
+        expect(events).to eq([[:blocked, "low on memory"], [:unblocked, client]])
+      end
+    end
+
+    it "calls every block given, and carries on when one raises" do
+      with_client do |client, _|
+        heard = []
+        client.on_connection_lost { raise "a hook with a bug" }
+        client.on_connection_lost { heard << :second }
+        first = current_connection(client)
+        sever!(first)
+
+        expect(client.open_channel).to be_open
+        expect(heard).to eq([:second])
+        expect { client.on_reconnected }.to raise_error(ArgumentError, /needs a block/)
+      end
+    end
+  end
+
   describe "#close" do
     it "releases a fiber that was waiting for a connection" do
       skip "toxiproxy not available" unless toxiproxy_available?

@@ -60,8 +60,8 @@ module Async
     # It returns when the consumer goes away, and says why:
     #
     # [:stopped]         #stop was called.
-    # [:cancelled]       the broker cancelled the consumer (the queue was
-    #                    deleted).
+    # [:cancelled]       the broker cancelled the consumer, or the queue was
+    #                    gone when a lost connection came back. See below.
     # [:closed]          the consumer, or its client, was closed.
     # [:connection_lost] the connection was lost, and the consumer was
     #                    created with +on_connection_loss: :end+.
@@ -82,6 +82,22 @@ module Async
     # them again, so any still waiting here are dropped without being
     # yielded, and settling one already handed out does nothing.
     #
+    # If the queue is not there when the connection comes back - it was
+    # deleted, and the client was told to forget it or never declared it -
+    # #each returns :cancelled, as it does when the broker says so itself.
+    #
+    # == A consumer the broker cancels
+    #
+    # The broker cancels a consumer when its queue is deleted, and for
+    # reasons that leave the queue where it was: a quorum queue that has
+    # lost its leader, say. By default either ends #each with :cancelled.
+    # With +on_cancel: :resubscribe+ the consumer asks whether the queue is
+    # still there, and if it is, consumes from it again and carries on,
+    # trying again at intervals growing from one second to thirty for as
+    # long as the queue exists and the broker refuses. Only a queue that is
+    # gone ends #each with :cancelled. Nothing is declared: a queue somebody
+    # deleted is not put back.
+    #
     # Options:
     #
     # [prefetch]           unsettled messages the broker sends at once.
@@ -89,6 +105,7 @@ module Async
     #                      send the whole queue.
     # [on_connection_loss] :wait (the default) or :end; see above. A consumer
     #                      of a Cluster may also say :move; see Cluster.
+    # [on_cancel]          :end (the default) or :resubscribe; see above.
     # [exclusive]          the queue is the consumer's own. Default true when
     #                      no queue is named, false otherwise.
     # [queue_arguments]    arguments for the consumer's own queue.
@@ -109,15 +126,22 @@ module Async
       Lost      = Struct.new(:channel, :error)
       private_constant :WAKE, :Cancelled, :Lost
 
-      LOSS_POLICIES = %i[wait end move].freeze
+      LOSS_POLICIES   = %i[wait end move].freeze
+      CANCEL_POLICIES = %i[end resubscribe].freeze
 
       attr :client, :prefetch
+
+      # :end or :resubscribe.
+      attr :on_cancel
 
       # The tag of the running consumer; nil when #each is not running.
       attr :consumer_tag
 
-      def initialize(client, queue = nil, prefetch: 100, on_connection_loss: :wait, exclusive: nil,
+      def initialize(client, queue = nil, prefetch: 100, on_connection_loss: :wait, on_cancel: :end, exclusive: nil,
                      queue_arguments: {}, arguments: {}, link: nil, relocate: nil)
+        unless CANCEL_POLICIES.include?(on_cancel)
+          raise ArgumentError, "on_cancel must be :end or :resubscribe (got #{on_cancel.inspect})"
+        end
         unless prefetch.nil? || (prefetch.is_a?(Integer) && prefetch.positive?)
           raise ArgumentError, "prefetch must be a positive Integer or nil (got #{prefetch.inspect})"
         end
@@ -140,6 +164,8 @@ module Async
         @arguments       = arguments
         @prefetch        = prefetch
         @on_loss         = on_connection_loss
+        @on_cancel       = on_cancel
+        @pause           = nil # Promise a wait between attempts to resubscribe ends on
         # What is registered with the client: this consumer, or the
         # ManagedConsumer built on it. And, for a consumer of a Cluster, how
         # to find it another client.
@@ -147,6 +173,8 @@ module Async
         @relocate        = relocate
         @bindings        = []
         @on_attach       = nil
+        @on_cancelled    = nil
+        @on_resubscribed = nil
         @channel         = nil
         @queue_connection = nil # the connection the consumer's own queue lives on
         @attaching       = Async::Semaphore.new(1)
@@ -242,6 +270,28 @@ module Async
         self
       end
 
+      # Have +block+ called, with the consumer, each time the broker cancels
+      # it: before it tries to consume again if it was made with
+      # +on_cancel: :resubscribe+, and before #each returns :cancelled if it
+      # was not. It runs in the fiber that called #each.
+      def on_cancelled(&block)
+        @on_cancelled = block
+        self
+      end
+
+      # Have +block+ called each time the consumer is consuming again after
+      # the broker cancelled it, with the number of attempts it took (1 if
+      # the first was accepted) and then the consumer. Only a consumer made
+      # with +on_cancel: :resubscribe+ ever is.
+      #
+      # With either block set, the cancel and the recovery are the
+      # application's to report, and the consumer's own lines about them are
+      # logged at debug only.
+      def on_resubscribed(&block)
+        @on_resubscribed = block
+        self
+      end
+
       # Consume, yielding one Message at a time to the block in the calling
       # fiber, until the consumer goes away. Returns why; see the class
       # comment.
@@ -277,6 +327,9 @@ module Async
               next unless item.channel.equal?(@consuming)
 
               @broker_cancelled = true
+              told(:on_cancelled, @on_cancelled)
+              next if @on_cancel == :resubscribe && resubscribe
+
               result = :cancelled
               break
             when Lost
@@ -289,7 +342,16 @@ module Async
                 break
               end
               move if @on_loss == :move
-              subscribe
+              begin
+                subscribe
+              rescue ChannelError => error
+                raise unless error.not_found?
+
+                # The queue went while the connection was away. The cancel
+                # the broker would have sent went with the connection.
+                result = :cancelled
+                break
+              end
             end
           end
         rescue ClosedError
@@ -312,6 +374,7 @@ module Async
 
         @stopping = true
         buffer.push(WAKE)
+        @pause&.resolve(true)
         nil
       end
 
@@ -450,7 +513,7 @@ module Async
         target = @relocate.call(self)
         return if target.nil? || target.equal?(@client)
 
-        Console.info(self, "Consumer of #{@queue_name} is moving", from: @client.endpoint.to_s,
+        @client.logger.info(self, "Consumer of #{@queue_name} is moving", from: @client.endpoint.to_s,
                                                                     to: target.endpoint.to_s)
         target.register(@link)
         @client.unregister(@link)
@@ -460,9 +523,14 @@ module Async
       end
 
       def attached
-        @on_attach&.call(self)
+        told(:on_attach, @on_attach)
+      end
+
+      # Call one of the consumer's blocks. What it raises is its own problem.
+      def told(name, block, *arguments)
+        block&.call(*arguments, @link)
       rescue StandardError => error
-        Console.error(self, "on_attach for #{@queue_name} raised", exception: error)
+        @client.logger.error(self, "#{name} for #{@queue_name} raised", exception: error)
       end
 
       # Start consuming on the consumer's channel, opening one if need be.
@@ -487,6 +555,51 @@ module Async
         end
       end
 
+      # The broker cancelled the consumer. Consume again if the queue is still
+      # there, trying for as long as it is; never declare it. True if #each
+      # should carry on (consuming again, or stopping), false if the queue is
+      # gone.
+      def resubscribe
+        @consuming = @consumer_tag = nil
+        delay    = 1
+        failures = 0
+        loop do
+          return true if @stopping
+          return false unless @client.queue?(@queue_name)
+
+          begin
+            subscribe
+            @client.logger.public_send(@on_resubscribed ? :debug : :info, self,
+                                       "Consumer of #{@queue_name} was cancelled by the broker, and is consuming again",
+                                       attempts: failures + 1)
+            told(:on_resubscribed, @on_resubscribed, failures + 1)
+            return true
+          rescue ChannelError => error
+            return false if error.not_found?
+
+            # Said once for each cancel, however long the broker goes on
+            # refusing: a long outage is one warning, not one every 30s.
+            failures += 1
+            level = failures == 1 && !@on_cancelled && !@on_resubscribed ? :warn : :debug
+            @client.logger.public_send(level, self,
+                                       "Consumer of #{@queue_name} was cancelled by the broker and cannot " \
+                                       "consume again yet; it will keep trying", exception: error)
+          end
+          pause(delay)
+          delay = [delay * 2, 30].min
+        end
+      end
+
+      # Wait +seconds+, or until #stop.
+      def pause(seconds)
+        @pause = Async::Promise.new
+        Async::Task.current.with_timeout(seconds) { @pause.wait }
+      rescue Async::TimeoutError
+        nil
+      ensure
+        @pause = nil
+      end
+
       # Cancel the consumer and put back whatever arrived and was not handed
       # out. Runs on every way out of #each, a stop of the calling task
       # included, so nothing here may assume the channel is still usable.
@@ -499,7 +612,7 @@ module Async
             # and land in the buffer, which is emptied below.
             channel.call(P::Basic::Cancel.encode(channel.id, tag, false), P::Basic::CancelOk)
           rescue Error => error
-            Console.debug(self, "Consumer #{tag} on #{@queue_name}: cancel failed while stopping", exception: error)
+            @client.logger.debug(self, "Consumer #{tag} on #{@queue_name}: cancel failed while stopping", exception: error)
           end
         end
       ensure
