@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-11-27
+
+### Fixed
+
+- `Async::RabbitMQ`: a queue deleted under a consumer with `on_cancel: :resubscribe` could come
+  back. A quorum queue part way through being deleted still says it exists, and closes the whole
+  connection on a consumer that tries to consume from it. The client then reconnected, declared
+  the queue again from its record, and the consumer carried on with the re-created, empty queue.
+  From the cancel until the consumer is consuming again or has found the queue gone, a reconnect
+  now leaves that queue and its bindings out of what it declares, so `each` returns `:cancelled`.
+  Once it has, a queue made with `client.queue` is declared again on the next reconnect unless
+  the application calls `client.forget(queue)`, as before.
+
 ## [0.10.0] - 2026-11-26
 
 A second client in the same gem. `Async::RabbitMQ`, loaded with `require "async/rabbitmq"`, is
@@ -37,8 +50,7 @@ An application uses one or the other. Nothing was removed.
 - `Consumer`: `each` yields one `Message` at a time, and the message settles itself. Given no
   queue it declares an exclusive one of its own and re-declares it after a reconnect.
   `on_connection_loss:` is `:wait` or `:end`. `on_cancel: :resubscribe` has a consumer the
-  broker cancelled consume again for as long as its queue exists, without declaring it, and
-  the client does not declare that queue on a reconnect while the consumer is recovering; the
+  broker cancelled consume again for as long as its queue exists, without declaring it; the
   default ends `each` with `:cancelled`, as does a queue that is gone when a lost connection
   comes back. `on_cancelled` and `on_resubscribed` tell the application of each, the second
   with the number of attempts it took. A broker that goes on refusing is warned of once for
