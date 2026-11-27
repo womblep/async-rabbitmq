@@ -1,0 +1,27 @@
+name: soakcluster
+x-node: &node
+  image: rabbitmq:4-management-alpine
+  entrypoint: ["sh", "-c", "echo SOAKCLUSTERCOOKIE > /var/lib/rabbitmq/.erlang.cookie && chmod 400 /var/lib/rabbitmq/.erlang.cookie && chown rabbitmq:rabbitmq /var/lib/rabbitmq/.erlang.cookie && exec docker-entrypoint.sh rabbitmq-server"]
+  volumes:
+    - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+services:
+  rmq1:
+    <<: *node
+    hostname: rmq1
+    container_name: soak-rmq1
+    ports: ["36011:15672"]
+  rmq2:
+    <<: *node
+    hostname: rmq2
+    container_name: soak-rmq2
+    ports: ["36012:15672"]
+  rmq3:
+    <<: *node
+    hostname: rmq3
+    container_name: soak-rmq3
+    ports: ["36013:15672"]
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: soak-toxiproxy
+    command: ["-host=0.0.0.0"]
+    ports: ["36000:8474", "36001:36001", "36002:36002", "36003:36003"]
