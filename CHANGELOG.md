@@ -37,7 +37,8 @@ An application uses one or the other. Nothing was removed.
 - `Consumer`: `each` yields one `Message` at a time, and the message settles itself. Given no
   queue it declares an exclusive one of its own and re-declares it after a reconnect.
   `on_connection_loss:` is `:wait` or `:end`. `on_cancel: :resubscribe` has a consumer the
-  broker cancelled consume again for as long as its queue exists, without declaring it; the
+  broker cancelled consume again for as long as its queue exists, without declaring it, and
+  the client does not declare that queue on a reconnect while the consumer is recovering; the
   default ends `each` with `:cancelled`, as does a queue that is gone when a lost connection
   comes back. `on_cancelled` and `on_resubscribed` tell the application of each, the second
   with the number of attempts it took. A broker that goes on refusing is warned of once for

@@ -476,6 +476,72 @@ RSpec.describe "Consumers", :integration do
         end
       end
 
+      # A quorum queue part way through being deleted says it exists, and
+      # closes the connection on whoever consumes from it. Here the queue is
+      # said to exist once, and the connection is cut before the consume.
+      def lose_the_connection_on_the_first_look(client)
+        first  = current_connection(client)
+        looked = false
+        allow(client).to receive(:queue?).and_wrap_original do |original, name|
+          next original.call(name) if looked
+
+          looked = true
+          sever!(first)
+          true
+        end
+        first
+      end
+
+      it "does not put a deleted queue back if the connection goes as it consumes again" do
+        with_client do |client, vhost|
+          queue    = queue_with(client, 0)
+          queue.bind(client.exchange("events", :topic), routing_key: "#")
+          consumer = queue.consumer(on_cancel: :resubscribe)
+          told     = []
+          consumer.on_cancelled { told << :cancelled }
+          consumer.on_resubscribed { told << :resubscribed }
+          running  = Async { consumer.each(&:ack) }
+          wait_for { consumer.consumer_tag }
+          first = lose_the_connection_on_the_first_look(client)
+
+          http_delete("/api/queues/#{URI.encode_www_form_component(vhost)}/work")
+          # A queue put back would be consumed from again, and this never end.
+          expect(Async::Task.current.with_timeout(5) { running.wait }).to eq(:cancelled)
+          expect(told).to eq([:cancelled])
+          expect(current_connection(client)).not_to equal(first)
+          expect(client.queue?("work")).to be(false)
+          expect(client.topology).not_to be_held("work")
+        end
+      end
+
+      it "consumes again on the next connection from a queue that is still there" do
+        with_client do |client, _|
+          queue    = queue_with(client, 0)
+          consumer = queue.consumer(on_cancel: :resubscribe)
+          got      = []
+          attempts = []
+          consumer.on_resubscribed { |count, _| attempts << count }
+          running  = Async do
+            consumer.each do |message|
+              got << message.body
+              message.ack
+            end
+          end
+          wait_for { consumer.consumer_tag }
+          first = lose_the_connection_on_the_first_look(client)
+
+          broker_cancels(consumer)
+          reconnected(client, first)
+          publish(client, queue, 1)
+          wait_for { got == %w[m0] }
+          expect(attempts).to eq([1])
+          expect(running).to be_running
+          expect(client.topology).not_to be_held("work")
+          consumer.stop
+          expect(running.wait).to eq(:stopped)
+        end
+      end
+
       it "keeps trying while the broker refuses, and can be stopped while it waits" do
         with_client do |client, _|
           queue    = queue_with(client, 0)

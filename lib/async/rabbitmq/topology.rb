@@ -15,6 +15,11 @@ module Async
     # Deleting something through the client forgets it. Something deleted
     # behind the client's back is not known to be gone, and comes back on the
     # next reconnect; Client#forget is for the application that knows.
+    #
+    # A queue may be held: left out of what is declared again, without being
+    # forgotten. A consumer the broker has cancelled holds its queue until it
+    # knows whether the queue is still there, so that a connection lost in
+    # the meantime does not put back a queue somebody has just deleted.
     class Topology
       ExchangeRecord = Struct.new(:name, :type, :durable, :auto_delete, :internal, :arguments)
       QueueRecord    = Struct.new(:name, :durable, :auto_delete, :arguments)
@@ -25,7 +30,20 @@ module Async
         @queues            = {}
         @queue_bindings    = []
         @exchange_bindings = []
+        @held              = Hash.new(0)
       end
+
+      # Counted: a queue with two consumers recovering is held until both
+      # have let go.
+      def hold_queue(name)
+        @held[name] += 1
+      end
+
+      def release_queue(name)
+        @held.delete(name) if (@held[name] -= 1) <= 0
+      end
+
+      def held?(name) = @held.key?(name)
 
       def exchanges         = @exchanges.values
       def queues            = @queues.values

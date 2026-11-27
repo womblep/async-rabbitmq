@@ -93,7 +93,12 @@ subscribe to again, `each` returns `:cancelled`.
 A `basic.cancel` from the broker ends `each` with `:cancelled` unless the consumer was made with
 `on_cancel: :resubscribe`. Then `each` asks on the client's admin channel whether the queue
 exists, and sends `basic.consume` again if it does, backing off from 1s to 30s while the broker
-refuses. It never declares, so a deleted queue stays deleted. The first refusal after a cancel is
+refuses. It never declares, and for as long as it is recovering the client's topology holds the
+queue: a reconnect leaves the queue and its bindings out of what it declares. Without that, a
+deleted queue could come back. A quorum queue part way through deletion still answers a passive
+declare, and answers `basic.consume` by closing the connection with a 541; the reconnect then
+declared the queue again from the record. The hold is counted, for two consumers of one queue,
+and is on the topology, which a cluster's clients share. The first refusal after a cancel is
 a warning and the rest are debug. `on_cancelled` and `on_resubscribed` are single blocks on the
 consumer, like `on_attach`, called in the fiber running `each`. `on_resubscribed` is given the
 number of attempts before the consumer, as the client's hooks put the client last.

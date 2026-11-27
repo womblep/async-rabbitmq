@@ -95,8 +95,9 @@ module Async
     # still there, and if it is, consumes from it again and carries on,
     # trying again at intervals growing from one second to thirty for as
     # long as the queue exists and the broker refuses. Only a queue that is
-    # gone ends #each with :cancelled. Nothing is declared: a queue somebody
-    # deleted is not put back.
+    # gone ends #each with :cancelled. Nothing is declared, by the consumer
+    # or, until it is consuming again, by the client on a reconnect: a queue
+    # somebody deleted is not put back.
     #
     # Options:
     #
@@ -559,8 +560,17 @@ module Async
       # there, trying for as long as it is; never declare it. True if #each
       # should carry on (consuming again, or stopping), false if the queue is
       # gone.
+      #
+      # The client does not declare the queue either while this goes on. A
+      # quorum queue part way through being deleted still answers for itself,
+      # and closes the connection on whoever consumes from it; the reconnect
+      # would otherwise put the queue back from the client's record.
       def resubscribe
         @consuming = @consumer_tag = nil
+        @client.without_declaring(@queue_name) { consume_again }
+      end
+
+      def consume_again
         delay    = 1
         failures = 0
         loop do
