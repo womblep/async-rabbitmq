@@ -377,9 +377,15 @@ Both run in the fiber that called `each` or `run`. With either set, the
 consumer's own lines about the cancel are logged at debug only.
 
 Nothing is declared along the way, so a queue somebody deleted is not put
-back. That holds for a lost connection only if the client is not going to
-declare the queue itself: a queue made with `client.queue` is declared again
-on every reconnect unless you call `client.forget(queue)`.
+back. That includes the client: from the cancel until the consumer is
+consuming again or has found the queue gone, a reconnect leaves that queue
+and its bindings out of what it declares. A quorum queue that is part way
+through being deleted can close the connection on a consumer that tries it,
+and the reconnect would otherwise put the queue back.
+
+Once `each` has returned `:cancelled` the queue is the client's to declare
+again: one made with `client.queue` comes back on the next reconnect unless
+you call `client.forget(queue)`.
 
 ### A message
 

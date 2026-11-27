@@ -457,6 +457,18 @@ module Async
         end
       end
 
+      # Run the block with the queue called +name+ left out of what a new
+      # connection declares. For a consumer finding out whether its queue is
+      # still there: a connection lost while it asks must not put the queue
+      # back. A queue that does still exist loses nothing by it.
+      def without_declaring(name)
+        topology = @topology
+        topology.hold_queue(name)
+        yield
+      ensure
+        topology&.release_queue(name)
+      end
+
       # Have +link+ closed when the client closes.
       def register(link)
         raise ClosedError, "This client has been closed" if @closed
@@ -650,7 +662,8 @@ module Async
       # else is let onto it. An entity the broker refuses is reported and
       # skipped: one bad declaration must not hold the rest of the application
       # off the connection. A connection that goes meanwhile raises, and the
-      # reconnect starts over.
+      # reconnect starts over. A queue that is held (see Topology) is left
+      # out, with its bindings.
       def declare_topology(connection)
         return if @topology.empty?
 
@@ -668,6 +681,8 @@ module Async
           }, P::Exchange::DeclareOk)
         end
         @topology.queues.each do |q|
+          next if @topology.held?(q.name)
+
           declare.call("queue #{q.name}", lambda { |id|
             P::Queue::Declare.encode(id, q.name, false, q.durable, false, q.auto_delete, false, q.arguments)
           }, P::Queue::DeclareOk)
@@ -678,6 +693,8 @@ module Async
           }, P::Exchange::BindOk)
         end
         @topology.queue_bindings.each do |b|
+          next if @topology.held?(b.destination)
+
           declare.call("binding #{b.source} -> #{b.destination}", lambda { |id|
             P::Queue::Bind.encode(id, b.destination, b.source, b.routing_key, false, b.arguments)
           }, P::Queue::BindOk)

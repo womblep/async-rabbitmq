@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-11-27
+
+### Fixed
+
+- `Async::RabbitMQ`: a queue deleted under a consumer with `on_cancel: :resubscribe` could come
+  back. A quorum queue part way through being deleted still says it exists, and closes the whole
+  connection on a consumer that tries to consume from it. The client then reconnected, declared
+  the queue again from its record, and the consumer carried on with the re-created, empty queue.
+  From the cancel until the consumer is consuming again or has found the queue gone, a reconnect
+  now leaves that queue and its bindings out of what it declares, so `each` returns `:cancelled`.
+  Once it has, a queue made with `client.queue` is declared again on the next reconnect unless
+  the application calls `client.forget(queue)`, as before.
+
 ## [0.10.0] - 2026-11-26
 
 A second client in the same gem. `Async::RabbitMQ`, loaded with `require "async/rabbitmq"`, is
